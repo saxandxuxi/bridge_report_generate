@@ -1,0 +1,15 @@
+{
+  "说明": "桥数据预处理管道配置：秒级原始数据 -> 日级数据 -> 图库/统计值 -> 传感器对照表",
+  "raw_data_dir": "D:/信科采集软件解析数据",
+  "daily_dir": "D:/Code/data_analysis/preprocess/日级数据",
+  "charts_dir": "D:/Code/data_analysis/preprocess/图库",
+  "stats_dir": "D:/Code/data_analysis/preprocess/统计值",
+  "sensor_map_docx": "D:/五座桥数据分析文件/五座桥测点编号表格.docx",
+  "bridge_name": "赤石",
+  "limit_sensors": 0,
+  "start": "",
+  "end": "",
+  "spike_threshold": 5.0,
+  "gap_fill_hours": 24,
+  "shift_threshold": 2.5
+}
