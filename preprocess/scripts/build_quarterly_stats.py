@@ -32,7 +32,7 @@ import numpy as np
 import build_chart_library as bcl
 
 DEFAULT_DAILY_ROOT = r"D:\preprocess_sensor_data\daily"
-DEFAULT_LIB_ROOT = r"D:\Code\桥数据预处理"
+DEFAULT_LIB_ROOT = "..\\"
 
 
 def load_sensor_map(path):

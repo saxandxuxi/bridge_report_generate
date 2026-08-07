@@ -19,9 +19,6 @@
 import argparse
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import bootstrap  # noqa: E402
-
 from report_agent.config import load_config
 from report_agent.recognizer import annotate_docx, print_summary, recognize, save_analysis
 

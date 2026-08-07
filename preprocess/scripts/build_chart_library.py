@@ -45,9 +45,6 @@ import sys
 import time
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-import bootstrap  # noqa: E402
-
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -64,7 +61,7 @@ except Exception:
 
 # ---------------- 默认路径（可按需修改/用命令行参数覆盖） ----------------
 DEFAULT_DAILY_ROOT = r"D:\preprocess_sensor_data\daily"   # 预处理后的 daily 目录
-DEFAULT_LIB_ROOT = r"D:\Code\桥数据预处理"                # 图库/统计值 的上级目录
+DEFAULT_LIB_ROOT = "..\\"                                 # 图库/统计值 的上级目录(相对运行目录)
 # ---------------------------------------------------------------------
 
 # 特征英文代号 -> 中文名（便于中文查询，未列出的按原名显示）

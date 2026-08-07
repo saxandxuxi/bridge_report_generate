@@ -12,9 +12,6 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import bootstrap  # noqa: E402
-
 from report_agent.bridges import resolve_bridge_config
 from report_agent.scheduler import run_forever
 

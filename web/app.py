@@ -32,8 +32,6 @@ from typing import Dict, Optional
 from flask import Flask, Response, jsonify, request, send_file
 
 ROOT = os.environ.get("REPORT_PROJECT_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
-import bootstrap  # noqa: E402
 
 from report_agent.bridges import get_bridge, list_bridges, resolve_bridge_config  # noqa: E402
 
@@ -159,10 +157,7 @@ def _require_token() -> Optional[Response]:
 
 def _subprocess_env() -> Dict:
     env = dict(os.environ)
-    deps = os.path.join(ROOT, ".deps")
     paths = [ROOT]
-    if os.path.isdir(deps):
-        paths.insert(0, deps)
     if env.get("PYTHONPATH"):
         paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(paths)

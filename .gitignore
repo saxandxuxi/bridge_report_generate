@@ -32,7 +32,3 @@ preprocess/*.csv
 preprocess/*.log
 preprocess/status.json
 preprocess/sensor_ids.txt
-
-# ---------- 离线依赖（有意保留，勿忽略） ----------
-# vendor/（numpy/matplotlib/pandas 等）与 .deps/（docx/pymupdf 等）
-# 是随代码一起部署到服务器、免联网安装的内嵌依赖，必须提交。

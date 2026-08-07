@@ -32,8 +32,6 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(ROOT))
-import bootstrap  # noqa: E402
 
 CONFIG_PATH = os.path.join(ROOT, "config.json")
 STATUS_PATH = os.path.join(ROOT, "status.json")

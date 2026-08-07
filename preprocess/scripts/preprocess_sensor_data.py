@@ -56,9 +56,6 @@ import os
 import re
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-import bootstrap  # noqa: E402
-
 # ---------------- 需要按你的服务器修改的部分 ----------------
 DATA_ROOT = r"D:\信科采集软件解析数据"     # 原始数据根目录(远程服务器 D 盘)
 OUTPUT_ROOT = ""        # 留空 = 自动放在 DATA_ROOT 上一级的 results/ 目录

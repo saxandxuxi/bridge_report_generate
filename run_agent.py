@@ -21,10 +21,6 @@ import os
 import sys
 import traceback
 
-# 内嵌依赖引导（vendor/）
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import bootstrap  # noqa: E402
-
 from report_agent.agent import run_once, save_summary
 from report_agent.config import load_config
 from report_agent.template_analyzer import analyze_template, print_analysis
