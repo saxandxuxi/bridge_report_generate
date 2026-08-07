@@ -662,6 +662,119 @@ def _copy_ppr(target_el, source_el) -> None:
         pass
 
 
+def _p_has_blip(p_el) -> bool:
+    return len(p_el.findall(".//" + qn("a:blip"))) > 0
+
+
+def _p_is_caption(p_el) -> bool:
+    text = "".join(t.text or "" for t in p_el.iter(qn("w:t"))).strip()
+    return bool(re.match(r"^图\d+(\.\d+)*-\d+\s", text))
+
+
+def _p_has_content(p_el) -> bool:
+    if _p_has_blip(p_el):
+        return True
+    text = "".join(t.text or "" for t in p_el.iter(qn("w:t"))).strip()
+    return bool(text)
+
+
+def _reorder_chart_blocks(doc: Document) -> int:
+    """同一节内：时程曲线图放在前面，频率分布直方图放在后面（保持同类内原顺序）。
+
+    图表块 = 图片段 + 紧随其后的图注段。块之间的空段忽略；
+    两个块之间出现 非空正文段/表格 视为节边界。
+    返回重排的块数。
+    """
+    body = doc.element.body
+    children = list(body.iterchildren())
+
+    blocks = []
+    i = 0
+    while i < len(children):
+        el = children[i]
+        if el.tag == qn("w:p") and _p_has_blip(el):
+            els = [el]
+            kind = "trend"
+            j = i + 1
+            if j < len(children) and children[j].tag == qn("w:p") and _p_is_caption(children[j]):
+                els.append(children[j])
+                cap_text = "".join(t.text or "" for t in children[j].iter(qn("w:t")))
+                kind = "hist" if "直方图" in cap_text else "trend"
+                j += 1
+            blocks.append((i, j - 1, kind, els))
+            i = j
+        else:
+            i += 1
+    if len(blocks) < 2:
+        return 0
+
+    groups = []
+    cur = []
+    for k, (start, end, kind, els) in enumerate(blocks):
+        if cur:
+            prev_end = blocks[k - 1][1]
+            between = children[prev_end + 1:start]
+            boundary = any(
+                c.tag == qn("w:tbl")
+                or (c.tag == qn("w:p") and _p_has_content(c) and not _p_is_caption(c))
+                for c in between
+            )
+            if boundary:
+                groups.append(cur)
+                cur = []
+        cur.append((kind, els))
+    if cur:
+        groups.append(cur)
+
+    moved = 0
+    for group in groups:
+        kinds = [b[0] for b in group]
+        if kinds == sorted(kinds, key=lambda x: 0 if x == "trend" else 1):
+            continue
+        ordered = sorted(group, key=lambda b: 0 if b[0] == "trend" else 1)
+        flat = [el for _, els in ordered for el in els]
+        prev = flat[0].getprevious()
+        for el in flat:
+            if prev is None:
+                body.insert(0, el)
+            else:
+                prev.addnext(el)
+            prev = el
+        moved += len(group)
+    if moved:
+        log.info("图表块按图型重排：%d 块（时程曲线图在前，直方图在后）", moved)
+    return moved
+
+
+def _renumber_and_unify_captions(doc: Document) -> int:
+    """重排后按新顺序重编图注号（图3.1.1-N），并统一图注字号为 10.5pt。"""
+    counters = {}
+    changed = 0
+    for p in _walk_paragraphs(doc):
+        text = _paragraph_text(p)
+        m = re.match(r"^(图\d+(?:\.\d+){0,2})-(\d+)(\s.*)$", text)
+        if not m:
+            continue
+        prefix = m.group(1)[1:]
+        counters[prefix] = counters.get(prefix, 0) + 1
+        new_text = f"图{prefix}-{counters[prefix]}{m.group(3)}"
+        runs = p.runs
+        if not runs:
+            continue
+        runs[0].text = new_text
+        for r in runs[1:]:
+            r.text = ""
+        runs[0].font.size = Pt(10.5)
+        try:
+            rPr = runs[0]._element.get_or_add_rPr()
+            rFonts = rPr.get_or_add_rFonts()
+            rFonts.set(qn("w:eastAsia"), "宋体")
+        except Exception:  # noqa: BLE001
+            pass
+        changed += 1
+    return changed
+
+
 def _add_caption_after(paragraph: Paragraph, text: str) -> Paragraph:
     """在图表段落之后插入一行居中图注（图X.X.X 图名）。"""
     new_p = OxmlElement("w:p")
@@ -792,6 +905,9 @@ def build_report(
     import os
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    # 同节内图表按图型重排（曲线图在前，直方图在后）+ 图注重编号 + 统一字号
+    _reorder_chart_blocks(doc)
+    _renumber_and_unify_captions(doc)
     doc.save(output_path)
     rgb_n = _flatten_rgba_in_docx(output_path)
     if rgb_n:

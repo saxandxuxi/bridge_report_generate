@@ -1123,19 +1123,39 @@ class BridgeData:
             return subs[0] if subs else None
         return None
 
+    def _position_for_sensor(self, sensor_id: str) -> str:
+        """从名称对照表反查传感器所在位置名（与合并图库目录同名）。
+        找不到时回退到传感器对照表的 名称/监测部位。"""
+        sid = str(sensor_id)
+        for pos, entries in self.name_dict.items():
+            for e in entries or []:
+                if str(e.get("编号", "")) == sid:
+                    return pos
+        info = self.sensor_map.get(sid, {})
+        return info.get("名称") or info.get("监测部位") or ""
+
     def _merged_chart_path(self, sensor_id: str, kind: str,
                            metric_feature: str = "") -> Optional[str]:
-        """合并图库路径：图库/<监测部位>/<特征组>/<图型>.png。找不到返回 None。"""
+        """合并图库路径，按优先级查找：
+          1) 图库/<监测部位>/<特征组>/<图型>.png（多传感器子图）
+          2) 图库/<监测部位>/<特征组>/<特征>/<图型>.png（单传感器多特征复制布局）
+        找不到返回 None。"""
         if not self.charts_dir:
             return None
-        info = self.sensor_map.get(str(sensor_id), {})
-        pos = info.get("名称") or info.get("监测部位")
+        pos = self._position_for_sensor(sensor_id)
         if not pos:
             return None
         g = feature_group(metric_feature or "")
         fname = CHART_KIND_FILE.get(kind, "时间序列图.png")
         p = os.path.join(self.charts_dir, _safe_dir(pos), _safe_dir(g), fname)
-        return p if os.path.isfile(p) else None
+        if os.path.isfile(p):
+            return p
+        if metric_feature:
+            p2 = os.path.join(self.charts_dir, _safe_dir(pos), _safe_dir(g),
+                              _safe_dir(metric_feature), fname)
+            if os.path.isfile(p2):
+                return p2
+        return None
 
     # ------------------------------------------------------------------
     # 待补图表占位图

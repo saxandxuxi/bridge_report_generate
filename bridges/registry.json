@@ -15,7 +15,7 @@
       "id": "dongtinghu",
       "name": "洞庭湖大桥",
       "config": "config.json",
-      "host": "",
+      "host": "222.242.220.14",
       "port": 8080,
       "token_env": "BRIDGE_DONGTINGHU_TOKEN",
       "description": "洞庭湖大桥（当前为虚拟样例数据，待接真实预处理产物）"
@@ -24,7 +24,7 @@
       "id": "mishuihe",
       "name": "洣水河特大桥",
       "config": "",
-      "host": "",
+      "host": "218.75.217.159",
       "port": 8080,
       "token_env": "BRIDGE_MISHUIHE_TOKEN",
       "description": "洣水河特大桥——需在各桥服务器创建 config_mishuihe.json"
@@ -33,7 +33,7 @@
       "id": "xiangjiang",
       "name": "湘江特大桥",
       "config": "",
-      "host": "",
+      "host": "222.247.255.109",
       "port": 8080,
       "token_env": "BRIDGE_XIANGJIANG_TOKEN",
       "description": "湘江特大桥——需在各桥服务器创建 config_xiangjiang.json"
@@ -42,7 +42,7 @@
       "id": "aizhai",
       "name": "矮寨大桥",
       "config": "",
-      "host": "",
+      "host": "218.76.92.189",
       "port": 8080,
       "token_env": "BRIDGE_AIZHAI_TOKEN",
       "description": "矮寨大桥——需在各桥服务器创建 config_aizhai.json"
