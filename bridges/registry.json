@@ -41,7 +41,7 @@
     {
       "id": "aizhai",
       "name": "矮寨大桥",
-      "config": "",
+      "config": "config_aizhai.json",
       "host": "218.76.92.189",
       "port": 8080,
       "token_env": "BRIDGE_AIZHAI_TOKEN",
@@ -55,6 +55,13 @@
       "port": 8080,
       "token_env": "BRIDGE_6_TOKEN",
       "description": "第六座桥（待确认桥名/服务器）"
+    },
+    {
+      "id": "矮寨大桥",
+      "name": "矮寨大桥",
+      "config": "config_矮寨大桥.json",
+      "host": "",
+      "port": 8080
     }
   ]
 }

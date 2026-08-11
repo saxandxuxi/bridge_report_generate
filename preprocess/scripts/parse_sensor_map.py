@@ -27,9 +27,9 @@ W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 DEFAULT_DOCX = r"D:\五座桥数据分析文件\五座桥测点编号表格.docx"
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "..", "统计值", "传感器编号名称.json")
+                           "..", "传感器对照", "传感器编号名称.json")
 DEFAULT_NAME_MAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "统计值", "传感器名称对照")
+                                    "..", "传感器对照", "传感器名称对照")
 DEFAULT_STATS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "..", "统计值")
 

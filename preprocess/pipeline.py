@@ -52,6 +52,34 @@ def save_status(status: dict) -> None:
         json.dump(status, f, ensure_ascii=False, indent=2)
 
 
+def period_tag(start="", end=""):
+    """由起止日期生成年月标签（与 preprocess_sensor_data/build_chart_library 一致）。"""
+    def _parse(s):
+        try:
+            return dt.date.fromisoformat(str(s).strip())
+        except (ValueError, AttributeError):
+            return None
+    d0, d1 = _parse(start), _parse(end)
+    if not d0 or not d1:
+        return ""
+    if d0.year == d1.year:
+        if d0.month == d1.month:
+            return f"{d0.year}.{d0.month:02d}"
+        return f"{d0.year}.{d0.month}~{d1.month}"
+    return f"{d0.year}.{d0.month}~{d1.year}.{d1.month}"
+
+
+def read_latest_dirs():
+    """从 status.json 读取最近一次生成的 图库/统计值 目录。"""
+    try:
+        with open(STATUS_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        dirs = d.get("dirs") or {}
+        return dirs.get("charts"), dirs.get("stats")
+    except Exception:
+        return None, None
+
+
 def run_step(name: str, cmd: list, status: dict) -> bool:
     """执行一步，日志追加到 pipeline.log，返回是否成功。"""
     log.info("== 步骤 %s: %s", name, " ".join(cmd))
@@ -139,10 +167,18 @@ def main() -> int:
             log.error(status["error"])
             return 1
         os.makedirs(daily, exist_ok=True)
-        ok = run_step("秒级数据->日级数据", [
+        cmd1 = [
             py, os.path.join(ROOT, "scripts", "preprocess_sensor_data.py"),
             "--mode", "preprocess", "--data-root", raw, "--output-root", daily,
-        ], status)
+        ]
+        tag = period_tag(start, end)
+        if tag:
+            cmd1 += ["--period-tag", tag]
+        if start:
+            cmd1 += ["--start", start]
+        if end:
+            cmd1 += ["--end", end]
+        ok = run_step("秒级数据->日级数据", cmd1, status)
         if not ok:
             status["error"] = "预处理步骤失败"
             status["running"] = False
@@ -151,13 +187,20 @@ def main() -> int:
 
     # 2) 日级 -> 图库 + 统计值
     if not args.skip_charts:
-        daily_data = os.path.join(daily, "daily") if daily else ""
+        tag = period_tag(start, end)
+        daily_data = ((os.path.join(daily, f"daily_{tag}") if tag
+                       else os.path.join(daily, "daily")) if daily else "")
         cmd = [
             py, os.path.join(ROOT, "scripts", "build_chart_library.py"),
             "--daily-root", daily_data or ".",
-            "--charts-dir", charts, "--stats-dir", stats,
             "--mode", "merged", "--dpi", "200",
         ]
+        # 图库/统计值目录名自动带年月范围（如 图库_2026.1~3）；
+        # 仅命令行显式指定 --charts/--stats 时才用固定目录
+        if args.charts:
+            cmd += ["--charts-dir", args.charts]
+        if args.stats:
+            cmd += ["--stats-dir", args.stats]
         if limit:
             cmd += ["--limit-sensors", str(limit)]
         if start:
@@ -175,7 +218,10 @@ def main() -> int:
 
     # 3) 测点编号表格 -> 传感器对照表
     if not args.skip_sensor_map and map_docx and os.path.isfile(map_docx):
-        out_map = os.path.join(stats, "传感器编号名称.json")
+        # 传感器对照表是固定产物（不随季度变化），统一放在 preprocess/传感器对照/
+        map_dir = os.path.join(ROOT, "preprocess", "传感器对照")
+        os.makedirs(map_dir, exist_ok=True)
+        out_map = os.path.join(map_dir, "传感器编号名称.json")
         ok = run_step("测点编号表格->传感器对照表", [
             py, os.path.join(ROOT, "scripts", "parse_sensor_map.py"),
             map_docx, out_map,
@@ -188,6 +234,12 @@ def main() -> int:
     else:
         log.info("跳过传感器对照表（未提供 docx 或已跳过）")
 
+    # 用 build_chart_library 写回的最新目录覆盖 status.dirs
+    latest_charts, latest_stats = read_latest_dirs()
+    if latest_charts:
+        status["dirs"]["charts"] = latest_charts
+    if latest_stats:
+        status["dirs"]["stats"] = latest_stats
     status["running"] = False
     status["step"] = "done"
     status["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")

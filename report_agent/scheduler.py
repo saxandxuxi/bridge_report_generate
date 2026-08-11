@@ -81,7 +81,8 @@ def _setup_logging(output_dir: str) -> None:
         handlers=[
             logging.StreamHandler(),
             logging.FileHandler(
-                os.path.join(output_dir, "scheduler.log"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "outputs", "logs", "scheduler.log"),
                 encoding="utf-8",
             ),
         ],

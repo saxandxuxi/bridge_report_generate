@@ -86,6 +86,22 @@ CHART_KIND_FILE = {
     "box": "频率分布图.png",
 }
 
+
+def _pick_chart_file(dirpath: str, base_name: str) -> Optional[str]:
+    """取图表文件：优先 base_name；振动按天出图时退化为
+    base_YYYY-MM-DD.png 中日期最新的一个(如 时间序列图_2026-03-31.png)。"""
+    p = os.path.join(dirpath, base_name)
+    if os.path.isfile(p):
+        return p
+    if os.path.isdir(dirpath):
+        prefix = base_name.rsplit(".", 1)[0] + "_"
+        cand = sorted(fn for fn in os.listdir(dirpath)
+                      if fn.startswith(prefix) and fn.endswith(".png"))
+        if cand:
+            return os.path.join(dirpath, cand[-1])
+    return None
+
+
 # 轴/方向分量 -> 同一特征组（与 build_chart_library.feature_group 保持一致）
 _AXIS_INNER = {"Δx", "Δy", "Δz", "x", "y", "z"}
 
@@ -279,6 +295,11 @@ class BridgeData:
                         "监测部位": info.get("监测部位", "") or name,
                         "类别": info.get("类别", ""),
                     }
+                    # 特征列表（传感器编号名称.json 用“特征编码”字段；
+                    # 兼容旧格式“特征”）——缺了它 sensors_for_metric 会退化为全量传感器
+                    feats = list(info.get("特征编码", []) or info.get("特征", []) or [])
+                    if feats:
+                        self._sensor_features[str(sid)] = feats
 
             # 2b. 人工维护的“传感器名称 -> 编号/特征”对照表
             self._load_name_dict()
@@ -346,6 +367,104 @@ class BridgeData:
                 return sid
         return None
 
+    def _sensors_at_position(self, pos: str, metric: str) -> List[str]:
+        """返回某监测部位中支持该指标的传感器编号（按名称对照顺序）。
+
+        指标有特征时按特征编码过滤；无特征时按“类别”过滤（如 挠度/应变/风荷载），
+        避免同一位置混装多种传感器时取错（如 5#塔梁交接处主梁 同时有结构温度/应变/挠度）。
+        """
+        key = _norm(pos)
+        entries = self.name_dict.get(key) or []
+        if not entries:
+            # 兼容全角/半角数字等写法差异（如 “6号” vs “六号”）
+            merged = []
+            for k, v in self.name_dict.items():
+                kn = _norm(k)
+                # 精确/包含匹配；“4#墩墩顶主梁梁端”是“…左侧/右侧”的前缀时合并两侧
+                if kn == key or (len(key) >= 2 and key in kn) or (len(kn) >= 2 and kn in key):
+                    merged.extend(v)
+            if merged:
+                entries = merged
+        feat = self.metrics.get(metric, {}).get("feature", "")
+        cat = self.metric_category.get(metric, "")
+        sids = []
+        for e in entries:
+            sid = str(e.get("编号", ""))
+            if not sid or self._is_excluded(sid):
+                continue
+            feats = [str(x) for x in (e.get("特征编码") or [])]
+            if feat and feat in feats:
+                sids.append(sid)
+            elif not feat and cat and e.get("特征") == cat:
+                sids.append(sid)
+            elif not feat and not cat:
+                sids.append(sid)
+        if not sids:
+            # 墩顶支座倾角表：位置如 “4#墩墩顶主梁支座左侧Y” -> 墩号+左/右+X/Y
+            if metric == "rotation" and "墩顶支座倾角表" in (self.table_map or {}):
+                m = re.search(r"(\d+)#[^左右]*?(左|右)[^xyXY]*?([xyXY])", key)
+                if m:
+                    entry = (self.table_map["墩顶支座倾角表"].get(m.group(1) + "#")
+                             or self.table_map["墩顶支座倾角表"].get(m.group(1)) or {})
+                    want = _norm(m.group(2) + m.group(3))
+                    e = None
+                    for ek, ev in entry.items():
+                        if _norm(str(ek)) == want:
+                            e = ev
+                            break
+                    if e and e.get("编号"):
+                        return [str(e["编号"])]
+        if not sids:
+            # 梁端支座位移表：位置如 “4#墩墩顶主梁梁端” -> 墩号 -> 左/右 传感器
+            if "梁端" in key and "梁端支座位移表" in (self.table_map or {}):
+                m = re.search(r"(\d+)#", key)
+                if m:
+                    row = (self.table_map["梁端支座位移表"].get(m.group(1) + "#")
+                           or self.table_map["梁端支座位移表"].get(m.group(1)) or {})
+                    out = []
+                    # 位置已带方向（如 “4#墩墩顶主梁梁端左侧”）时只取对应侧，
+                    # 避免左侧/右侧都合并成同一组传感器导致图注错位
+                    if "左侧" in key or ("左" in key and "右" not in key):
+                        sides = ("左",)
+                    elif "右侧" in key or ("右" in key and "左" not in key):
+                        sides = ("右",)
+                    else:
+                        sides = ("左", "右")
+                    for side in sides:
+                        e = row.get(side)
+                        if e and e.get("编号"):
+                            out.append(str(e["编号"]))
+                    if out:
+                        return out
+        if not sids:
+            # 表格映射兜底（结构温度表/温湿度表/裂缝监测表等的位置 -> 传感器列表）
+            mkey = {
+                "structure_temperature": "结构温度表",
+                "temperature": "温湿度表",
+                "humidity": "温湿度表",
+                "crack": "裂缝监测表",
+            }.get(metric, "")
+            if mkey and mkey in (self.table_map or {}):
+                for k, v in (self.table_map[mkey] or {}).items():
+                    if _norm(k) == key:
+                        return [str(x) for x in v]
+        if not sids:
+            # 传感器对照表兜底：位置名精确匹配（如 7LX（S）-22 索力位置）
+            feat = self.metrics.get(metric, {}).get("feature", "")
+            cat = self.metric_category.get(metric, "")
+            for sid, info in self.sensor_map.items():
+                nm = _norm(info.get("名称") or "") or _norm(info.get("监测部位") or "")
+                if nm != key or self._is_excluded(sid):
+                    continue
+                feats = self._sensor_features.get(sid, [])
+                if feat and feat in feats:
+                    sids.append(str(sid))
+                elif not feat and cat and info.get("类别") == cat:
+                    sids.append(str(sid))
+                elif not feat and not cat:
+                    sids.append(str(sid))
+        return sids
+
     def status(self) -> Dict:
         """返回加载状态摘要（供 Web 端展示）。"""
         stats_ok = bool(self.stats_dir) and os.path.isdir(self.stats_dir)
@@ -380,6 +499,11 @@ class BridgeData:
                 if self._is_excluded(sid):
                     continue
                 if feat in feats:
+                    # 只取当前桥的传感器（对照表包含多座桥）
+                    if self.bridge_name:
+                        bname = self.sensor_map.get(sid, {}).get("桥名", "")
+                        if bname and bname != self.bridge_name:
+                            continue
                     sids.append(sid)
         if not sids:
             # 特征未知时：优先用监测类别限定（振动/应变/索力…），避免跨类别污染
@@ -523,6 +647,34 @@ class BridgeData:
             return self._aggregate_daily(daily, stat, fstats=fstats)
         return self._full_period_stats(fstats, stat)
 
+    def _stat_detail(self, sensor_id: str, metric: str, stat: str, period: Dict,
+                     feature: str = "") -> Optional[Dict]:
+        """单个传感器统计 + 数据来源明细；读不到返回 None。"""
+        fstats = self._feature_stats(sensor_id, metric, feature=feature)
+        if not fstats:
+            return None
+        info = self.sensor_map.get(str(sensor_id), {})
+        daily = self._period_daily(fstats, period)
+        if daily:
+            v = self._aggregate_daily(daily, stat, fstats=fstats)
+            source = "报告期逐日聚合"
+            days = len(daily)
+        else:
+            v = self._full_period_stats(fstats, stat)
+            source = "统计值JSON整体统计（报告期内无逐日数据）"
+            days = 0
+        if v is None:
+            return None
+        return {
+            "传感器编号": str(sensor_id),
+            "监测部位": info.get("名称") or info.get("监测部位") or "",
+            "特征": feature or self.metrics.get(metric, {}).get("feature", ""),
+            "统计文件": os.path.join(self.stats_dir, f"{sensor_id}.json"),
+            "数据来源": source,
+            "天数": days,
+            "值": v,
+        }
+
     @staticmethod
     def _extract_dunhao(title: str) -> str:
         """从表格标题提取墩号，如 '4#墩墩顶主梁梁端支座位移监测统计' -> '4'。"""
@@ -541,8 +693,10 @@ class BridgeData:
 
     def _resolve_cell_by_table(self, metric: str, column: str, stat: str,
                                period: Dict, title: str,
-                               row_index: int = 0) -> Optional[float]:
-        """按表格标题上下文解析单元格（测点映射 / 表格映射）。"""
+                               row_index: int = 0,
+                               trace: Optional[Dict] = None) -> Optional[float]:
+        """按表格标题上下文解析单元格（测点映射 / 表格映射）。
+        trace: 传入字典时记录命中的分支与传感器编号（供血缘日志）。"""
         if not title:
             return None
         t = title.replace("{{", "").replace("}}", "")
@@ -556,6 +710,9 @@ class BridgeData:
                     plan = next((p for p in plans if p.get("断面位置") == pos), None)
                     sid = (plan or {}).get("测点", {}).get(column)
                     if sid:
+                        if trace is not None:
+                            trace.update({"branch": "测点映射表", "position": pos,
+                                          "sensor_id": str(sid), "column": column})
                         return self._sensor_stat(str(sid), metric, stat, period)
 
         # 2) 梁端支座位移表：墩号 + 左/右
@@ -566,6 +723,9 @@ class BridgeData:
             row = (entry.get(dun + "#") or entry.get(dun) or {})
             entry = row.get(side)
             if entry:
+                if trace is not None:
+                    trace.update({"branch": "梁端支座位移表", "position": f"{dun}#墩{side}",
+                                  "sensor_id": str(entry.get("编号", "")), "column": column})
                 return self._sensor_stat(str(entry.get("编号", "")), metric, stat, period,
                                          feature=str(entry.get("特征", "")))
 
@@ -578,24 +738,26 @@ class BridgeData:
             row = (entry.get(dun + "#") or entry.get(dun) or {})
             entry = row.get(side + axis)
             if entry:
+                if trace is not None:
+                    trace.update({"branch": "墩顶支座倾角表", "position": f"{dun}#墩{side}{axis}",
+                                  "sensor_id": str(entry.get("编号", "")), "column": column})
                 return self._sensor_stat(str(entry.get("编号", "")), metric, stat, period,
                                          feature=str(entry.get("特征", "")))
 
-        # 4) 裂缝监测表：列名 -> 断面位置 -> 该位置全部裂缝传感器聚合
+        # 4) 裂缝监测表：列名 -> 断面位置 -> 按表格行号取对应传感器
         if "裂缝" in t and "裂缝监测表" in self.table_map:
             pos = self._match_position(column, list(self.table_map["裂缝监测表"].keys()))
             if pos:
                 ids = [str(x) for x in self.table_map["裂缝监测表"][pos]]
-                vals = [self._sensor_stat(s, metric, stat, period) for s in ids]
-                vals = [v for v in vals if v is not None]
-                if vals:
-                    if stat == "max":
-                        return max(vals)
-                    if stat == "min":
-                        return min(vals)
-                    if stat == "range":
-                        return max(vals) - min(vals)
-                    return sum(vals) / len(vals)
+                if not ids:
+                    return None
+                # 一个监测部位有多个传感器时，按表格行号取对应传感器
+                # （第1行 -> 第1个传感器，第2行 -> 第2个传感器…）
+                sid = ids[row_index % len(ids)]
+                if trace is not None:
+                    trace.update({"branch": "裂缝监测表", "position": pos,
+                                  "sensor_id": sid, "column": column})
+                return self._sensor_stat(sid, metric, stat, period)
 
         # 5) 温湿度表 / 结构温度表：位置 -> 编号列表
         for kw, mkey in (("结构温度", "结构温度表"), ("温湿度", "温湿度表")):
@@ -609,6 +771,9 @@ class BridgeData:
                     # 一个监测部位有多个传感器时，按表格行号取对应传感器
                     # （第1行 -> 第1个传感器，第2行 -> 第2个传感器…）
                     sid = ids[row_index % len(ids)]
+                    if trace is not None:
+                        trace.update({"branch": f"{mkey}", "position": pos,
+                                      "sensor_id": sid, "column": column})
                     return self._sensor_stat(sid, metric, stat, period, feature=feat)
         return None
 
@@ -726,58 +891,153 @@ class BridgeData:
     def resolve_cell(self, metric: str, column: str, stat: str, period: Dict,
                      table_title: str = "", row_index: int = 0) -> Optional[float]:
         """解析 {{cell.<metric>.<column>.<stat>}}，可带表格标题上下文。"""
+        value, _detail = self.resolve_cell_detail(metric, column, stat, period,
+                                                  table_title=table_title,
+                                                  row_index=row_index)
+        return value
+
+    def resolve_cell_detail(self, metric: str, column: str, stat: str, period: Dict,
+                            table_title: str = "", row_index: int = 0):
+        """解析 {{cell.<metric>.<column>.<stat>}}，返回 (值, 数据链路明细)。"""
         actual = _canon_stat(STAT_KEY_MAP.get(stat, stat))
+        trace: Dict = {}
+        val = None
         # 0) 表格上下文映射（测点N / 左侧右侧 / 左X右X 等）
         if table_title:
             val = self._resolve_cell_by_table(metric, column, actual, period, table_title,
-                                              row_index=row_index)
+                                              row_index=row_index, trace=trace)
             if val is not None:
                 self._match_stats["table_map"] = self._match_stats.get("table_map", 0) + 1
-                return val
-        sensor_id = self.find_sensor(metric, column)
+        # 1) 通用位置多传感器：column 为监测部位名时按表格行号取该位置第 N 个传感器
+        if val is None:
+            pos = self._match_position(column, list(self.name_dict.keys()))
+            if pos:
+                sids = self._sensors_at_position(pos, metric)
+                if sids:
+                    sid = sids[row_index % len(sids)]
+                    trace.update({"branch": "名称对照位置-按行取传感器",
+                                  "position": pos, "sensor_id": str(sid), "column": column})
+                    val = self._sensor_stat(sid, metric, actual, period)
+                    if val is not None:
+                        self._match_stats["name_dict"] = self._match_stats.get("name_dict", 0) + 1
+        # 2) find_sensor 直接命中
+        if val is None:
+            sensor_id = self.find_sensor(metric, column)
+            if sensor_id:
+                trace.update({"branch": "find_sensor", "sensor_id": str(sensor_id),
+                              "column": column})
+                fstats = self._feature_stats(sensor_id, metric)
+                if fstats:
+                    daily = self._period_daily(fstats, period)
+                    val = self._aggregate_daily(daily, actual, fstats=fstats) if daily else None
+                    if val is not None:
+                        trace.update({"position": self._position_for_sensor(sensor_id)})
+        # 3) 回退：该指标全部传感器聚合
+        if val is None:
+            self._match_stats["metric_fallback"] += 1
+            agg, agg_detail = self.resolve_metric_stat_detail(metric, stat, period)
+            if agg is not None:
+                val = agg
+                trace.update({"branch": "回退-指标全传感器聚合",
+                              "sensor_id": None, "position": None})
+                detail = {
+                    "占位符": f"cell.{metric}.{column}.{stat}",
+                    "指标": metric,
+                    "统计量": stat,
+                    "报告期": f"{period.get('start')} ~ {period.get('end')}",
+                    "分支": trace.get("branch", ""),
+                    "监测部位": trace.get("position") or column,
+                    "表格标题": table_title,
+                    "表格行号": row_index + 1,
+                    "聚合明细": agg_detail,
+                    "最终值": val,
+                }
+                return val, detail
+            detail = {
+                "占位符": f"cell.{metric}.{column}.{stat}",
+                "结果": "未找到",
+                "原因": agg_detail.get("原因", "无可用统计值"),
+                "分支": trace.get("branch", ""),
+                "表格标题": table_title,
+                "表格行号": row_index + 1,
+            }
+            return None, detail
+        # 组装常规明细
+        sensor_id = trace.get("sensor_id")
+        d = None
         if sensor_id:
-            fstats = self._feature_stats(sensor_id, metric)
-            if fstats:
-                daily = self._period_daily(fstats, period)
-                val = self._aggregate_daily(daily, actual, fstats=fstats) if daily else None
-                if val is not None:
-                    return val
-                # 报告期内无数据，但整体统计存在：仍返回整体值并告警？
-                # 返回 None 由上层决定（填入“—”并计入待补）
-        # 回退：该指标全部传感器聚合
-        self._match_stats["metric_fallback"] += 1
-        return self.resolve_metric_stat(metric, stat, period)
+            d = self._stat_detail(sensor_id, metric, actual, period)
+        detail = {
+            "占位符": f"cell.{metric}.{column}.{stat}",
+            "指标": metric,
+            "统计量": stat,
+            "报告期": f"{period.get('start')} ~ {period.get('end')}",
+            "分支": trace.get("branch", ""),
+            "监测部位": trace.get("position") or column,
+            "表格标题": table_title,
+            "表格行号": row_index + 1,
+            "传感器": d,
+            "最终值": val,
+        }
+        return val, detail
 
     def resolve_metric_stat(self, metric: str, stat: str, period: Dict) -> Optional[float]:
         """解析 {{stats.<metric>.<stat>}}：对该指标全部传感器聚合。"""
+        value, _detail = self.resolve_metric_stat_detail(metric, stat, period)
+        return value
+
+    def resolve_metric_stat_detail(self, metric: str, stat: str, period: Dict):
+        """解析 {{stats.<metric>.<stat>}}，返回 (值, 数据链路明细)。
+
+        明细包含：报告期、聚合规则、每个传感器的统计文件/天数/数值，
+        供 data_lineage 日志使用。
+        """
         actual = _canon_stat(STAT_KEY_MAP.get(stat, stat))
-        vals = []
+        per_sensor = []
         for sid in self.sensors_for_metric(metric):
-            fstats = self._feature_stats(sid, metric)
-            if not fstats:
-                continue
-            daily = self._period_daily(fstats, period)
-            if daily:
-                v = self._aggregate_daily(daily, actual, fstats=fstats)
-            else:
-                v = self._full_period_stats(fstats, actual)
-            if v is not None:
-                vals.append(v)
-        if not vals:
-            return None
+            d = self._stat_detail(sid, metric, actual, period)
+            if d:
+                per_sensor.append(d)
+        if not per_sensor:
+            return None, {
+                "占位符": f"stats.{metric}.{stat}",
+                "结果": "未找到",
+                "原因": f"指标 {metric} 无可用传感器统计值",
+            }
+        vals = [d["值"] for d in per_sensor]
         if actual == "max":
-            return max(vals)
-        if actual == "min":
-            return min(vals)
-        if actual == "abs_max":
-            return max(vals, key=abs)
-        if actual == "range":
-            return max(vals) - min(vals)
-        if actual == "sum":
-            return sum(vals)
-        if actual in ("count", "days"):
-            return sum(vals)
-        return sum(vals) / len(vals)
+            value, rule = max(vals), "跨传感器取最大"
+        elif actual == "min":
+            value, rule = min(vals), "跨传感器取最小"
+        elif actual == "abs_max":
+            value, rule = max(vals, key=abs), "跨传感器取绝对值最大"
+        elif actual == "range":
+            value, rule = max(vals), "跨传感器取最大差值（各传感器报告期内最大-最小）"
+        elif actual == "sum":
+            value, rule = sum(vals), "跨传感器求和"
+        elif actual in ("count", "days"):
+            value, rule = sum(vals), "跨传感器求和"
+        else:
+            value, rule = sum(vals) / len(vals), "跨传感器取平均"
+        detail = {
+            "占位符": f"stats.{metric}.{stat}",
+            "指标": metric,
+            "统计量": stat,
+            "报告期": f"{period.get('start')} ~ {period.get('end')}",
+            "聚合规则": rule,
+            "传感器数": len(per_sensor),
+            "逐传感器": per_sensor,
+            "最终值": value,
+        }
+        # 最值/差值对应的监测部位（供 {{stats.<metric>.<stat>.loc}} 使用）
+        loc = ""
+        for d in per_sensor:
+            if abs(d["值"] - value) < 1e-9:
+                loc = d.get("监测部位") or ""
+                break
+        if loc:
+            detail["位置"] = loc
+        return value, detail
 
     def estimate_days(self, period: Dict) -> int:
         """估算报告期内的数据覆盖天数（用于 {{stats.days}} 等占位符）。"""
@@ -916,6 +1176,14 @@ class BridgeData:
         if chart_id in self.chart_map:
             return str(self.chart_map[chart_id])
 
+        # 0) 位置化占位符：<metric>_<监测部位>_<kind>_<n>（如 strain_4#墩底部_trend_1）
+        pp = self._parse_position_chart_id(chart_id)
+        if pp:
+            metric, pos, _kind, n = pp
+            sids = self._sensors_at_position(pos, metric)
+            if sids:
+                return sids[(n - 1) % len(sids)]
+
         ctx_texts = context if isinstance(context, (list, tuple)) else ([context] if context else [])
         text = " ".join([caption] + [str(x) for x in ctx_texts if x]).strip()
         parsed = self._parse_chart_id(chart_id)
@@ -948,7 +1216,15 @@ class BridgeData:
                 key = (found_metric or "?", _norm(location), kind)
                 idx = self._chart_seq.get(key, 0)
                 self._chart_seq[key] = idx + 1
-                return loc_sids[idx % len(loc_sids)]
+                # 同一位置多个传感器时按监测部位分组再取序号，
+                # 避免 5#/6#/7#/8#塔梁交接处主梁 等场景前两个序号都落在 5#
+                by_pos = {}
+                for sid in loc_sids:
+                    p = self._position_for_sensor(sid)
+                    by_pos.setdefault(p, []).append(sid)
+                ordered = [v[0] for _, v in sorted(by_pos.items())]
+                pool = ordered if ordered else loc_sids
+                return pool[idx % len(pool)]
 
         # 2) 指标序号顺序分配（如 temperature_trend_2 -> 温度传感器第2个）
         if parsed and metric_from_id in self.metrics:
@@ -959,6 +1235,14 @@ class BridgeData:
         # 3) 泛型序号 + 指标回退（如 chart_trend_35 + 倾角 -> rotation 第35个，越界则失败）
         if parsed and parsed[0] is None and found_metric:
             sids = self.sensors_for_metric(found_metric)
+            # 按监测部位分组，先位置后传感器（避免同位置多传感器重复占用前几个序号）
+            by_pos = {}
+            for sid in sids:
+                p = self._position_for_sensor(sid)
+                by_pos.setdefault(p, []).append(sid)
+            ordered = [v[0] for _, v in sorted(by_pos.items())]
+            if ordered and 1 <= parsed[2] <= len(ordered):
+                return ordered[parsed[2] - 1]
             if sids and 1 <= parsed[2] <= len(sids):
                 return sids[parsed[2] - 1]
 
@@ -971,6 +1255,64 @@ class BridgeData:
                 if any(n and len(n) >= 4 and _norm(n) in _norm(caption) for n in names):
                     return sid
         return None
+
+    def _parse_position_chart_id(self, chart_id: str):
+        """解析 位置化图表ID：<metric>_<监测部位>_<kind>_<n>。
+
+        如 strain_4#墩底部_trend_1 -> ("strain", "4#墩底部", "trend", 1)。
+        找不到返回 None。
+        """
+        if not chart_id or not self.name_dict:
+            return None
+        cands = self._position_candidates()
+        for metric in sorted(self.metrics, key=len, reverse=True):
+            prefix = metric + "_"
+            if not chart_id.startswith(prefix):
+                continue
+            rest = chart_id[len(prefix):]
+            rest_norm = _norm(rest)
+            for pos in cands:
+                pn = _norm(pos)
+                if not rest_norm.startswith(pn + "_"):
+                    continue
+                after = rest[len(pos) + 1:]
+                m = re.match(r"^(?P<kind>[a-z_]+)_(?P<n>\d+)$", after)
+                if m:
+                    return metric, pos, m.group("kind"), int(m.group("n"))
+        return None
+
+    def _position_candidates(self) -> List[str]:
+        """位置化图表 ID 可匹配的监测位置候选集（按长度降序）。
+
+        覆盖：传感器名称对照表 + 表格映射位置（结构温度表/裂缝监测表等）
+        + 测点映射断面 + 传感器对照表的 名称/监测部位（如 7LX（S）-22）。
+        """
+        cands = set(self.name_dict.keys())
+        for tname, m in (self.table_map or {}).items():
+            if isinstance(m, dict):
+                cands.update(str(k) for k in m.keys())
+                # 梁端支座位移表：补 “4#墩墩顶主梁梁端” 组合位置
+                if "梁端支座位移表" in str(tname):
+                    for dun in m:
+                        cands.add(f"{dun}墩墩顶主梁梁端")
+        # 从名称对照已有的“左侧x/右侧x”派生“左侧Y/右侧Y”位置（字符保持一致）
+        extra = set()
+        for c in list(cands):
+            if re.search(r"(左|右)侧x$", _norm(c)):
+                extra.add(c[:-1] + "Y")
+        cands.update(extra)
+        for m in (self.point_map or {}).values():
+            if isinstance(m, list):
+                for pl in m:
+                    p = (pl or {}).get("断面位置")
+                    if p:
+                        cands.add(str(p))
+        for info in self.sensor_map.values():
+            for f in ("名称", "监测部位"):
+                v = info.get(f)
+                if v:
+                    cands.add(str(v))
+        return sorted(cands, key=len, reverse=True)
 
     def _extract_location(self, text: str) -> str:
         """从图注/上下文提取监测位置关键词。"""
@@ -1030,20 +1372,32 @@ class BridgeData:
 
         # 确定特征与图片文件名
         parsed = self._parse_chart_id(chart_id)
-        kind = parsed[1] if parsed else "trend"
+        pp = self._parse_position_chart_id(chart_id)
+        if pp:
+            metric_from_id, _pos, kind = pp[0], pp[1], pp[2]
+        else:
+            metric_from_id = parsed[0] if parsed else None
+            kind = parsed[1] if parsed else "trend"
         if kind not in CHART_KIND_FILE:
+            if kind in ("scatter", "correlation"):
+                # 相关性散点图：图库没有对应图时返回 None（由上层生成占位图），
+                # 不要退化为时程图导致“散点图位置插入时程图”
+                return None
             kind = "trend"
 
         # 优先：合并图库（图库/<监测部位>/<特征组>/<图型>.png）
+        # 特征选择：节上下文推断的指标(metric_hint) > chart_id 前缀指标 > 特征提示
         metric_feature = ""
-        if parsed and parsed[0] in self.metrics:
-            metric_feature = self.metrics[parsed[0]].get("feature", "")
-        elif feature_hint:
+        if metric_hint and metric_hint in self.metrics:
+            metric_feature = self.metrics[metric_hint].get("feature", "")
+        if not metric_feature and metric_from_id and metric_from_id in self.metrics:
+            metric_feature = self.metrics[metric_from_id].get("feature", "")
+        if not metric_feature and feature_hint:
             metric_feature = feature_hint
         merged = self._merged_chart_path(sensor_id, kind, metric_feature)
         if merged:
             display_metric = metric_hint or self._metric_alias_hit(
-                f"{caption} {' '.join(context) if isinstance(context, (list, tuple)) else context or ''}"
+                caption
             ) or None
             return {
                 "path": merged,
@@ -1061,12 +1415,11 @@ class BridgeData:
         if kind in ("scatter", "correlation"):
             # 相关性图在特征目录下: 相关性_<特征A>_<特征B>.png（此处不强行匹配）
             fname = "相关性_" + feat_dir + ".png"
-        path = os.path.join(self.charts_dir, sensor_id, feat_dir, fname)
-        if not os.path.isfile(path):
+        path = _pick_chart_file(
+            os.path.join(self.charts_dir, sensor_id, feat_dir), fname)
+        if not path:
             return None
-        display_metric = metric_hint or self._metric_alias_hit(
-            f"{caption} {' '.join(context) if isinstance(context, (list, tuple)) else context or ''}"
-        ) or None
+        display_metric = metric_hint or self._metric_alias_hit(caption) or None
         return {
             "path": path,
             "sensor_id": sensor_id,
@@ -1147,13 +1500,16 @@ class BridgeData:
             return None
         g = feature_group(metric_feature or "")
         fname = CHART_KIND_FILE.get(kind, "时间序列图.png")
-        p = os.path.join(self.charts_dir, _safe_dir(pos), _safe_dir(g), fname)
-        if os.path.isfile(p):
+        p = _pick_chart_file(
+            os.path.join(self.charts_dir, _safe_dir(pos), _safe_dir(g)),
+            fname)
+        if p:
             return p
         if metric_feature:
-            p2 = os.path.join(self.charts_dir, _safe_dir(pos), _safe_dir(g),
-                              _safe_dir(metric_feature), fname)
-            if os.path.isfile(p2):
+            p2 = _pick_chart_file(
+                os.path.join(self.charts_dir, _safe_dir(pos), _safe_dir(g),
+                             _safe_dir(metric_feature)), fname)
+            if p2:
                 return p2
         return None
 
@@ -1164,7 +1520,8 @@ class BridgeData:
     def make_placeholder_chart(self, chart_id: str, reason: str, out_dir: str) -> str:
         """为解析不到的图表生成一张明显的占位图，避免生成流程中断。"""
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, f"pending_{chart_id}.png")
+        safe = re.sub(r'[\\/:*?"<>|]', "_", str(chart_id))
+        path = os.path.join(out_dir, f"pending_{safe}.png")
         try:
             from PIL import Image, ImageDraw, ImageFont
             w, h = 1200, 700

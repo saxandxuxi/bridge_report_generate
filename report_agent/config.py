@@ -14,6 +14,39 @@ def _resolve_path(base_dir: str, path: str) -> str:
     return os.path.normpath(os.path.join(base_dir, path))
 
 
+def _apply_latest_bridge_dirs(cfg: dict, base: str) -> None:
+    """用 preprocess/status.json 中最近一次生成的 图库/统计值 目录覆盖 bridge_data 路径。
+
+    图库/统计值目录名现在带年月范围（如 图库_2026.1~3），status.json 由
+    build_chart_library.py 生成后写回；目录不存在时保持配置原值。
+    """
+    bridge_data = cfg.get("bridge_data") or {}
+    if not bridge_data:
+        return
+    status_path = os.path.join(base, "preprocess", "status.json")
+    if not os.path.isfile(status_path):
+        return
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            status = json.load(f)
+        dirs = status.get("dirs") or {}
+    except Exception:
+        return
+    stats = dirs.get("stats") or ""
+    charts = dirs.get("charts") or ""
+    if stats and os.path.isdir(stats):
+        bridge_data["stats_dir"] = stats
+        sm = os.path.join(stats, "传感器编号名称.json")
+        if os.path.isfile(sm):
+            bridge_data["sensor_map"] = sm
+        nd = os.path.join(stats, "传感器名称对照")
+        if os.path.isdir(nd):
+            nd_file = os.path.join(nd, "赤石大桥.json")
+            bridge_data["name_dict"] = nd_file if os.path.isfile(nd_file) else ""
+    if charts and os.path.isdir(charts):
+        bridge_data["charts_dir"] = charts
+
+
 def load_config(config_path: str = None) -> dict:
     """加载配置文件，并把所有相对路径转换为相对于配置文件目录的绝对路径。"""
     path = config_path or os.environ.get("REPORT_AGENT_CONFIG") or DEFAULT_CONFIG
@@ -64,8 +97,25 @@ def load_config(config_path: str = None) -> dict:
                 cfg["_chart_texts"] = chart_texts
             # 加载 data_values：annotate_docx 阶段保存的 {{data.N}} -> 原始值映射
             data_values = analysis.get("data_values", {})
+            # 以 numbers 中的 {{data.N}} 条目为准重建映射（历史 analysis 的
+            # data_values 可能是旧脏值，如车辆数 5/6/6 而非 758279 等）
+            data_number_meta = {}
+            for _n in analysis.get("numbers", []) or []:
+                _ph = _n.get("placeholder") or ""
+                if _ph.startswith("{{data.") and _ph.endswith("}}"):
+                    _key = _ph.strip("{}")
+                    data_values[_key] = str(_n.get("value", ""))
+                    data_number_meta[_key] = {
+                        "value": str(_n.get("value", "")),
+                        "context": str(_n.get("context", "")),
+                        "snippet": str(_n.get("snippet", "")),
+                        "paragraph": _n.get("paragraph"),
+                        "reasons": list(_n.get("reasons", []) or []),
+                    }
             if data_values:
                 cfg["_data_values"] = data_values
+            if data_number_meta:
+                cfg["_data_number_meta"] = data_number_meta
             # 全文档文本流（按段落索引），用于图表位置上下文继承
             texts = analysis.get("texts", [])
             if texts:
@@ -76,4 +126,5 @@ def load_config(config_path: str = None) -> dict:
                 "加载 chart_texts / data_values 失败: %s", exc
             )
 
+    _apply_latest_bridge_dirs(cfg, base)
     return cfg

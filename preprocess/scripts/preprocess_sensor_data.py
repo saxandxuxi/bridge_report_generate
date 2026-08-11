@@ -56,17 +56,54 @@ import os
 import re
 import time
 
+import numpy as np
+
 # ---------------- 需要按你的服务器修改的部分 ----------------
 DATA_ROOT = r"D:\信科采集软件解析数据"     # 原始数据根目录(远程服务器 D 盘)
 OUTPUT_ROOT = ""        # 留空 = 自动放在 DATA_ROOT 上一级的 results/ 目录
 BUCKET_SECONDS = 3600   # 聚合粒度(秒)，默认 3600 = 1 小时，一天输出 24 行
 WORKERS = 0             # 0 = 自动使用全部 CPU 核数
-MEDIAN_MODE = "exact"   # exact=精确中位数(默认); none=不计算中位数(最省内存)
+MEDIAN_MODE = "none"    # none=不计算中位数(默认,图库/统计值不使用中位数列)
 RESUME = False          # True = 已生成过的 daily 日文件自动跳过(断点续跑)
 SENSORS_PER_WORKER = 3  # 每个工作进程一次处理的传感器数量(按传感器分批)
+DAILY_SUBDIR = "daily"  # daily 输出子目录（带期号时为 daily_2026.1~3）
 # -----------------------------------------------------------
 
 logger = logging.getLogger("bridge_preprocess")
+
+
+def period_tag(start="", end=""):
+    """由起止日期生成年月范围标签，与图库/统计值目录一致。
+    例如 2026-01-01~2026-03-31 -> 2026.1~3；单月 -> 2026.07。"""
+    def _parse(s):
+        try:
+            return dt.date.fromisoformat(str(s).strip())
+        except (ValueError, AttributeError):
+            return None
+    d0, d1 = _parse(start), _parse(end)
+    if not d0 or not d1:
+        return ""
+    if d0.year == d1.year:
+        if d0.month == d1.month:
+            return f"{d0.year}.{d0.month:02d}"
+        return f"{d0.year}.{d0.month}~{d1.month}"
+    return f"{d0.year}.{d0.month}~{d1.year}.{d1.month}"
+
+
+def bucket_seconds_for(feature):
+    """特征专用聚合粒度：
+      - 风速 FSFX2(spfs)/FSFX2(szfs) -> 600 秒（10 分钟一个均值）
+      - 振动 DZJSD(xJsd)/yJsd/zJsd  -> 1 秒（保留全天秒级全量数据）
+      - 其余特征 -> BUCKET_SECONDS（默认 1 小时）
+    """
+    m = re.search(r"\(([^)]+)\)$", feature or "")
+    inner = (m.group(1) if m else (feature or "")).lower()
+    if inner in ("spfs", "szfs"):
+        return 600
+    if inner.endswith("jsd"):
+        return 1
+    return BUCKET_SECONDS
+
 
 # 真实文件名识别: 传感器编号_YYYYMMDDHH_模块(特征).csv
 # 例如 103_2026030300_WSD(rh).csv -> stamp=2026030300, name=WSD, axis=rh
@@ -193,30 +230,60 @@ def _looks_like_header(row):
 
 def _read_hour_file_fast(path):
     """
-    快速解析一个"一个小时"的 CSV（二进制逐行，数字是 ASCII 无需解码）。
-    按真实格式 计数器,数值 解析，返回 (counters, values)；
-    文件为空 / 打不开 / 一行都解析不出来时返回 None。
+    快速解析一个"一个小时"的 CSV（向量化，pandas C 引擎优先）。
+    按真实格式 计数器,数值 解析，返回 (counters, values) 为 numpy 数组；
+    文件为空 / 打不开 / 解析不出数值时返回 None。
     """
-    counters, values = [], []
+    # 1) 向量化路径（快 5~15 倍）
     try:
-        with open(path, "rb", buffering=1 << 20) as f:
-            for line in f:
-                if line.startswith(b"\xef\xbb\xbf"):  # 去 UTF-8 BOM
-                    line = line[3:]
-                line = line.strip()
-                if not line:
-                    continue
-                p = line.split(b",")
-                if len(p) < 2:
-                    continue
-                try:
-                    counters.append(int(p[0]))
-                    values.append(float(p[1]))
-                except ValueError:
-                    continue
-    except OSError as exc:
+        import pandas as pd
+        df = pd.read_csv(
+            path, header=None, usecols=[0, 1], engine="c",
+            dtype=float, skip_blank_lines=True,
+            on_bad_lines="skip", comment=None,
+        )
+        if df is None or df.empty:
+            return None
+        counters = df[0].to_numpy(dtype=np.float64)
+        values = df[1].to_numpy(dtype=np.float64)
+    except Exception:  # noqa: BLE001
+        counters = None
+    if counters is None:
+        # 2) 回退：逐行二进制解析（带表头/脏行时使用）
+        counters, values = [], []
+        try:
+            with open(path, "rb", buffering=1 << 20) as f:
+                for line in f:
+                    if line.startswith(b"\xef\xbb\xbf"):  # 去 UTF-8 BOM
+                        line = line[3:]
+                    line = line.strip()
+                    if not line:
+                        continue
+                    p = line.split(b",")
+                    if len(p) < 2:
+                        continue
+                    try:
+                        c = int(p[0])
+                        v = float(p[1])
+                    except ValueError:
+                        continue
+                    counters.append(c)
+                    values.append(v)
+        except OSError:
+            return None
+        if not counters:
+            return None
+        return (np.array(counters, dtype=np.int64),
+                np.array(values, dtype=np.float64))
+
+    # pandas 路径：过滤非有限值，计数器整数化
+    ok = np.isfinite(values) & np.isfinite(counters)
+    counters = counters[ok]
+    values = values[ok]
+    if counters.size == 0:
         return None
-    return (counters, values) if counters else None
+    counters = np.round(counters).astype(np.int64)
+    return counters, values
 
 
 def _read_hour_file_text(path):
@@ -301,11 +368,11 @@ def load_feature_day(sensor, date, feature):
 
 def aggregate_feature_day(sensor, date, feature):
     """
-    流式聚合某传感器某天某个特征的所有小时文件（正式处理路径）。
+    流式聚合某传感器某天某个特征的所有小时文件（正式处理路径，向量化）。
 
-    一次只读一个小时的 CSV，逐行换算成小时桶下标后立即更新
-    count/sum/sumsq/min/max，不把全天数据攒在内存；精确中位数
-    只保留每个桶的数值列表（MEDIAN_MODE="none" 时连这个也不留）。
+    每个小时文件用 numpy 批量分桶（count/sum/sumsq/min/max），
+    不把全天数据攒在内存；中位数列默认不计算（MEDIAN_MODE="none"，
+    图库/统计值不使用该列）。计数器单位同一天内只探测一次。
 
     返回 (out_rows, files_loaded, total_samples, errors)
     """
@@ -313,15 +380,16 @@ def aggregate_feature_day(sensor, date, feature):
     day_dir = os.path.join(DATA_ROOT, sensor,
                            f"{y:04d}", f"{m:02d}", f"{d:02d}")
     day_start = dt.datetime(y, m, d)
-    n_buckets = -(-86400 // BUCKET_SECONDS)  # 向上取整，兼容不能整除的粒度
-    counts = [0] * n_buckets
-    sums = [0.0] * n_buckets
-    sq_sums = [0.0] * n_buckets
-    mins = [None] * n_buckets
-    maxs = [None] * n_buckets
-    values = [[] for _ in range(n_buckets)] if MEDIAN_MODE == "exact" else None
+    bucket = bucket_seconds_for(feature)
+    n_buckets = -(-86400 // bucket)  # 向上取整，兼容不能整除的粒度
+    counts = np.zeros(n_buckets, dtype=np.int64)
+    sums = np.zeros(n_buckets, dtype=np.float64)
+    sq_sums = np.zeros(n_buckets, dtype=np.float64)
+    mins = np.full(n_buckets, np.inf)
+    maxs = np.full(n_buckets, -np.inf)
 
     files_loaded, errors, total = 0, [], 0
+    unit_cache = None
     if not os.path.isdir(day_dir):
         errors = ["day dir missing"]
     else:
@@ -333,22 +401,23 @@ def aggregate_feature_day(sensor, date, feature):
             fast = _read_hour_file_fast(path)
             if fast is not None:
                 counters, vals = fast
-                unit = detect_counter_unit(counters)
+                if unit_cache is None:
+                    unit_cache = detect_counter_unit(counters.tolist())
+                unit = unit_cache
                 c0 = counters[0]
                 base = hh * 3600.0
-                for c, v in zip(counters, vals):
-                    idx = int((base + (c - c0) * unit) // BUCKET_SECONDS)
-                    if 0 <= idx < n_buckets:
-                        counts[idx] += 1
-                        sums[idx] += v
-                        sq_sums[idx] += v * v
-                        total += 1
-                        if mins[idx] is None or v < mins[idx]:
-                            mins[idx] = v
-                        if maxs[idx] is None or v > maxs[idx]:
-                            maxs[idx] = v
-                        if values is not None:
-                            values[idx].append(v)
+                idx = ((base + (counters - c0) * unit) // bucket).astype(np.int64)
+                mask = (idx >= 0) & (idx < n_buckets) & np.isfinite(vals)
+                ii = idx[mask]
+                vv = vals[mask]
+                n = int(ii.size)
+                if n:
+                    np.add.at(counts, ii, 1)
+                    np.add.at(sums, ii, vv)
+                    np.add.at(sq_sums, ii, vv * vv)
+                    np.minimum.at(mins, ii, vv)
+                    np.maximum.at(maxs, ii, vv)
+                    total += n
                 files_loaded += 1
                 continue
             # 回退: 通用时间戳文本格式
@@ -357,37 +426,29 @@ def aggregate_feature_day(sensor, date, feature):
             if not file_errors:
                 files_loaded += 1
             for t, v in file_rows:
-                idx = int((t - day_start).total_seconds()) // BUCKET_SECONDS
+                idx = int((t - day_start).total_seconds()) // bucket
                 if 0 <= idx < n_buckets:
                     counts[idx] += 1
                     sums[idx] += v
                     sq_sums[idx] += v * v
                     total += 1
-                    if mins[idx] is None or v < mins[idx]:
+                    if v < mins[idx]:
                         mins[idx] = v
-                    if maxs[idx] is None or v > maxs[idx]:
+                    if v > maxs[idx]:
                         maxs[idx] = v
-                    if values is not None:
-                        values[idx].append(v)
 
     out = []
     for i in range(n_buckets):
-        ts = day_start + dt.timedelta(seconds=i * BUCKET_SECONDS)
-        if counts[i]:
-            n = counts[i]
+        ts = day_start + dt.timedelta(seconds=i * bucket)
+        n = int(counts[i])
+        if n:
             mean = sums[i] / n
             var = max(0.0, sq_sums[i] / n - mean * mean)
             std = math.sqrt(var)
-            if values is not None:
-                vals_i = values[i]
-                vals_i.sort()
-                if n % 2:
-                    median = vals_i[n // 2]
-                else:
-                    median = (vals_i[n // 2 - 1] + vals_i[n // 2]) / 2.0
-            else:
-                median = None
-            out.append((ts, n, mean, mins[i], maxs[i], sums[i], std, median))
+            vmin = None if np.isinf(mins[i]) else float(mins[i])
+            vmax = None if np.isinf(maxs[i]) else float(maxs[i])
+            median = None
+            out.append((ts, n, mean, vmin, vmax, sums[i], std, median))
         else:
             out.append((ts, 0, None, None, None, None, None, None))
     return out, files_loaded, total, errors
@@ -444,7 +505,7 @@ def process_task(task):
     sensor, date_str, feature = task
     y, m, d = map(int, date_str.split("-"))
     date = dt.date(y, m, d)
-    out_path = os.path.join(OUTPUT_ROOT, "daily", sensor, feature,
+    out_path = os.path.join(OUTPUT_ROOT, DAILY_SUBDIR, sensor, feature,
                             date_str + ".csv")
     # 断点续跑: 输出文件已存在且非空则跳过
     if RESUME and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -455,7 +516,7 @@ def process_task(task):
         out_rows, files_loaded, total, errors = \
             aggregate_feature_day(sensor, date, feature)
 
-        out_dir = os.path.join(OUTPUT_ROOT, "daily", sensor, feature)
+        out_dir = os.path.join(OUTPUT_ROOT, DAILY_SUBDIR, sensor, feature)
         os.makedirs(out_dir, exist_ok=True)
         with open(out_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -554,14 +615,17 @@ def process_batch(batch):
     return results
 
 
-def init_worker(data_root, output_root, bucket_seconds, median_mode, resume):
+def init_worker(data_root, output_root, bucket_seconds, median_mode, resume,
+                daily_subdir):
     """把运行参数传给每个工作进程(Windows 多进程会重新导入模块)。"""
     global DATA_ROOT, OUTPUT_ROOT, BUCKET_SECONDS, MEDIAN_MODE, RESUME
+    global DAILY_SUBDIR
     DATA_ROOT = data_root
     OUTPUT_ROOT = output_root
     BUCKET_SECONDS = bucket_seconds
     MEDIAN_MODE = median_mode
     RESUME = resume
+    DAILY_SUBDIR = daily_subdir
 
 
 def discover(sensors=None, start=None, end=None):
@@ -796,11 +860,17 @@ def run_preprocess(tasks):
     try:
         with mp.Pool(workers, initializer=init_worker,
                      initargs=(DATA_ROOT, OUTPUT_ROOT, BUCKET_SECONDS,
-                               MEDIAN_MODE, RESUME)) as pool:
+                               MEDIAN_MODE, RESUME, DAILY_SUBDIR)) as pool:
             for results in pool.imap_unordered(process_batch, batches,
                                                chunksize=1):
                 for meta, err in results:
                     done += 1
+                    # 任务失败时 process_task 返回 (None, 错误信息)，
+                    # 记录后继续，不让整个运行崩溃
+                    if meta is None:
+                        errors.append(err or "未知错误")
+                        logger.error(f"任务失败: {err}")
+                        continue
                     sensor = meta.get("sensor") if isinstance(meta, dict) else None
                     if sensor:
                         sensor_done[sensor] = sensor_done.get(sensor, 0) + 1
@@ -881,6 +951,8 @@ def main():
                     help="inventory=只摸底; preprocess=只处理; all=先摸底再处理")
     ap.add_argument("--data-root", default=DATA_ROOT, help="原始数据根目录")
     ap.add_argument("--output-root", default=OUTPUT_ROOT, help="结果目录")
+    ap.add_argument("--bridge", default="",
+                    help="大桥名称(如 赤石)；结果写入 <output-root>/<桥名>/ 下")
     ap.add_argument("--sensors", default="", help="逗号分隔的传感器编号，留空=全部")
     ap.add_argument("--sensors-file", default="",
                     help="传感器编号列表文件(每行一个或逗号分隔)，与 --sensors 合并")
@@ -902,20 +974,28 @@ def main():
                     help="跳过已生成过的 daily 日文件(断点续跑)")
     ap.add_argument("--limit-days", type=int, default=0,
                     help="每个传感器每个特征只处理前 N 天(试跑用)")
+    ap.add_argument("--period-tag", default="",
+                    help="daily 目录的年月标签(如 2026.1~3)；留空按 --start/--end 自动推导")
     args = ap.parse_args()
 
     DATA_ROOT = args.data_root
     OUTPUT_ROOT = args.output_root or resolve_output_root()
+    if args.bridge:
+        OUTPUT_ROOT = os.path.join(OUTPUT_ROOT, args.bridge)
     BUCKET_SECONDS = args.bucket
     WORKERS = args.workers
     MEDIAN_MODE = args.median_mode
     RESUME = args.resume
     SENSORS_PER_WORKER = max(1, args.sensors_per_worker)
+    global DAILY_SUBDIR
+    tag = args.period_tag or period_tag(args.start, args.end)
+    DAILY_SUBDIR = f"daily_{tag}" if tag else "daily"
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
     setup_logging(os.path.join(OUTPUT_ROOT, "preprocess.log"))
     logger.info("=" * 28 + " 新一次运行开始 " + "=" * 28)
     logger.info(f"数据根目录: {DATA_ROOT}")
     logger.info(f"结果目录: {OUTPUT_ROOT}")
+    logger.info(f"daily 输出目录: {os.path.join(OUTPUT_ROOT, DAILY_SUBDIR)}")
 
     # 合并 --sensors 与 --sensors-file 中的编号
     sensor_ids = set()

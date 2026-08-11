@@ -78,8 +78,10 @@ def main() -> int:
             cfg = load_config(args.config)
             result = analyze_template(cfg["template"])
             print_analysis(result)
-            os.makedirs(cfg["output_dir"], exist_ok=True)
-            out = os.path.join(cfg["output_dir"], "template_analysis.json")
+            analysis_dir = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "outputs", "analysis")
+            os.makedirs(analysis_dir, exist_ok=True)
+            out = os.path.join(analysis_dir, "template_analysis.json")
             with open(out, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
             print(f"\n识别结果已保存: {out}")

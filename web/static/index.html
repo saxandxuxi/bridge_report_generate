@@ -102,6 +102,11 @@
         <input type="date" id="runStart" title="手动区间开始日（仅手动区间用）" style="display:none">
         <button onclick="startRun()">开始生成</button>
       </div>
+      <div class="row">
+        <label style="font-size:13px"><input type="checkbox" id="runAutoPre" checked> 缺数据时自动预处理（秒级→日级→图库/统计值）</label>
+        <button class="ghost" onclick="checkPeriod()">检查该周期数据</button>
+      </div>
+      <div id="periodInfo" class="muted"></div>
       <div id="runStatus" class="muted"></div>
       <div id="runResult"></div>
     </div>
@@ -140,6 +145,8 @@
       <div class="field"><label>统计值目录</label><input id="ppStats" placeholder="如 D:/.../统计值"></div>
       <div class="field"><label>测点编号表格</label><input id="ppMapDocx" placeholder="五座桥测点编号表格.docx 路径（可留空）"></div>
       <div class="field"><label>桥名</label><input id="ppBridge" placeholder="如 赤石"></div>
+      <div class="field"><label>起始日期</label><input type="date" id="ppStart" title="只处理该日期之后的秒级数据（可留空=全部）"></div>
+      <div class="field"><label>结束日期</label><input type="date" id="ppEnd" title="只处理该日期之前的秒级数据（可留空=全部）"></div>
       <div class="row">
         <button class="ghost" onclick="loadPreprocessConfig()">加载配置</button>
         <button class="ghost" onclick="savePreprocessConfig()">保存配置</button>
@@ -328,13 +335,36 @@ function quickRun(id) { showTab("run"); $("runBridge").value = id; startRun(); }
 function onModeChange() {
   var manual = $("runMode").value === "manual";
   $("runStart").style.display = manual ? "" : "none";
+  checkPeriod();
 }
 $("runMode").addEventListener("change", onModeChange);
+$("runEnd").addEventListener("change", checkPeriod);
+
+function checkPeriod() {
+  var bridgeId = $("runBridge").value;
+  if (!bridgeId) return;
+  var mode = $("runMode").value;
+  var url = "/api/bridges/" + bridgeId + "/period?mode=" + encodeURIComponent(mode);
+  if (mode === "manual" && $("runStart").value && $("runEnd").value) {
+    url += "&start=" + $("runStart").value + "&end=" + $("runEnd").value;
+  } else if ($("runEnd").value) {
+    url += "&date=" + $("runEnd").value;
+  }
+  api(url).then(function (p) {
+    $("periodInfo").innerHTML =
+      "周期: <b>" + esc(p.label || "—") + "</b>（" + esc(p.start) + " ~ " + esc(p.end) + "）<br>" +
+      "图库: " + esc(p.charts_dir) + "　" + (p.charts_exists ? "✔ 已存在" : "✘ 缺失") + "<br>" +
+      "统计值: " + esc(p.stats_dir) + "　" + (p.stats_exists ? "✔ 已存在" : "✘ 缺失") + "<br>" +
+      (p.data_ready ? '<span class="green">数据就绪，将跳过预处理直接生成报告</span>'
+                    : '<span class="yellow">该周期图库/统计值缺失，勾选“自动预处理”会先跑数据处理</span>');
+  }).catch(function () {});
+}
 
 function startRun() {
   var bridgeId = $("runBridge").value;
   var body = { mode: $("runMode").value, date: $("runEnd").value || "" };
   if (body.mode === "manual") body.start = $("runStart").value || "";
+  body.auto_preprocess = $("runAutoPre").checked;
   $("runResult").innerHTML = "";
   $("runStatus").textContent = "正在启动…";
   api("/api/bridges/" + bridgeId + "/run", { method: "POST", body: JSON.stringify(body) })
@@ -354,8 +384,20 @@ function pollRun(bridgeId) {
       if (!running) {
         clearInterval(STATE.pollTimer);
         STATE.pollTimer = null;
-        $("runStatus").textContent = "完成";
-        if (st.last_run) {
+        if (st.running && st.running.error) {
+          $("runStatus").textContent = "失败: " + st.running.error;
+          $("runResult").innerHTML = "<pre>" + esc(JSON.stringify({
+            error: st.running.error,
+            period: st.running.period,
+            charts_dir: st.running.charts_dir,
+            stats_dir: st.running.stats_dir,
+            preprocess: st.running.preprocess,
+            log_tail: st.running.log_tail || st.running.pipeline_log_tail || ""
+          }, null, 2)) + "</pre>";
+        } else {
+          $("runStatus").textContent = "完成";
+        }
+        if (st.last_run && !(st.running && st.running.error)) {
           var s = {
             output: st.last_run.output,
             period: st.last_run.period,
@@ -367,6 +409,8 @@ function pollRun(bridgeId) {
           $("runResult").innerHTML = "<pre>" + esc(JSON.stringify(s, null, 2)) + "</pre>";
         }
         loadBridges();
+        if (bridgeId === $("dlBridge").value) loadReports();
+        checkPeriod();
       } else {
         $("runStatus").textContent = "运行中…（PID " + (st.running.pid || "?") + "）";
       }
@@ -434,6 +478,8 @@ function loadPreprocessConfig() {
     $("ppStats").value = c.stats_dir || "";
     $("ppMapDocx").value = c.sensor_map_docx || "";
     $("ppBridge").value = c.bridge_name || "";
+    $("ppStart").value = c.start || "";
+    $("ppEnd").value = c.end || "";
     refreshPreprocess();
   }).catch(function (e) { showMsg(String(e), "err"); });
 }
@@ -459,7 +505,9 @@ function runPreprocess() {
     daily_dir: $("ppDaily").value.trim(),
     charts_dir: $("ppCharts").value.trim(),
     stats_dir: $("ppStats").value.trim(),
-    sensor_map_docx: $("ppMapDocx").value.trim()
+    sensor_map_docx: $("ppMapDocx").value.trim(),
+    start: $("ppStart").value || "",
+    end: $("ppEnd").value || ""
   };
   api("/api/preprocess/run", { method: "POST", body: JSON.stringify(body) })
     .then(function (r) {

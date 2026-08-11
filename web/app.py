@@ -32,6 +32,7 @@ from typing import Dict, Optional
 from flask import Flask, Response, jsonify, request, send_file
 
 ROOT = os.environ.get("REPORT_PROJECT_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 from report_agent.bridges import get_bridge, list_bridges, resolve_bridge_config  # noqa: E402
 
@@ -57,6 +58,82 @@ _preprocess: Dict = {}
 _running: Dict[str, Dict] = {}
 _run_lock = threading.Lock()
 _schedulers: Dict[str, Dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# 周期 / 季度工具
+# ---------------------------------------------------------------------------
+
+def _period_from_mode(mode: str, date_str: str = "") -> Dict:
+    """按报告模式计算周期，返回 {start, end, label}。
+    label 示例: quarterly -> 2026.1~3 / 2026.4~6；monthly -> 2026.07。"""
+    import calendar
+    end = dt.date.fromisoformat(date_str) if date_str else dt.date.today()
+    mode = mode or "quarterly"
+    if mode == "yearly":
+        start = dt.date(end.year, 1, 1)
+        end = dt.date(end.year, 12, 31)
+        label = f"{end.year}年"
+    elif mode == "quarterly":
+        q = (end.month - 1) // 3 + 1
+        ms, me = (q - 1) * 3 + 1, q * 3
+        start = dt.date(end.year, ms, 1)
+        end = dt.date(end.year, me, calendar.monthrange(end.year, me)[1])
+        label = f"{end.year}.{ms}~{me}"
+    elif mode == "monthly":
+        start = dt.date(end.year, end.month, 1)
+        end = dt.date(end.year, end.month,
+                      calendar.monthrange(end.year, end.month)[1])
+        label = f"{end.year}.{end.month:02d}"
+    else:  # weekly / manual
+        start = end - dt.timedelta(days=6)
+        label = f"{end.year}.{end.month:02d}.{end.day:02d}"
+    return {"start": start.isoformat(), "end": end.isoformat(), "label": label}
+
+
+def _label_from_range(start: str, end: str) -> str:
+    """由起止日期生成目录标签：同年同季 -> 2026.1~3；同年同月 -> 2026.07。"""
+    try:
+        sm, em = int(start[5:7]), int(end[5:7])
+        sy, ey = start[:4], end[:4]
+    except (IndexError, ValueError):
+        return ""
+    if sy == ey and sm == em:
+        return f"{sy}.{sm:02d}"
+    if sy == ey and (sm, em) in ((1, 3), (4, 6), (7, 9), (10, 12)):
+        return f"{sy}.{sm}~{em}"
+    return f"{sy}{sm:02d}-{ey}{em:02d}"
+
+
+def _period_dir_base(cfg: Optional[Dict] = None) -> str:
+    """季度目录的上级目录：从配置图库目录解析出 preprocess/ 这一级。
+    兼容 图库_<期>/<桥名> 与 图库/<桥名> 两种布局。"""
+    bd = (cfg or {}).get("bridge_data") or {}
+    cd = str(bd.get("charts_dir", "") or "").replace("\\", "/")
+    for marker in ("图库_", "图库"):
+        idx = cd.find(marker)
+        if idx > 0:
+            base = cd[:idx].rstrip("/")
+            return base if os.path.isabs(base) else os.path.normpath(
+                os.path.join(ROOT, base))
+    return PREPROCESS_DIR
+
+
+def _quarter_dirs(cfg: Optional[Dict], label: str) -> tuple:
+    """季度化输出目录：<base>/图库_<label>/<桥名>、<base>/统计值_<label>/<桥名>。"""
+    base = _period_dir_base(cfg)
+    bridge = ((cfg or {}).get("bridge_data") or {}).get("bridge_name", "")
+    def _with_bridge(p: str) -> str:
+        return os.path.join(p, bridge) if bridge else p
+    if not label:
+        return _with_bridge(os.path.join(base, "图库")), \
+            _with_bridge(os.path.join(base, "统计值"))
+    return (_with_bridge(os.path.join(base, f"图库_{label}")),
+            _with_bridge(os.path.join(base, f"统计值_{label}")))
+
+
+def _dir_nonempty(path: str) -> bool:
+    return bool(os.path.isdir(path) and any(True for _ in os.scandir(path)))
 
 
 # ---------------------------------------------------------------------------
@@ -432,11 +509,97 @@ def api_bridge_chart(bridge_id, filename):
         return jsonify({"error": "配置不可用"}), 404
     charts_dir = (cfg.get("charts") or {}).get("output_dir", "")
     safe = os.path.basename(filename)
-    for base in (charts_dir, os.path.join(cfg.get("output_dir", ""), "charts")):
+    for base in (charts_dir, os.path.join(ROOT, "outputs", "charts")):
         path = os.path.join(base, safe)
         if os.path.isfile(path):
             return send_file(path)
     return jsonify({"error": "图片不存在"}), 404
+
+
+def _run_pipeline(period: Dict, charts_dir: str, stats_dir: str,
+                  st: Dict) -> int:
+    """调用 pipeline.py 完成 秒级->日级->图库/统计值->对照表。
+    返回子进程退出码。"""
+    pcfg = {}
+    if os.path.isfile(PREPROCESS_CONFIG):
+        try:
+            with open(PREPROCESS_CONFIG, "r", encoding="utf-8") as f:
+                pcfg = json.load(f)
+        except Exception:  # noqa: BLE001
+            pcfg = {}
+    raw = pcfg.get("raw_data_dir", "")
+    daily = pcfg.get("daily_dir", os.path.join(PREPROCESS_DIR, "日级数据"))
+    map_docx = pcfg.get("sensor_map_docx", "")
+    cmd = [sys.executable, os.path.join(PREPROCESS_DIR, "pipeline.py"),
+           "--raw", raw, "--daily", daily,
+           "--charts", charts_dir, "--stats", stats_dir,
+           "--start", period["start"], "--end", period["end"]]
+    if map_docx:
+        cmd += ["--sensor-map-docx", map_docx]
+    st["pipeline_cmd"] = " ".join(cmd)
+    proc = subprocess.Popen(cmd, cwd=ROOT, env=_subprocess_env(),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    st["pipeline_pid"] = proc.pid
+    try:
+        out, _ = proc.communicate(timeout=7200)
+    except Exception as exc:  # noqa: BLE001
+        proc.kill()
+        st["pipeline_error"] = str(exc)
+        return 1
+    st["pipeline_log_tail"] = out.decode("utf-8", errors="replace")[-4000:]
+    return proc.returncode
+
+
+def _update_bridge_data_dirs(bridge_id: str, stats_dir: str,
+                             charts_dir: str) -> None:
+    """把桥配置的 bridge_data 路径切到季度目录。"""
+    cfg_path = _config_path_for(bridge_id)
+    if not cfg_path:
+        return
+    try:
+        from report_agent.config import load_config
+        cfg = load_config(cfg_path)
+    except Exception:  # noqa: BLE001
+        return
+    bd = cfg.setdefault("bridge_data", {})
+    bd["stats_dir"] = stats_dir
+    bd["charts_dir"] = charts_dir
+    # 传感器对照表是固定产物，统一放 preprocess/传感器对照/，不随季度变化
+    map_dir = os.path.join(PREPROCESS_DIR, "传感器对照")
+    bd["sensor_map"] = os.path.join(map_dir, "传感器编号名称.json")
+    bd["overview"] = os.path.join(stats_dir, "总览.json")
+    bridge = bd.get("bridge_name", "") or ""
+    bd["name_dict"] = os.path.join(map_dir, "传感器名称对照",
+                                   f"{bridge}大桥.json")
+    _save_config(cfg, cfg_path)
+
+
+@app.route("/api/bridges/<bridge_id>/period")
+def api_bridge_period(bridge_id):
+    """按模式/日期计算周期，返回季度目录及数据是否就绪。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    cfg = _config_for(bridge_id)
+    if not cfg or "error" in cfg:
+        return jsonify({"error": "配置不可用"}), 404
+    mode = request.args.get("mode", "quarterly")
+    date = request.args.get("date", "")
+    start = request.args.get("start", "")
+    end = request.args.get("end", "")
+    if start and end:
+        period = {"start": start, "end": end, "label": _label_from_range(start, end)}
+    else:
+        period = _period_from_mode(mode, date)
+    charts_dir, stats_dir = _quarter_dirs(cfg, period["label"])
+    return jsonify({
+        **period,
+        "charts_dir": charts_dir,
+        "stats_dir": stats_dir,
+        "charts_exists": _dir_nonempty(charts_dir),
+        "stats_exists": _dir_nonempty(stats_dir),
+        "data_ready": _dir_nonempty(charts_dir) and _dir_nonempty(stats_dir),
+    })
 
 
 @app.route("/api/bridges/<bridge_id>/run", methods=["POST"])
@@ -455,6 +618,16 @@ def api_bridge_run(bridge_id):
         return jsonify({"error": f"无效模式: {mode}"}), 400
     date = str(data.get("date") or "").strip()
     engine = str(data.get("engine") or "").strip() or None
+    start = str(data.get("start") or "").strip()
+    end = str(data.get("end") or "").strip()
+    auto_preprocess = bool(data.get("auto_preprocess"))
+
+    if start and end:
+        period = {"start": start, "end": end,
+                  "label": _label_from_range(start, end)}
+    else:
+        period = _period_from_mode(mode, date)
+        start, end = period["start"], period["end"]
 
     with _run_lock:
         st = _running.get(bridge_id)
@@ -464,14 +637,37 @@ def api_bridge_run(bridge_id):
         _running[bridge_id] = st
 
     def _worker():
-        cmd = [sys.executable, os.path.join(ROOT, "run_agent.py"),
-               "--config", cfg_path, "--mode", mode]
-        if date:
-            cmd += ["--date", date]
-        if engine:
-            cmd += ["--engine", engine]
-        st["cmd"] = " ".join(cmd)
         try:
+            st["period"] = period
+            cfg = _config_for(bridge_id)
+            charts_dir, stats_dir = _quarter_dirs(cfg, period["label"])
+            data_ready = _dir_nonempty(charts_dir) and _dir_nonempty(stats_dir)
+            st["charts_dir"] = charts_dir
+            st["stats_dir"] = stats_dir
+            st["data_ready"] = data_ready
+            if auto_preprocess:
+                if not data_ready:
+                    st["preprocess"] = "running"
+                    rc = _run_pipeline(period, charts_dir, stats_dir, st)
+                    st["preprocess"] = "done" if rc == 0 else "failed"
+                    if rc != 0:
+                        st["error"] = ("数据预处理失败，详见 pipeline 日志。"
+                                       if not st.get("pipeline_error")
+                                       else st["pipeline_error"])
+                        return
+                else:
+                    st["preprocess"] = "skipped"
+                _update_bridge_data_dirs(bridge_id, stats_dir, charts_dir)
+            else:
+                st["preprocess"] = "manual"
+
+            cmd = [sys.executable, os.path.join(ROOT, "run_agent.py"),
+                   "--config", cfg_path, "--mode", mode]
+            if date:
+                cmd += ["--date", date]
+            if engine:
+                cmd += ["--engine", engine]
+            st["cmd"] = " ".join(cmd)
             proc = subprocess.Popen(
                 cmd, cwd=ROOT, env=_subprocess_env(),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -584,10 +780,10 @@ def api_bridge_log(bridge_id):
     name = request.args.get("name", "agent")
     lines = min(int(request.args.get("lines", 300)), 5000)
     candidates = {
-        "agent": os.path.join(cfg.get("output_dir", ""), "agent.log"),
-        "scheduler": os.path.join(cfg.get("output_dir", ""), "scheduler.log"),
-        "web": os.path.join(ROOT, "outputs", "web.log"),
-        "run": os.path.join(ROOT, "outputs", "web_run.log"),
+        "agent": os.path.join(ROOT, "outputs", "logs", "agent.log"),
+        "scheduler": os.path.join(ROOT, "outputs", "logs", "scheduler.log"),
+        "web": os.path.join(ROOT, "outputs", "logs", "web.log"),
+        "run": os.path.join(ROOT, "outputs", "logs", "web_run.log"),
     }
     path = candidates.get(name)
     if not path or not os.path.isfile(path):
@@ -650,6 +846,13 @@ def api_preprocess_run():
     for k, v in flags.items():
         if v:
             cmd += [f"--{k}", str(v)]
+    # 时间范围（只处理该时间段数据）
+    start = str(data.get("start") or "").strip()
+    end = str(data.get("end") or "").strip()
+    if start:
+        cmd += ["--start", start]
+    if end:
+        cmd += ["--end", end]
     if data.get("skip_preprocess"):
         cmd.append("--skip-preprocess")
     if data.get("skip_charts"):

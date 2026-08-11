@@ -11,7 +11,7 @@
             4. 若全部提取正确 → 模型只回复一个字：是
 
 设计要点：
-  - 默认接入阿里云百炼（DashScope）OpenAI 兼容接口，模型 qwen-plus
+- 默认接入阿里云百炼（DashScope）OpenAI 兼容接口，模型 qwen-plus
   - API Key 从环境变量获取：优先 QWEN_API_KEY，其次 DASHSCOPE_API_KEY
   - 占位符统一标准：{{stats.<指标英文名>.<统计类型>}}，模型输出会再被本模块规范化校验
   - 报告全文 + 已提取项 + 待确认项一次性发送，单次调用完成校验
@@ -42,15 +42,23 @@ METRIC_STANDARD = {
     "displacement": "位移/变位", "rotation": "转角", "strain": "应变",
     "stress": "应力", "cable_force": "索力", "cable_clamp": "索夹滑动",
     "vehicle_load": "车辆荷载", "wind_load": "风荷载", "wind_speed": "风速",
-    "earthquake_load": "地震荷载", "structural_temp": "结构温度",
+    "earthquake_load": "地震", "structural_temp": "结构温度",
+    "structure_temperature": "结构温度",
+    "bearing_displacement": "支座位移",
     "vehicle_count": "车辆数量", "settlement": "沉降",
 }
 STAT_STANDARD = {
     "max": "最大/最高", "min": "最小/最低", "avg": "平均",
     "median": "中位数", "std": "标准差", "range": "极差/差值",
+    "abs_max": "绝对最大",
 }
 
 STD_PLACEHOLDER_RE = re.compile(r"\{\{stats\.([a-zA-Z_]+)\.([a-zA-Z_]+)\}\}")
+
+# 非规范指标键 -> 运行时 config.metrics 使用的键（如 LLM 输出 structural_temp）
+METRIC_CANON = {
+    "structural_temp": "structure_temperature",
+}
 
 
 def get_api_key() -> str:
@@ -71,8 +79,10 @@ def normalize_placeholder(raw: str, fallback_index: int) -> str:
     if not raw:
         return f"{{{{data.{fallback_index}}}}}"
     m = STD_PLACEHOLDER_RE.search(raw)
-    if m and m.group(1) in METRIC_STANDARD and m.group(2) in STAT_STANDARD:
-        return f"{{{{stats.{m.group(1)}.{m.group(2)}}}}}"
+    if m and m.group(2) in STAT_STANDARD:
+        metric = METRIC_CANON.get(m.group(1), m.group(1))
+        if metric in METRIC_STANDARD:
+            return f"{{{{stats.{metric}.{m.group(2)}}}}}"
     return f"{{{{data.{fallback_index}}}}}"
 
 
@@ -203,6 +213,61 @@ class LLMClassifier:
 
         return self._parse_response(resp, review_items, review_images)
 
+    def verify_images(self, doc_text: str, images: List[Dict],
+                      review_images: List[Dict]) -> Dict:
+        """单独对图片做一轮 LLM 判定（与数字识别分开，避免相互干扰）。
+
+        返回 {"images_review": {index: "replace"|"keep"},
+              "images_wrong": {index}, "raw": 原始回复}。
+        """
+        if not self.available():
+            log.info("LLM 不可用，图片 review 降级为文本长度启发式")
+            images_review = {}
+            for img in (review_images or []):
+                idx = img.get("_review_index", len(images_review))
+                r = _text_length_heuristic(img)
+                images_review[idx] = r["verdict"]
+            return {"images_review": images_review, "images_wrong": {}, "raw": ""}
+        system = (
+            "你是桥梁健康监测报告图表识别专家。请判断报告中的每张图片属于哪一类：\n"
+            "1) 动态监测图（数据曲线图/直方图/分布图等，生成新报告时应替换为程序生成的图）；\n"
+            "2) 固定图（示意图/CAD图/布置图/架构图/流程图/logo/照片等，保留）。\n"
+            "只对“待确认”的图片给出 replace(动态图) 或 keep(固定图)。\n"
+            "同时检查“已判定为动态图”的图片中是否有误判的固定图（图题含示意图/布置图/"
+            "架构图/流程图/平面图等），把它们的索引放进 images_wrong。\n"
+            "只回复 JSON，格式：{\"images_review\": {\"<index>\": \"replace|keep\"}, "
+            "\"images_wrong\": [<index>]}"
+        )
+        user = (
+            "报告文本摘录（供上下文参考）：\n" + (doc_text or "")[:10000]
+            + "\n\n图片清单：\n"
+            + json.dumps(
+                [{k: im.get(k) for k in ("index", "caption", "verdict", "w_in", "h_in")}
+                 for im in images],
+                ensure_ascii=False,
+            )[:10000]
+            + "\n\n待确认图片索引："
+            + json.dumps([im.get("_review_index") for im in (review_images or [])])
+        )
+        try:
+            resp = self._chat([
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("LLM 图片识别失败（%s）", exc)
+            return {"images_review": {}, "images_wrong": {}, "raw": ""}
+        result = {"images_review": {}, "images_wrong": {}, "raw": resp}
+        m = re.search(r"\{.*\}", resp, re.S)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                result["images_review"] = data.get("images_review") or {}
+                result["images_wrong"] = {int(x) for x in (data.get("images_wrong") or [])}
+            except Exception as exc:  # noqa: BLE001
+                log.warning("解析图片 LLM 回复失败: %s", exc)
+        return result
+
     def _fallback(self, review_items: List[Dict], review_images: List[Dict] = None) -> Dict:
         """降级：review 项用文本长度启发式。"""
         decisions = {}
@@ -249,6 +314,12 @@ class LLMClassifier:
             "  典型例子：本季度最高温度39.93℃、车辆总数1549777辆、应变最大差值697.85με、\n"
             "  索夹滑动最大差值31.61mm、最大10min平均风速11.93m/s、结构温度最大值40.59℃、\n"
             "  最高湿度100.55%、占比、增长率、超标天数等。\n\n"
+            "▶ 原文占位标记（应 replace）：部分成品报告用 [A-MAX]、[A-MAX-LOC]、B-MIN、\n"
+            "  G-MAX-X 这类字母-统计量标记代替真实数值（如“环境最高温度为[A-MAX]℃，\n"
+            "  对应测点位置为[A-MAX-LOC]”）。它们每期变化，视为动态值；\n"
+            "  - 值标记（A-MAX）→ {{stats.<指标>.<统计>}}\n"
+            "  - 位置标记（A-MAX-LOC）→ {{stats.<指标>.<统计>.loc}}\n"
+            "  不要把它们当作静态编号，也不要重复加入 missed（本地已按上下文映射）。\n\n"
             "▶ 静态值（应 keep）：每期不变的固定配置、规范参数、表格标识等。\n"
             "  【A. 工程设计参数】桥长1933.6m、跨径1480+453.6m、桩号K814+091、矢跨比1/9.6\n"
             "  【B. 监测内容/布设表】'共布置11个风荷载测点'、'布设1个温湿度仪'、\n"

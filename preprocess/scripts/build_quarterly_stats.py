@@ -102,16 +102,31 @@ def main():
     ap.add_argument("--lib-root", default=DEFAULT_LIB_ROOT)
     ap.add_argument("--sensor-map", default="",
                     help="传感器编号名称.json 路径(默认 统计值/传感器编号名称.json)")
+    ap.add_argument("--bridge", default="",
+                    help="大桥名称(如 赤石)；统计值输出到 <lib-root>/统计值/<桥名>/，"
+                         "daily 根目录取 <daily根>/<桥名>/daily。不填按对照表自动推导")
     ap.add_argument("--start", default="")
     ap.add_argument("--end", default="")
     ap.add_argument("--limit-sensors", type=int, default=0)
     args = ap.parse_args()
 
-    stats_dir = os.path.join(args.lib_root, "统计值")
-    os.makedirs(stats_dir, exist_ok=True)
-    map_path = args.sensor_map or os.path.join(stats_dir, "传感器编号名称.json")
+    stats_dir0 = os.path.join(args.lib_root, "统计值")
+    map_path = args.sensor_map or os.path.join(stats_dir0, "传感器编号名称.json")
     sensor_map = load_sensor_map(map_path)
     print(f"传感器名称对照: {'已加载(' + str(len(sensor_map)) + '个)' if sensor_map else '未找到'}")
+    bridge = args.bridge or ""
+    if not bridge:
+        names = [info.get("桥名", "") for info in sensor_map.values()]
+        names = [n for n in names if n]
+        if names:
+            bridge = max(set(names), key=names.count)
+    stats_dir = os.path.join(args.lib_root, "统计值", bridge) if bridge \
+        else stats_dir0
+    os.makedirs(stats_dir, exist_ok=True)
+    if bridge and args.daily_root == DEFAULT_DAILY_ROOT:
+        args.daily_root = os.path.join(
+            os.path.dirname(DEFAULT_DAILY_ROOT.rstrip("/\\")), bridge,
+            os.path.basename(DEFAULT_DAILY_ROOT.rstrip("/\\")))
 
     pairs = discover_pairs(args.daily_root)
     if not pairs:

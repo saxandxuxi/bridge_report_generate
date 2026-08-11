@@ -41,7 +41,7 @@ def resolve_period(
         start = dt.date(end.year, 1, 1)
         end = dt.date(end.year, 12, 31)
         label = f"{end.year}年"
-        label_cn = f"{end.year}年"
+        label_cn = f"{end.year}年度"
     elif mode == "quarterly":
         # 自然季度：1-3 / 4-6 / 7-9 / 10-12 月
         q = (end.month - 1) // 3 + 1
@@ -242,8 +242,12 @@ class ReportAgent:
                     for pno in range(para - 1, max(para - 5, -1), -1):
                         if 0 <= pno < len(texts) and texts[pno]:
                             body_texts.append(str(texts[pno]))
-                    metric_hint = bridge._metric_alias_hit(
-                        f"{ct.get('text', '')} {' '.join(body_texts)}") or ""
+                    # 指标判断：节上下文(正文)优先于图注原文（图注原文可能有笔误，如结构温度节写成“环境温度”）
+                    metric_hint = (
+                        bridge._metric_alias_hit(" ".join(body_texts))
+                        or bridge._metric_alias_hit(ct.get("text", ""))
+                        or ""
+                    )
                 info = bridge.resolve_chart_info(cid, ct.get("text", ""), context=ctx_texts,
                                                  metric_hint=metric_hint,
                                                  sensor_hint=str(ct.get("sensor_id") or ""),
@@ -286,7 +290,7 @@ class ReportAgent:
                     for item in gap.get("missing", []):
                         sid = item["sensor_id"]
                         kind = item["kind"]
-                        png = bridge.chart_png_for(sid, kind)
+                        png = bridge.chart_png_for(sid, kind, metric=item.get("metric", ""))
                         if not png:
                             continue
                         metric = item.get("metric", "")
@@ -301,6 +305,32 @@ class ReportAgent:
                         })
             log.info("缺图推断：%d 节存在缺图（自动补齐 %d 张）",
                      len(chart_gaps), sum(len(v) for v in extra_charts.values()))
+            # 模板中额外的位置化图表占位符（如特殊应变 4#/5#墩底部），
+            # 未出现在 analysis chart_texts 时按位置直接解析，避免“有占位无图”
+            try:
+                from docx import Document as _Doc
+                from .report_builder import _paragraph_text, _walk_paragraphs
+                tpl_doc = _Doc(self.cfg.get("template", ""))
+                extra_ids = []
+                for para in _walk_paragraphs(tpl_doc):
+                    t = _paragraph_text(para).strip()
+                    m = re.fullmatch(r"\{\{chart\.([^}]+)\}\}", t)
+                    if not m:
+                        continue
+                    cid = m.group(1)
+                    if cid not in chart_images:
+                        extra_ids.append(cid)
+                for cid in extra_ids:
+                    info = bridge.resolve_chart_info(cid, cid)
+                    if not info:
+                        continue
+                    chart_images[cid] = info["path"]
+                    chart_captions[cid] = info["display"]
+                    chart_sensors[cid] = info["sensor_id"]
+                    chart_kinds[cid] = info["kind"]
+                    log.info("模板位置化图表 %s -> %s", cid, info["path"])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("扫描模板额外图表占位符失败: %s", exc)
             # CSV 可用时，剩余的 user_chart_defs 仍可走 matplotlib 兜底
             leftover_defs = [d for d in user_chart_defs if d.get("id") not in chart_images]
             if records and leftover_defs:
@@ -340,12 +370,15 @@ class ReportAgent:
             row_datasets = {"daily_records": daily_rows}
 
         # 5. 填充模板
+        lineage: List[Dict] = []
         resolver = report_builder.build_value_resolver(
             computed, period,
             data_registry=data_registry,
             data_values=self.cfg.get("_data_values", {}),
             bridge=bridge,
             missing_sink=missing_sinks,
+            lineage=lineage,
+            data_meta=self.cfg.get("_data_number_meta", {}),
         )
 
         # 输出文件名：优先使用 config.report_name_prefix；
@@ -391,7 +424,23 @@ class ReportAgent:
             period=period,
             chart_captions=chart_captions,
             extra_charts=extra_charts,
+            text_replace=bridge_cfg.get("text_replace") or None,
         )
+
+        # 数据链路日志：每个填入数值的来源与计算链（找不到的会标“未找到”）
+        if lineage:
+            out_dir_abs = os.path.abspath(self.cfg.get("output_dir", "outputs"))
+            logs_dir = os.path.join(
+                os.path.dirname(out_dir_abs),
+                "logs",
+            )
+            lineage_path = report_builder._write_data_lineage(
+                lineage, logs_dir, period)
+            log.info("数据链路日志已写出: %s（%d 条，未找到 %d 条）",
+                     lineage_path, len(lineage),
+                     sum(1 for e in lineage if e.get("结果") == "未找到"))
+        else:
+            lineage_path = ""
 
         summary = {
             "output": out_path,
@@ -430,84 +479,216 @@ class ReportAgent:
         parsed = bridge._parse_chart_id(cid)
         return parsed[0] if parsed and parsed[0] else ""
 
-    def _expected_sensors_for_cluster(self, bridge, cluster, texts) -> Optional[List[str]]:
-        """推断一个图表集群（节）应有的传感器集合。
+    def _section_plan(self, bridge, cluster, texts) -> Optional[Dict]:
+        """推断一个图表集群（节）应出的（指标, 监测部位列表, 图型集合）。
 
-        规则：
-          - 只处理有明确节标题（数字编号开头）的温湿度/结构温度节；
-          - 按指标选对应表（温湿度表 / 结构温度表）；
-          - 用节标题里的位置词（含跨号展开）匹配表内监测部位。
+        返回 {"metric", "positions": [(位置, [传感器编号])], "kinds": [...]} 或 None。
+        位置来源：
+          - 温湿度/结构温度/应变/振动等有映射表的，用表格映射/测点映射；
+          - 其余（风荷载/挠度/位移/倾角/索力/裂缝等）用该节表格 cell_ref 的行标签。
         """
         paras = [c.get("paragraph") for c in cluster if isinstance(c.get("paragraph"), int)]
         if not paras:
             return None
         p0 = min(paras)
-        # 最近的节标题：数字编号开头、短文本
         section_title = ""
-        for pno in range(p0 - 1, max(p0 - 6, -1), -1):
+        heading_pno = None
+        for pno in range(p0 - 1, max(p0 - 120, -1), -1):
             if 0 <= pno < len(texts):
                 t = str(texts[pno]).strip()
                 if not t:
                     continue
-                if re.match(r"^\d+(\.\d+){1,3}\s", t) and len(t) <= 60:
+                if re.match(r"^\d+(\.\d+){1,3}(?=[\u4e00-\u9fa5\s])", t) and len(t) <= 60:
                     section_title = t
+                    heading_pno = pno
                     break
-        if not section_title:
+        if not section_title or heading_pno is None:
             return None
-        cid = str(cluster[0].get("_unique_chart_id") or cluster[0].get("chart_id") or "")
-        # 指标从节标题判断：环境温度/环境湿度 -> 温湿度表；结构温度 -> 结构温度表
+        metric, mkey = None, ""
         if "结构温度" in section_title:
             metric, mkey = "structure_temperature", "结构温度表"
         elif "环境温度" in section_title:
             metric, mkey = "temperature", "温湿度表"
         elif "环境湿度" in section_title:
             metric, mkey = "humidity", "温湿度表"
-        else:
+        elif "风速" in section_title or "风向" in section_title or "风荷载" in section_title:
+            metric = "wind_speed"
+        elif "挠度" in section_title:
+            metric = "deflection"
+        elif "应变" in section_title:
+            metric, mkey = "strain", "结构应变监测表"
+        elif "位移" in section_title:
+            metric = "displacement"
+        elif "倾角" in section_title or "转角" in section_title:
+            metric = "rotation"
+        elif "索力" in section_title:
+            metric = "cable_force"
+        elif "裂缝" in section_title:
+            metric, mkey = "crack", "裂缝监测表"
+        elif "振动" in section_title:
+            metric, mkey = "vibration", "结构振动监测表"
+        if not metric:
             return None
-        positions = (bridge.table_map or {}).get(mkey, {}) or {}
+        # 图型集合：节标题 + 该节说明句（“……时程曲线图、频率分布直方图如下图所示”）
+        kinds = set()
+        _win = [section_title]
+        for _pno in range(p0 - 1, max(p0 - 6, -1), -1):
+            if 0 <= _pno < len(texts) and str(texts[_pno]).strip():
+                _win.append(str(texts[_pno]))
+        _joined = "".join(_win)
+        if "直方图" in _joined or "频率分布" in _joined:
+            kinds.add("histogram")
+        if "时程" in _joined or "时间序列" in _joined:
+            kinds.add("trend")
+        if not kinds:
+            kinds = {"trend"}
+        # 位置集合
+        positions = []
+        if mkey and (bridge.table_map or {}).get(mkey):
+            for pos, sids in (bridge.table_map[mkey] or {}).items():
+                positions.append((pos, [str(x) for x in sids]))
+        elif mkey and mkey in (bridge.point_map or {}):
+            for pl in bridge.point_map[mkey]:
+                sids = [str(x) for x in ((pl.get("测点") or {}).values())]
+                positions.append((pl.get("断面位置", ""), sids))
+        else:
+            positions = self._cell_ref_positions(bridge, heading_pno)
         if not positions:
             return None
-        # 位置词：去掉章节号与指标/监测词
+        positions = self._filter_positions(positions, section_title)
+        if not positions:
+            return None
+        return {"metric": metric, "positions": positions, "kinds": sorted(kinds)}
+
+    @staticmethod
+    def _filter_positions(positions, section_title) -> List[tuple]:
+        """按节标题里的位置词过滤监测部位，避免补图时把同指标其它节的位置也补进来。"""
         body = re.sub(r"^\d+(\.\d+){1,3}\s*", "", section_title)
-        for w in ("环境温度", "环境湿度", "结构温度", "监测", "统计", "数据分析"):
+        for w in ("环境温度", "环境湿度", "结构温度", "风速", "风向", "风荷载", "挠度", "应变",
+                  "位移", "倾角", "转角", "索力", "裂缝", "振动", "监测", "统计",
+                  "数据分析", "结构", "主梁"):
             body = body.replace(w, "")
         body = body.strip()
         if not body:
-            return None
-        spans = re.findall(r"\d+", "".join(re.findall(r"第([\d、，,和及]+)跨", body)))
+            return positions  # 节标题没有位置词（如“风荷载监测数据分析”）-> 全量
         norm_body = _norm(body)
-        ids = set()
-        matched_any = False
-        for pos, id_list in positions.items():
-            np = _norm(pos)
-            if norm_body and (norm_body in np or np in norm_body):
-                ids.update(str(x) for x in id_list)
-                matched_any = True
-        # 主体位置词没精确命中时，才用跨号兜底（避免 L3/8 与 L5/8 串位）
-        if not matched_any and spans:
-            for pos, id_list in positions.items():
+        positions_norm = {_norm(p): p for p, _ in positions}
+        out = []
+        for np, pos in positions_norm.items():
+            # 位置词必须是完整片段（前后是顿号/逗号/开头/结尾），
+            # 避免 “4#、5#墩底部” 里只把 “5#墩底部” 当整段匹配
+            if norm_body == np or norm_body in np or re.search(
+                    rf"(^|[、，,和及]){re.escape(np)}([、，,和及]|$)", norm_body):
+                out.append(pos)
+        # 列表式墩号位置（如 “4#、5#墩底部”）-> 展开为 4#墩底部、5#墩底部
+        m_list = re.match(r"^(\d+#(?:[、，,和及]\d+#)+)(.+)$", norm_body)
+        if m_list:
+            nums = re.findall(r"(\d+)#", m_list.group(1))
+            suffix = m_list.group(2)
+            for n in nums:
+                cand = f"{n}#{suffix}"
+                for np, pos in positions_norm.items():
+                    if cand == np or cand in np or np in cand:
+                        out.append(pos)
+        # 跨号展开（如 “第6、7跨跨中断面”），要求含“跨中”时位置也含“跨中”
+        spans = re.findall(r"\d+", "".join(re.findall(r"第([\d、，,和及]+)跨", body)))
+        if not out and spans:
+            need_mid = "跨中" in body
+            for pos, _ in positions:
                 np = _norm(pos)
-                if any(f"第{s}跨" in np for s in spans):
-                    ids.update(str(x) for x in id_list)
-        return sorted(ids, key=lambda x: int(x) if x.isdigit() else x) if ids else None
+                ok = any(f"第{s}跨" in np for s in spans)
+                if ok and need_mid and "跨中" not in np:
+                    ok = False
+                if ok:
+                    out.append(pos)
+        seen = set()
+        dedup = []
+        for p in out:
+            if p not in seen:
+                seen.add(p)
+                dedup.append(p)
+        return [(p, sids) for p, sids in positions if p in seen]
+
+    def _cell_ref_positions(self, bridge, heading_pno: int) -> List[tuple]:
+        """从 analysis cell_ref 收集该节表格的监测部位（位置 -> 该位置传感器）。
+
+        范围取“小节标题之后、下一个小节标题之前”，避免表格行距图表占位符较远时漏采。
+        """
+        texts = self.cfg.get("_texts", []) or []
+        if not (0 <= heading_pno < len(texts)):
+            return []
+        lo = heading_pno
+        hi = min(heading_pno + 250, len(texts))
+        for pno in range(heading_pno + 1, hi):
+            t = str(texts[pno]).strip()
+            if t and re.match(r"^\d+(\.\d+){1,3}(?=[\u4e00-\u9fa5\s])", t) and len(t) <= 60:
+                hi = pno
+                break
+        out = {}
+        for ct in (self.cfg.get("_chart_texts", []) or []):
+            if ct.get("source") != "cell_ref":
+                continue
+            p = ct.get("paragraph")
+            if not isinstance(p, int) or not (lo < p < hi):
+                continue
+            row = str(ct.get("row_label") or "").strip()
+            if not row or row.startswith("测点"):
+                continue
+            metric = str(ct.get("metric") or "")
+            sids = bridge._sensors_at_position(row, metric) if metric else []
+            if sids:
+                out.setdefault(row, sids)
+        return [(pos, sids) for pos, sids in out.items()]
+
+    def _metric_for_cluster(self, cl, texts) -> str:
+        """按最近节标题推断指标。"""
+        paras = [c.get("paragraph") for c in cl if isinstance(c.get("paragraph"), int)]
+        if not paras:
+            return ""
+        p0 = min(paras)
+        for pno in range(p0 - 1, max(p0 - 120, -1), -1):
+            if 0 <= pno < len(texts):
+                t = str(texts[pno]).strip()
+                if re.match(r"^\d+(\.\d+){1,3}(?=[\u4e00-\u9fa5\s])", t) and len(t) <= 60:
+                    for kw, m in (("结构温度", "structure_temperature"),
+                                  ("环境温度", "temperature"),
+                                  ("环境湿度", "humidity"),
+                                  ("风速", "wind_speed"), ("风向", "wind_speed"),
+                                  ("挠度", "deflection"), ("应变", "strain"),
+                                  ("位移", "displacement"), ("倾角", "rotation"),
+                                  ("转角", "rotation"), ("索力", "cable_force"),
+                                  ("裂缝", "crack"), ("振动", "vibration")):
+                        if kw in t:
+                            return m
+                    break
+        return ""
 
     def _detect_chart_gaps(self, bridge, chart_items, chart_sensors,
                            chart_kinds, chart_para) -> List[Dict]:
-        """检测每节图表数是否少于该节监测部位应有的数量。"""
+        """按“该节表格的监测部位 × 图型”检测缺图，并生成补齐清单。"""
         texts = self.cfg.get("_texts", []) or []
-        # 聚类：段落间距 <= 12 视为同一节
-        clusters = []
-        cur = []
-        last_p = None
+        # 聚类：按节标题切分（每出现一个数字编号标题就开新簇），
+        # 避免相邻节图表离得近时被并到同一簇、锚点选到下一节
+        heading_idx = []
+        for pno, t in enumerate(texts):
+            ts = str(t).strip()
+            if ts and len(ts) <= 60 and re.match(r"^\d+(\.\d+){1,3}(?=[\u4e00-\u9fa5\s])", ts):
+                heading_idx.append(pno)
+
+        def _section_of(p: int):
+            h = None
+            for hh in heading_idx:
+                if hh < p:
+                    h = hh
+                else:
+                    break
+            return h
+
+        clusters: Dict[int, List[Dict]] = {}
         for ct in chart_items:
             p = ct.get("paragraph") or 0
-            if cur and last_p is not None and p - last_p > 12:
-                clusters.append(cur)
-                cur = []
-            cur.append(ct)
-            last_p = p
-        if cur:
-            clusters.append(cur)
+            clusters.setdefault(_section_of(p), []).append(ct)
+        clusters = [v for k, v in sorted(clusters.items(), key=lambda kv: (kv[0] is None, kv[0] or 0))]
 
         gaps = []
         for cl in clusters:
@@ -516,30 +697,52 @@ class ReportAgent:
             if not cids:
                 continue
             used = sorted({s for c in cids if (s := chart_sensors.get(c))})
-            kinds = sorted({k for c in cids if (k := chart_kinds.get(c))})
-            if not used or not kinds:
+            if not used:
                 continue
-            expected = self._expected_sensors_for_cluster(bridge, cl, texts)
-            if not expected:
+            plan = self._section_plan(bridge, cl, texts)
+            if not plan:
                 continue
-            missing = sorted(set(expected) - set(used))
-            if not missing:
+            metric = plan["metric"]
+            target_kinds = plan["kinds"]
+            # 已插图组合 (监测部位, 图型)
+            charted = set()
+            for c in cids:
+                s = chart_sensors.get(c)
+                k = chart_kinds.get(c)
+                if not s or not k:
+                    continue
+                p = bridge._position_for_sensor(s)
+                if p:
+                    charted.add((_norm(p), k))
+            missing_items = []
+            for pos, sids in plan["positions"]:
+                for k in target_kinds:
+                    if (_norm(pos), k) in charted:
+                        continue
+                    sid = str(sids[0]) if sids else ""
+                    if not sid:
+                        sids2 = bridge._sensors_at_position(pos, metric)
+                        sid = str(sids2[0]) if sids2 else ""
+                    if not sid:
+                        continue
+                    missing_items.append({
+                        "sensor_id": sid, "position": pos,
+                        "kind": k, "metric": metric,
+                    })
+            if not missing_items:
                 continue
-            metric = self._metric_for_chart(cids[0], bridge)
             section = ""
             if cl and isinstance(cl[0].get("paragraph"), int):
                 p0 = cl[0]["paragraph"]
                 section = str(texts[p0 - 2])[:40] if 0 <= p0 - 2 < len(texts) else ""
             gaps.append({
                 "section": section,
-                "expected_sensors": sorted(set(expected)),
+                "metric": metric,
+                "positions": [p for p, _ in plan["positions"]],
+                "kinds": target_kinds,
                 "charted_sensors": used,
-                "missing_sensors": missing,
                 "anchor_cid": cids[-1],
-                "missing": [
-                    {"sensor_id": s, "kind": k, "metric": metric}
-                    for s in missing for k in kinds
-                ],
+                "missing": missing_items,
             })
         return gaps
 
@@ -556,13 +759,16 @@ def run_once(
     # 统一日志：与 scheduler 一致的 handler 风格
     output_dir = cfg.get("output_dir", "outputs")
     os.makedirs(output_dir, exist_ok=True)
+    logs_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "outputs", "logs")
+    os.makedirs(logs_dir, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(),
             logging.FileHandler(
-                os.path.join(output_dir, "agent.log"),
+                os.path.join(logs_dir, "agent.log"),
                 encoding="utf-8",
             ),
         ],

@@ -24,6 +24,7 @@ import copy
 import datetime as dt
 import hashlib
 import io
+import json
 import logging
 import os
 import re
@@ -86,8 +87,11 @@ def _eval_simple_expr(expr: str, stats: Dict) -> Optional[float]:
 
 
 def build_value_resolver(stats: Dict, period: Dict,
-                           data_registry=None, data_values: Dict = None,
-                           bridge=None, missing_sink: Optional[list] = None) -> Callable[[str], str]:
+                         data_registry=None, data_values: Dict = None,
+                         bridge=None, missing_sink: Optional[list] = None,
+                         lineage: Optional[list] = None,
+                         data_meta: Optional[Dict] = None,
+                         missing_marker: str = "—") -> Callable[[str], str]:
     """根据统计结果和报告期构建占位符解析函数。
 
     支持以下占位符类型：
@@ -100,7 +104,14 @@ def build_value_resolver(stats: Dict, period: Dict,
     bridge: 可选的真实监测数据适配器（report_agent.bridge_source.BridgeData），
             优先于 data_registry / stats 解析 cell 与 stats 占位符。
     missing_sink: 可选的列表，解析不到的 cell/stats 键会追加进去（供 Web 待补清单）。
+    lineage: 可选的列表，每次解析把 占位符/来源/计算链路/最终值 追加进去（供数据血缘日志）。
+    data_meta: {{data.N}} 的原文上下文（来自 analysis numbers），供血缘日志引用。
+    missing_marker: 解析不到时填入文档的标记（默认 “—”），并写入血缘日志说明未找到。
     """
+
+    def _log(entry: Dict) -> None:
+        if lineage is not None:
+            lineage.append(entry)
 
     def resolve(key: str, table_title: str = "", row_index: int = 0) -> str:
         # 表达式计算
@@ -113,16 +124,28 @@ def build_value_resolver(stats: Dict, period: Dict,
         # 表格单元格：cell.metric.column.stat
         if key.startswith("cell."):
             from .data_loader import resolve_cell
+            # 同一位置多测点行的索引后缀（如 cell.crack.5#塔底部.avg#2 -> row_index=1）
+            row_override = None
+            m_sfx = re.match(r"^(.*)#(\d+)$", key)
+            if m_sfx:
+                key = m_sfx.group(1)
+                row_override = int(m_sfx.group(2)) - 1
             parts = key.split(".")
             if len(parts) != 4:
                 raise KeyError(f"cell 占位符格式错误（期望 cell.metric.column.stat）: {key}")
             _, metric, column, stat = parts
+            cell_row = row_override if row_override is not None else row_index
             value = None
             if bridge is not None:
                 try:
-                    value = bridge.resolve_cell(metric, column, stat, period,
-                                                table_title=table_title or "",
-                                                row_index=row_index)
+                    value, detail = bridge.resolve_cell_detail(
+                        metric, column, stat, period,
+                        table_title=table_title or "", row_index=cell_row)
+                    if value is not None:
+                        _log({**detail, "类型": "cell重算",
+                              "输出": _format_cell_value(stat, value)})
+                    else:
+                        _log({"占位符": key, "类型": "cell重算", "结果": "未找到", **detail})
                 except Exception as exc:  # noqa: BLE001
                     log.warning("桥数据解析 cell 失败 %s: %s", key, exc)
             if value is None and bridge is None and data_registry is not None:
@@ -132,7 +155,7 @@ def build_value_resolver(stats: Dict, period: Dict,
                     missing_sink.append(key)
                 # 桥模式下解析不到 -> 填占位符（真实数据源已尝试过）
                 if bridge is not None:
-                    return "—"
+                    return missing_marker
                 # 指标无数据源（如 strain/displacement）——返回占位符而非崩溃
                 if data_registry is not None and data_registry.get(metric) is None:
                     import logging
@@ -151,17 +174,40 @@ def build_value_resolver(stats: Dict, period: Dict,
             return _format_cell_value(stat, value)
         if key.startswith("stats."):
             parts = key.split(".")
+            # {{stats.<metric>.<stat>.loc}}：最值对应的监测部位（如 A-MAX-LOC）
+            if len(parts) == 4 and parts[3] == "loc" and bridge is not None:
+                _metric, _stat = parts[1], parts[2]
+                _value, _detail = bridge.resolve_metric_stat_detail(_metric, _stat, period)
+                if _detail and _detail.get("位置"):
+                    _log({"占位符": key, "类型": "stats最值位置", "值": _detail["位置"],
+                          "关联": f"stats.{_metric}.{_stat}",
+                          "说明": "取达到最值/最大差值的传感器监测部位"})
+                    return str(_detail["位置"])
+                _log({"占位符": key, "类型": "stats最值位置", "结果": "未找到",
+                      "原因": f"stats.{_metric}.{_stat} 无最值位置可推断"})
+                if missing_sink is not None:
+                    missing_sink.append(key)
+                return missing_marker
             if len(parts) == 3 and bridge is not None:
-                metric, _, stat = parts
+                _, metric, stat = parts
                 value = None
                 try:
-                    value = bridge.resolve_metric_stat(metric, stat, period)
+                    value, detail = bridge.resolve_metric_stat_detail(metric, stat, period)
+                    if value is not None:
+                        _log({**detail, "类型": "stats重算",
+                              "输出": _format_stat_value(key, value)})
+                    else:
+                        _log({"占位符": key, "类型": "stats重算", "结果": "未找到", **detail})
                 except Exception as exc:  # noqa: BLE001
                     log.warning("桥数据解析 stats 失败 %s: %s", key, exc)
                 if value is not None:
                     return _format_stat_value(key, value)
                 if missing_sink is not None:
                     missing_sink.append(key)
+                # 只有“桥模式真实指标”解析不到才标缺失；
+                # stats.days 等非桥指标继续走下方 computed 兜底
+                if bridge is not None and metric in bridge.metrics:
+                    return missing_marker
             node = stats
             found = True
             for p in parts[1:]:
@@ -219,10 +265,25 @@ def build_value_resolver(stats: Dict, period: Dict,
         # 通用数据占位符：回填 annotate_docx 阶段保存的原始值
         if key.startswith("data."):
             if data_values and key in data_values:
-                return str(data_values[key])
-            raise KeyError(f"无原始值映射的 data 占位符: {key}")
+                raw = str(data_values[key])
+                meta = (data_meta or {}).get(key, {})
+                _log({
+                    "占位符": key,
+                    "类型": "data原文回填",
+                    "值": raw,
+                    "原文上下文": meta.get("context", ""),
+                    "原文段落": meta.get("paragraph"),
+                    "说明": "回填分析阶段记录的原文数值，未重算（如需重算应使用 stats.* 占位符）",
+                })
+                return raw
+            _log({"占位符": key, "类型": "data原文回填", "结果": "未找到",
+                  "原因": "analysis data_values 中没有该键的原文值"})
+            if missing_sink is not None:
+                missing_sink.append(key)
+            return missing_marker
         raise KeyError(f"不支持的占位符: {key}")
 
+    resolve.lineage = lineage or []
     return resolve
 
 
@@ -334,7 +395,12 @@ def _ensure_rgb(path: str) -> str:
             return path
         cache = os.path.join(tempfile.gettempdir(), "report_rgb")
         os.makedirs(cache, exist_ok=True)
-        key = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:16]
+        # 缓存键包含文件修改时间/大小，图库重新生成后不会返回旧缓存图
+        mtime = os.path.getmtime(path) if os.path.isfile(path) else 0
+        fsize = os.path.getsize(path) if os.path.isfile(path) else 0
+        key = hashlib.sha1(
+            f"{os.path.abspath(path)}|{mtime}|{fsize}".encode("utf-8")
+        ).hexdigest()[:16]
         out = os.path.join(cache, key + ".png")
         if os.path.isfile(out):
             return out
@@ -351,12 +417,51 @@ def _ensure_rgb(path: str) -> str:
         return path
 
 
+def _set_auto_line_spacing(paragraph: Paragraph) -> None:
+    """覆盖默认样式的固定行距(lineRule=exact)。
+
+    模板的 Normal 样式常带 w:line=500 lineRule=exact（固定行高约 25pt），
+    inline 大图会溢出固定行高、压住上下内容造成重叠。
+    这里显式改为单倍自动行距，让行随图片高度自动扩展。
+    """
+    try:
+        pPr = paragraph._p.get_or_add_pPr()
+        spacing = pPr.find(qn("w:spacing"))
+        if spacing is None:
+            spacing = OxmlElement("w:spacing")
+            pPr.append(spacing)
+        spacing.set(qn("w:line"), "240")
+        spacing.set(qn("w:lineRule"), "auto")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("设置图片段落自动行距失败: %s", exc)
+
+
 def _insert_chart(paragraph: Paragraph, png_path: str, width_inches: float) -> None:
     """把段落清空并插入居中图片。"""
     paragraph.clear()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_auto_line_spacing(paragraph)
     run = paragraph.add_run()
-    run.add_picture(_ensure_rgb(png_path), width=Inches(width_inches))
+    w, h = _chart_insert_size(png_path, width_inches)
+    if w:
+        run.add_picture(_ensure_rgb(png_path), width=w)
+    else:
+        run.add_picture(_ensure_rgb(png_path), height=h)
+
+
+def _chart_insert_size(png_path: str, width_inches: float,
+                       max_height_inches: float = 6.5):
+    """计算插入尺寸：优先按宽度；图过高时按最大高度限制（保持比例）。"""
+    try:
+        from PIL import Image
+        img = Image.open(png_path)
+        w, h = img.size
+        ratio = h / w if w else 1.0
+        if ratio * width_inches > max_height_inches:
+            return None, Inches(max_height_inches)
+    except Exception:  # noqa: BLE001
+        pass
+    return Inches(width_inches), None
 
 
 def iter_block_items(parent):
@@ -558,7 +663,14 @@ def _period_text_replacements(period: Dict):
     end = period.get("end")
     sm = getattr(start, "month", m)
     em = getattr(end, "month", m)
-    return [
+    def _prev_year_quarter(m):
+        """把“上一年度的第X季度”改成当前报告期（如 2025年第一季度 -> 2026年第一季度）。"""
+        y = int(m.group(1))
+        if y == sig.year - 1:
+            return f"{sig.year}年{m.group(2)}"
+        return m.group(0)
+
+    reps = [
         (re.compile(rf"{x4}年{x2}月{x2}日"), f"{y}年{m}月{d}日"),
         # 报告期范围：xx月-xx月（如结论段“2026年xx月-xx月”）
         (re.compile(rf"{x2}月[-—–~～]{x2}月"), f"{sm}月-{em}月"),
@@ -568,7 +680,25 @@ def _period_text_replacements(period: Dict):
         # 签字表等处的裸月/日占位（顺序在范围之后，避免误伤）
         (re.compile(rf"{x2}月"), f"{m}月"),
         (re.compile(rf"{x2}日"), f"{d}日"),
+        # 上一年度的“第X季度” -> 当前报告期（正文字面量，如“2025年第一季度”）
+        (re.compile(r"(20\d{2})年(第[一二三四1-4]季度)"), _prev_year_quarter),
+        # 兜底：模板残留 “2025年{{date.period_label_cn}}” 解析后变成
+        # “2025年2026年第1季度” → 去掉旧年份
+        (re.compile(r"20\d{2}年(\d{4}年)"), r"\1"),
     ]
+    # 年度报告：季度字眼全部改为年度
+    if period.get("mode") == "yearly":
+        reps += [
+            (re.compile(r"本季度"), "本年度"),
+            # “2025年第一季度” -> “2026年度”（顺序在 _prev_year_quarter 之后）
+            (re.compile(r"(20\d{2})年(第[一二三四1-4]季度)"),
+             lambda m: f"{y}年度"),
+            # 页眉等 “xxxx年第X季度” -> “2026年”
+            (re.compile(rf"第[xX×]季度"), ""),
+            # 封面 “2026年度（2026年）” 冗余括注 -> “2026年度”
+            (re.compile(rf"（{y}年）"), ""),
+        ]
+    return reps
 
 
 def _apply_period_text_fixes(doc: Document, period: Dict) -> int:
@@ -782,6 +912,7 @@ def _add_caption_after(paragraph: Paragraph, text: str) -> Paragraph:
     _copy_ppr(new_p, paragraph._p)  # 继承图表段落的样式/间距，避免行高塌陷
     p = Paragraph(new_p, paragraph._parent)
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_auto_line_spacing(p)
     run = p.add_run(text)
     run.font.size = Pt(10.5)
     return p
@@ -807,6 +938,7 @@ def build_report(
     period: Optional[Dict] = None,
     chart_captions: Optional[Dict[str, str]] = None,
     extra_charts: Optional[Dict[str, List[Dict]]] = None,
+    text_replace: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """基于模板生成报告，返回未替换的占位符列表（strict=True 时抛出异常）。"""
     doc = Document(template_path)
@@ -854,7 +986,12 @@ def build_report(
                 for ex in extra_charts.get(chart_id, []):
                     ex_p = _new_paragraph_after(anchor_el, item._parent, source_el=item._p)
                     ex_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    ex_p.add_run().add_picture(_ensure_rgb(ex["path"]), width=Inches(chart_width_inches))
+                    _set_auto_line_spacing(ex_p)
+                    w, h = _chart_insert_size(ex["path"], chart_width_inches)
+                    if w:
+                        ex_p.add_run().add_picture(_ensure_rgb(ex["path"]), width=w)
+                    else:
+                        ex_p.add_run().add_picture(_ensure_rgb(ex["path"]), height=h)
                     ex_anchor = ex_p._p
                     ex_caption = ex.get("caption", "")
                     if ex_caption:
@@ -908,11 +1045,112 @@ def build_report(
     # 同节内图表按图型重排（曲线图在前，直方图在后）+ 图注重编号 + 统一字号
     _reorder_chart_blocks(doc)
     _renumber_and_unify_captions(doc)
+    # 兜底：所有含图片的段落统一自动行距，防止模板 Normal 固定行距(lineRule=exact)
+    # 导致 inline 大图溢出行高、与上下内容重叠
+    for pa in _walk_paragraphs(doc):
+        if pa._p.findall('.//' + qn("w:drawing")):
+            _set_auto_line_spacing(pa)
+    if text_replace:
+        _apply_text_replacements(doc, text_replace)
     doc.save(output_path)
     rgb_n = _flatten_rgba_in_docx(output_path)
     if rgb_n:
         log.info("输出文档 RGBA 图片转 RGB：%d 张", rgb_n)
     return unfilled
+
+
+def _write_data_lineage(lineage: List[Dict], logs_dir: str, period: Dict) -> str:
+    """把本次生成所有占位符的数据链路写入 logs/data_lineage_<label>.json 与 .log。
+
+    返回写出的 .log 路径。找不到的项会以“结果=未找到”明确记录，不会静默填值。
+    """
+    os.makedirs(logs_dir, exist_ok=True)
+    label = (period.get("label") or "report").replace(" ", "_")
+    json_path = os.path.join(logs_dir, f"data_lineage_{label}.json")
+    log_path = os.path.join(logs_dir, f"data_lineage_{label}.log")
+
+    payload = {
+        "报告期": {
+            "mode": period.get("mode"),
+            "start": str(period.get("start")),
+            "end": str(period.get("end")),
+            "label": label,
+        },
+        "汇总": {
+            "总条目": len(lineage),
+            "stats重算": sum(1 for e in lineage if e.get("类型") == "stats重算"),
+            "cell重算": sum(1 for e in lineage if e.get("类型") == "cell重算"),
+            "data原文回填": sum(1 for e in lineage if e.get("类型") == "data原文回填"),
+            "未找到": sum(1 for e in lineage if e.get("结果") == "未找到"),
+        },
+        "条目": lineage,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+
+    lines = [
+        f"数据链路日志 报告期={payload['报告期']}",
+        f"汇总: {payload['汇总']}",
+        "=" * 70,
+    ]
+    for e in lineage:
+        ph = e.get("占位符") or "?"
+        typ = e.get("类型") or "?"
+        if e.get("结果") == "未找到":
+            lines.append(f"[未找到] {ph} ({typ}) 原因: {e.get('原因', '')}")
+            continue
+        out = e.get("输出")
+        if typ == "data原文回填":
+            lines.append(f"[{ph}] {typ} 值={e.get('值')}")
+        else:
+            lines.append(f"[{ph}] {typ} 输出={out}")
+        if typ == "stats重算":
+            lines.append(f"    指标={e.get('指标')} 统计量={e.get('统计量')} "
+                         f"报告期={e.get('报告期')} 聚合规则={e.get('聚合规则')}")
+            for d in e.get("逐传感器", []):
+                lines.append(f"    传感器{d.get('传感器编号')} "
+                             f"{d.get('监测部位')} {d.get('特征')} "
+                             f"天数={d.get('天数')} 值={d.get('值')} "
+                             f"文件={d.get('统计文件')}")
+        elif typ == "cell重算":
+            lines.append(f"    分支={e.get('分支')} 监测部位={e.get('监测部位')} "
+                         f"表格={e.get('表格标题')} 行号={e.get('表格行号')}")
+            d = e.get("传感器")
+            if isinstance(d, dict):
+                lines.append(f"    传感器{d.get('传感器编号')} {d.get('监测部位')} "
+                             f"天数={d.get('天数')} 值={d.get('值')} "
+                             f"文件={d.get('统计文件')}")
+            elif e.get("聚合明细"):
+                lines.append(f"    回退聚合: 规则={e['聚合明细'].get('聚合规则')} "
+                             f"传感器数={e['聚合明细'].get('传感器数')}")
+        elif typ == "data原文回填":
+            lines.append(f"    值={e.get('值')} 原文上下文={e.get('原文上下文', '')[:60]} "
+                         f"原文段落={e.get('原文段落')}")
+        lines.append("-" * 70)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return log_path
+
+
+def _apply_text_replacements(doc: Document, replacements: Dict[str, str]) -> int:
+    """对全文（正文/表格/页眉页脚）做字典级文字修正，如 堡->墩（源文档字库替换错误）。"""
+    changed = 0
+    for paragraph in _walk_paragraphs(doc):
+        full = "".join(r.text for r in paragraph.runs)
+        new = full
+        for a, b in replacements.items():
+            new = new.replace(a, b)
+        if new != full:
+            runs = paragraph.runs
+            if not runs:
+                continue
+            runs[0].text = new
+            for r in runs[1:]:
+                r.text = ""
+            changed += 1
+    if changed:
+        log.info("文字修正 %d 处：%s", changed, replacements)
+    return changed
 
 
 def _remaining_markers(doc: Document) -> List[str]:

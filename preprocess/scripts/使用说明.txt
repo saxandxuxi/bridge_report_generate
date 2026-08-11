@@ -17,52 +17,83 @@
 二、处理流程
 ------------------------------------------------------------
 第 1 步: 原始数据预处理(按天聚合为小时统计)
-    python 处理脚本\run_preprocess_all_sensors.py
-    输出: D:\preprocess_sensor_data\daily\<传感器>\<特征>\<日期>.csv
+    python 处理脚本\preprocess_sensor_data.py --mode preprocess \
+        --data-root D:\信科采集软件解析数据 --output-root D:\preprocess_sensor_data \
+        --bridge 赤石 --start 2026-01-01 --end 2026-03-31 --resume
+    输出(绝对路径): D:\preprocess_sensor_data\<桥名>\daily_2026.1~3\<传感器>\<特征>\<日期>.csv
     说明: summary.csv 会在结束后自动按 传感器/特征/日期 排序去重;
-          断点续跑跳过的任务也会回填汇总记录，不再丢失。
+           断点续跑跳过的任务也会回填汇总记录，不再丢失。
 
 第 2 步: 生成图库 + 统计值
-    python 处理脚本\build_chart_library.py
-    默认读取 D:\preprocess_sensor_data\daily,
-    输出到 D:\preprocess_sensor_data\图库 和 D:\preprocess_sensor_data\统计值
+    python 处理脚本\build_chart_library.py --mode merged --year 2026 \
+        --quarter 1 --bridge 赤石 --features "DZJSD(xJsd)" --skip-per-sensor
+    默认读取(绝对路径): D:\preprocess_sensor_data\<桥名>\daily_2026.1~3
+    输出(相对路径): preprocess\图库_2026.1~3\<桥名>\ 和 preprocess\统计值_2026.1~3\<桥名>\
+    --bridge 不填时自动按传感器对照表里的桥名推导；预处理和建图库必须用同一个桥名。
 
     常用参数:
       --correlation     同时生成特征间相关性分析图(默认关闭)
       --limit-sensors N 只处理前 N 个传感器(试跑)
       --start/--end     只统计指定日期范围
-      --daily-root/--lib-root  覆盖输入输出路径
+      --daily-root/--lib-root/--charts-dir/--stats-dir  覆盖输入输出路径
+      --vibration-date YYYY-MM-DD  振动(秒级)指定出图日期(默认自动取数据最完整的一天)
       --rebuild-summary 先从 daily 目录重新生成 summary.csv，再生成图库
                         (不重跑预处理，适合 daily 已有、汇总表丢失/不全时)
 
     第 2.5 步: 生成季度统计值(小时级，同监测部位多传感器取均值)
     python 处理脚本\build_quarterly_stats.py
-        --daily-root D:\preprocess_sensor_data\daily
-        --lib-root   D:\preprocess_sensor_data
+        --daily-root D:\preprocess_sensor_data\<桥名>\daily_2026.1~3
+        --lib-root   D:\Code\data_analysis\preprocess --bridge 赤石
     输出: 统计值\季度统计.json
 
     统计前统一清洗(与绘图同一套逻辑):
       - 物理合理范围过滤: 湿度 0~100%、温度 -80~80℃、风速 0~100 m/s、
         索力 0~10 万 KN、位移/挠度 ±10 万 mm、应变 ±5 万 με 等，
-        超出范围的值(如采集错误码 435000、9e7)一律用稳健基线替代并记录
+        超出范围的值(如采集错误码 435000、9e7)一律用稳健基线替代并记录；
+        边界带量程百万分之一的容差，避免基线贴近边界(如索力≈0)时把
+        微小测量噪声(-1e-06)误判为超范围导致满图红点；
+        仅当 >=98% 数据落在物理区间内该范围才生效(硬过滤)；
+        否则认为范围与传感器量程/单位不符，仅作绘图参考、不硬过滤，
+        交由分布极端点/尖峰逻辑处理，并在记录中写明"命中率xx%"
       - 零散尖峰替代 + 规律性高峰保护(见上文)
       - 同一监测部位同一特征有多个传感器时，按小时取各传感器均值，
         最大值取各传感器最大、最小值取最小
 
     图库生成失败/数据不足时会记录到: 图库\生成失败记录.txt
 
+    合并图(merged)版面：≤3 个测点/特征时子图纵向堆叠、每个子图占满宽度，
+    保证插入报告(约 5.8 英寸宽、上限 6.5 英寸高)后文字清晰可读、不与正文重叠；
+    超过 3 个子图时退回两列网格，避免整图过高。
+    振动(DZJSD 等秒级特征)：per_sensor 与 merged 都只出一张时间序列图
+    (时间序列图.png)——每天只加载当天数据(约 8.6 万点)，在期内挑选
+    数据最完整的一天(可用 --vibration-date YYYY-MM-DD 指定)；
+    横轴为 0~24 小时(刻度 0/6/12/18/24 时)，标题含具体年月日；
+    频率分布图仍按季度逐日累积。报告侧若存在旧版按天文件
+    (时间序列图_YYYY-MM-DD.png)会自动取日期最新的一张。
+
     进一步预处理(默认开启，生成统计值和图之前执行):
       - 数据按小时级加载(daily 每天 24 行)，时间序列图一天描 24 个点，
         横轴仍标日期；只有没有 daily 时才回退 summary.csv(日级)
-      - 零散尖峰点(均值/最大/最小三个序列各自检测): 用去掉上下 5%
-        极端值后的稳健基线判定，偏离超过 --spike-threshold 倍MAD、
-        且连续不超过 3 小时的点才是尖峰候选；每个序列最多替代
-        --max-spikes(默认3)个最极端的，其余视为正常分布尾部不替代；
-        风类特征(spfs/szfs 长尾分布、spfx/szfx 圆形量)不做尖峰判定，
-        只做范围过滤(真实大风/阵风不被误删)；
+      - 零散尖峰点(均值/最大/最小三个序列各自检测): 滑动(重合)窗口法——
+        每个窗口去掉 1 个最小+1 个最大后看局部分布，被去掉的极值偏离
+        窗口中心超过 --spike-threshold 倍窗口尺度、且被 >=2 个重合窗口
+        命中才算尖峰候选；连续超过 3 个点的长段属于持续偏高/偏低，
+        不判尖峰(走标注)；每个序列最多替代 --max-spikes(默认3)个
+        最极端的，其余视为正常分布尾部不替代；
+        风向类(spfx/szfx 圆形量)不做尖峰判定只做范围过滤；风速
+        (spfs/szfs)允许剔除零散尖峰(真实大风/阵风长段不会被误删)；
+        分布极端点(--dist-k)：单个孤立点偏离超过 dist_k×尺度(默认20)视为
+        异常值，按偏离程度排名最多剔除 --max-removals(默认5)个；
+        连续超过 3 个点的异常段不剔除，改为在时间序列图上着色并标注
+        "x月x日x时~x月x日x时 均值xx 偏高/偏低"(精确到数据粒度，
+        如 10 分钟)；dist-k=0 时关闭散点异常值剔除(异常段标注仍用
+        默认带宽)。分布极端点与零散尖峰合计最多剔除 5 个，按偏离程度
+        排名，物理范围外/非有限值不计入；
         替代记录写入 JSON 的 "预处理.尖峰替代"，图上 黑x=统计尖峰、
-        红x=物理范围外剔除；同一小时在多天重复出现的"规律性高峰"
-        (如早晚高峰)视为常态不替代
+        红x=物理范围外/分布极端点剔除；同一小时在多天重复出现的
+        "规律性高峰"(如早晚高峰)视为常态不替代；时间序列图只绘制
+        均值序列，图上的 X 只标注均值序列的剔除点(最大值/最小值序列
+        的清洗记录仍保留在 JSON 的 "预处理.尖峰替代" 中)
       - 数据缺失(连续 >= --gap-fill-hours 小时，默认24): 在图上橙色
         标注缺失区间("数据缺失 Nh: x月x日x时~x月x日x时 (已线性填充)")，
         绘图序列用首尾有效值线性插值填充；统计值仍按真实数据计算，
@@ -72,7 +103,8 @@
         着色并标注 "x月x日x时~x月x日x时 均值xx 偏高/偏低"(精确到小时)，
         区间详情写入 JSON 的 "预处理.突变区间"
       参数: --spike-threshold 5.0(默认) / --gap-fill-hours 24(0=关闭) /
-            --max-spikes 3 / --shift-threshold 2.5 / --shift-min-days 7；
+            --max-spikes 3 / --max-removals 5 / --dist-k 20(0=关闭) /
+            --shift-threshold 2.5 / --shift-min-days 7；
             流量/计数类特征(如人流量)建议 --spike-threshold 0 关闭尖峰替代
 
 第 3 步(一次性): 生成传感器编号对照表(完善版)
@@ -86,11 +118,6 @@
     特征编码来自 Q1 统计值(自动读取 统计值\ 目录)，
     先跑完预处理和图库统计再执行本脚本，映射最准确。
 
-第 4 步(可选): 单独修复/重建 summary.csv(不重跑预处理)
-    python 处理脚本\build_summary_from_daily.py
-        --daily-root D:\preprocess_sensor_data\daily
-        --summary    D:\preprocess_sensor_data\summary.csv
-    直接从 daily 目录重新汇总，按 传感器/特征/日期 排序输出。
 
 三、统计值 JSON 里的中文键
 ------------------------------------------------------------

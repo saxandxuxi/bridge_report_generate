@@ -5,10 +5,10 @@
   "bridge_data": {
     "enabled": true,
     "bridge_name": "赤石",
-    "stats_dir": "preprocess/统计值",
-    "charts_dir": "preprocess/图库",
+    "stats_dir": "preprocess/统计值/赤石",
+    "charts_dir": "preprocess/图库/赤石",
     "sensor_map": "preprocess/统计值/传感器编号名称.json",
-    "overview": "preprocess/统计值/总览.json",
+    "overview": "preprocess/统计值/赤石/总览.json",
     "name_dict": "preprocess/统计值/传感器名称对照/赤石大桥.json",
     "fuzzy_threshold": 0.7,
     "period_aggregate": true,

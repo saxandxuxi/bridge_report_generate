@@ -84,6 +84,7 @@ _TITLE_TO_METRIC = [
     ("交通", "vehicle_count", "交通"),
     ("荷载", "vehicle_count", "荷载"),
     ("车流", "vehicle_count", "车流"),
+    ("裂缝", "crack", "裂缝"),
     ("桥面", "displacement", "桥面位移"),
     ("支座", "bearing_displacement", "支座位移"),
 ]
@@ -101,6 +102,8 @@ _HEADER_TO_STAT = [
     (["标准差", "std"], "std", 0),
     (["中位数", "median"], "median", 0),
     (["合计", "累计", "总和"], "sum", 0),
+    (["数值"], "count", 0),       # 交通荷载“数值/辆”
+    (["比例", "占比"], "ratio", 0),  # 交通荷载“比例/%”
 ]
 
 
@@ -218,7 +221,12 @@ DATE_RE = re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}")
 KILO_POST_RE = re.compile(r"[Kk]\s*\d+\s*\+?\s*\d*")
 CAPTION_RE = re.compile(r"^\s*(图|表|Figure|Fig\.?)\s*\d*")
 # 图表文本占位：报告里 "xxx_time_series" / "xxx_histogram" 等行表示该处应插入图表
-CHART_TEXT_RE = re.compile(r"_(time_series|histogram|curve|frequency|scatter|boxplot)$")
+CHART_TEXT_RE = re.compile(
+    r"_(time_series|histogram|curve|frequency|scatter|boxplot)$"
+    r"|_[^_]+(时程曲线图|频率分布直方图|频率分布图|时程曲线|时间序列图)$"
+    r"|_(时程曲线图|频率分布直方图|频率分布图|时程曲线|时间序列图|直方图)$"
+    r"|_(时程曲线图|频率分布直方图|频率分布图|时程曲线|时间序列图|直方图)_\d+$"
+)
 
 # 纯图题识别：图题末尾含"图"且包含动态图表关键词
 # 例：交通荷载监测_车辆累计通过数量统计图、梁端转角测点变化时程曲线图
@@ -229,6 +237,42 @@ BARE_CHART_CAPTION_RE = re.compile(
 # 字母前缀表示表格（指标），行号从 2 开始（标题行算 1），列号从 2 开始（标签列算 1）
 # 例：H(10,2) = 索夹表 87-L 索夹 1 的平均值列
 CELL_REF_RE = re.compile(r"([A-Z])\((\d+)\s*,\s*(\d+)\)")
+
+
+def _metric_from_chart_text(text: str) -> str:
+    """从图表文本/图题推断指标名（长关键词优先，避免“结构温度”误判为“温度”）。"""
+    t = text or ""
+    ordered = [
+        ("结构温度", "structure_temperature"),
+        ("环境温度", "temperature"),
+        ("环境湿度", "humidity"),
+        ("梁端倾角", "rotation"),
+        ("倾角", "rotation"),
+        ("挠度", "deflection"),
+        ("应变", "strain"),
+        ("转角", "rotation"),
+        ("索夹", "cable_clamp"),
+        ("索力", "cable_force"),
+        ("位移", "displacement"),
+        ("变位", "displacement"),
+        ("偏位", "displacement"),
+        ("裂缝", "crack"),
+        ("风速", "wind_speed"),
+        ("风向", "wind_dir"),
+        ("振动", "vibration"),
+        ("应力", "stress"),
+        ("沉降", "settlement"),
+        ("车辆", "vehicle_count"),
+        ("交通", "vehicle_count"),
+        ("车流", "vehicle_count"),
+        ("荷载", "load"),
+        ("温度", "temperature"),
+        ("湿度", "humidity"),
+    ]
+    for kw, metric in ordered:
+        if kw in t:
+            return metric
+    return "chart"
 
 # 动态统计关键词（出现则倾向于替换）
 DYNAMIC_WORDS = [
@@ -276,13 +320,17 @@ METRIC_WORDS = {
     "应变": "strain", "应力": "stress", "裂缝": "crack", "挠度": "deflection",
     "雨量": "rainfall", "风速": "wind_speed",
     # 桥梁健康监测专用（与 llm_classifier.METRIC_STANDARD 保持一致）
-    "转角": "rotation", "索力": "cable_force", "索夹": "cable_clamp",
-    "变位": "displacement", "振动": "vibration", "车辆": "vehicle_count",
-    "荷载": "load", "结构温度": "structural_temp",
+    "转角": "rotation", "倾角": "rotation", "索力": "cable_force", "索夹": "cable_clamp",
+    "变位": "displacement", "支座位移": "bearing_displacement",
+    "振动": "vibration", "地震": "earthquake_load", "车辆": "vehicle_count",
+    "荷载": "load", "结构温度": "structure_temperature",
 }
 STAT_WORDS = {
-    "最高": "max", "最大": "max", "最低": "min", "最小": "min",
+    "最高": "max", "最大": "max", "最低": "min", "最底": "min", "最小": "min",
     "平均": "avg", "均值": "avg", "中位数": "median", "标准差": "std", "极差": "range",
+    # 长词优先（suggest_placeholder 会按关键词长度优先），“最大差值”应映射 range
+    "最大差值": "range", "最小差值": "range", "最大变化": "range",
+    "绝对最大": "abs_max",
 }
 
 
@@ -299,20 +347,34 @@ def suggest_placeholder(before: str, after: str):
     combined = {**METRIC_WORDS, **STAT_WORDS}
     best_metric = best_stat = None
     best_md = best_sd = None
+    best_stat_kw = best_metric_kw = ""
 
     def consider(text, offset_penalty, from_end=False):
-        nonlocal best_metric, best_stat, best_md, best_sd
-        for kw, v in combined.items():
+        nonlocal best_metric, best_stat, best_md, best_sd, best_stat_kw, best_metric_kw
+        # 长关键词优先：同一位置命中时，“最大差值”优先于“最大”
+        for kw, v in sorted(combined.items(), key=lambda kv: -len(kv[0])):
             idx = text.rfind(kw) if from_end else text.find(kw)
             if idx == -1:
                 continue
             d = (len(text) - idx if from_end else idx) + offset_penalty
-            if v in METRIC_WORDS.values() and d <= 10 and (best_md is None or d < best_md):
-                best_metric, best_md = v, d
-            elif v in STAT_WORDS.values() and d <= 6 and (best_sd is None or d < best_sd):
-                best_stat, best_sd = v, d
+            if v in METRIC_WORDS.values() and d <= 20 and (
+                    best_md is None or d < best_md
+                    or (d == best_md and len(kw) > len(best_metric_kw))):
+                best_metric, best_md, best_metric_kw = v, d, kw
+            elif v in STAT_WORDS.values() and d <= 8 and (
+                    best_sd is None or d < best_sd
+                    or (d == best_sd and len(kw) > len(best_stat_kw))):
+                best_stat, best_sd, best_stat_kw = v, d, kw
 
     consider(before, 0, from_end=True)
+    # “结构温度”比“温度”更具体，覆盖短词“温度”命中，
+    # 避免“结构温度…最高温度”被抢成 stats.temperature.*
+    if "结构温度" in before:
+        best_metric = "structure_temperature"
+        best_md = 0
+    if "支座位移" in before:
+        best_metric = "bearing_displacement"
+        best_md = 0
     if best_metric is None or best_stat is None:
         consider(after, 30)  # 数字之后的词仅作补充，且带较大距离惩罚
     if best_metric and best_stat:
@@ -371,16 +433,26 @@ def classify_number(value: str, context: str, before: str = "", after: str = "")
         score -= 0.50
         reasons.append("测点布设数量")
 
-    # 测点编号：数字前后紧跟 "测点" / "测点N" / "N号测点"
-    if re.search(r"测\s*点\s*$", before) or re.search(r"测\s*点\s*$", ctx_stripped):
+    # 测点编号：数字前后紧跟 "测点" / "测点N" / "N号测点"。
+    # 只作用于整数（测点编号是 1/2/3…）；"测点的最大值为39.96" 这类小数是测量值，
+    # 不能被误判成测点编号。
+    if re.fullmatch(r"\d+", value) and (
+            re.search(r"测\s*点\s*$", before) or re.search(r"测\s*点\s*$", ctx_stripped)):
         score -= 0.55
         reasons.append("测点编号（前）")
-    elif re.search(r"^\s*测\s*点", after):
+    elif re.fullmatch(r"\d+", value) and re.search(r"^\s*测\s*点", after):
         score -= 0.55
         reasons.append("测点编号（后）")
-    if re.search(r"^\s*号\s*测\s*点", after) or re.search(r"号\s*测\s*点$", before):
+    if re.fullmatch(r"\d+", value) and (
+            re.search(r"^\s*号\s*测\s*点", after) or re.search(r"号\s*测\s*点$", before)):
         score -= 0.55
         reasons.append("测点编号")
+
+    # 车辆总数：数字后面紧跟“辆”（如 “…车辆总数为378993辆”），
+    # 与车道号（“车道1、车道2”）区分，保证结论段三个车辆数都判为动态。
+    if re.search(r"^\s*辆", after):
+        score += 0.35
+        reasons.append("车辆总数（后跟辆）")
 
     # 索夹/吊索编号："87-L" / "87-R" / "88-L" / "88-R" 等字母结尾
     if re.search(r"[A-Za-z]$", after) and re.fullmatch(r"\d+", value):
@@ -389,6 +461,10 @@ def classify_number(value: str, context: str, before: str = "", after: str = "")
     if re.search(r"^\s*-\s*[A-Za-z]$", after) and re.fullmatch(r"\d+", value):
         score -= 0.60
         reasons.append("索夹/吊索编号")
+    # 字母前缀编号（如 RE24-RE25 节点板、K814+091 桩号）：数字紧跟在字母后
+    if re.search(r"[A-Za-z]$", before) and re.fullmatch(r"\d+", value):
+        score -= 0.60
+        reasons.append("编号（字母前缀）")
 
     # 表格标题信号：context 含 "监测内容表" / "阈值表" / "对照表" / "分级表" 等
     table_title_signals = [
@@ -504,7 +580,7 @@ def _extract_numbers(text: str, base: dict, header_context: str = "") -> list:
             continue  # 跳过占位符内部
         value = m.group(0)
         ctx = _window(text, m.start(), m.end())
-        before = text[max(0, m.start() - 12):m.start()]
+        before = text[max(0, m.start() - 20):m.start()]
         after = text[m.end():m.end() + 4]
         if header_context:
             ctx = header_context + " | " + ctx
@@ -522,6 +598,125 @@ def _extract_numbers(text: str, base: dict, header_context: str = "") -> list:
         )
         out.append(info)
     return out
+
+
+# 原文占位标记：如 [A-MAX]、[A-MAX-LOC]、B-MIN、G-MAX-X 等。
+# 部分成品报告用这类标记代替真实数值（由报告生成器占位），识别时应视为动态值。
+TAG_TOKEN_RE = re.compile(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+")
+TAG_RE = re.compile(
+    r"\[(" + TAG_TOKEN_RE.pattern + r")\]"
+    r"|(?<![A-Za-z0-9\]])" + TAG_TOKEN_RE.pattern + r"(?![A-Za-z0-9\[])",
+)
+
+
+def _nearest_word(text: str, pos: int, win: int, words: dict, skip=()) -> Optional[str]:
+    """在 text[pos-win:pos] 里找最近的指标/统计词，长词优先。
+
+    短词是长词的子串且落在长词内部时（如 “最大” 在 “绝对最大/最大差值” 内、
+    “温度” 在 “结构温度” 内），必须让长词胜出，否则会把 绝对最大/最大差值
+    错判成 max、把 结构温度 错判成 环境温度。
+    skip: 需要排除的词类值（如 “荷载/车辆” 太泛，不适合推断监测指标）。
+    """
+    ordered = sorted(words.items(), key=lambda kv: -len(kv[0]))
+    best = None
+    for kw, v in ordered:
+        if v in skip:
+            continue
+        i = text.rfind(kw, max(0, pos - win), pos)
+        if i == -1:
+            continue
+        # 该位置被更长关键词覆盖（长词起点 <= 短词起点 < 长词终点）→ 跳过短词
+        covered = False
+        for lkw, lv in ordered:
+            if len(lkw) <= len(kw) or lv in skip:
+                continue
+            j = text.rfind(lkw, max(0, pos - win), pos)
+            if j != -1 and j <= i < j + len(lkw):
+                covered = True
+                break
+        if covered:
+            continue
+        d = pos - i
+        if best is None or d < best[0]:
+            best = (d, v)
+    return best[1] if best else None
+
+
+def _extract_tags(text: str, base: dict) -> list:
+    """提取 [A-MAX] / A-MAX-LOC 等原文占位标记。"""
+    out = []
+    for m in TAG_RE.finditer(text):
+        token = m.group(1) or m.group(0)
+        # 规范编号（CECS3-2012 / JTG3362-2018 / T1037-2016 等）以 4 位年份结尾，
+        # 是固定参数，不是动态占位标记；上下文含 规范/标准/规程/编号 时同样保留
+        before_ctx = text[max(0, m.start() - 30):m.start()]
+        if re.search(r"-\d{4}$", token) or any(
+                w in before_ctx for w in ("规范", "标准", "规程", "编号", "JTG", "GB", "CECS")):
+            continue
+        # 真正的占位标记含 MAX/MIN/LOC 等统计词；RE24-RE25、K814+091 这类
+        # 节点板/桩号编号不该被当作动态标记
+        if not re.search(r"(MAX|MIN|LOC|ABS|AVG|STD|RANGE|MEDIAN)", token):
+            continue
+        before = text[max(0, m.start() - 20):m.start()]
+        after = text[m.end():m.end() + 4]
+        out.append({
+            "token": token,
+            "value": token,
+            "position": m.start(),
+            "end": m.end(),
+            "before": before,
+            "after": after,
+            "verdict": "replace",
+            "confidence": 0.9,
+            "reasons": ["原文占位标记（如 A-MAX），应动态替换"],
+            "placeholder": None,
+            **base,
+        })
+    return out
+
+
+def _classify_tag(tag: dict, texts: list) -> None:
+    """根据上下文把 [A-MAX] 这类标记映射为 stats.* 占位符。
+
+    - 值标记（A-MAX）→ {{stats.<指标>.<统计>}}（重算）
+    - 位置标记（A-MAX-LOC）→ {{stats.<指标>.<统计>.loc}}（对应测点位置，运行时取
+      最值传感器的监测部位）；推断不到时退回 {{data.N}} 原文回填。
+    """
+    para_idx = tag.get("paragraph")
+    pos = tag.get("position")
+    if not isinstance(para_idx, int) or not isinstance(pos, int):
+        return
+    t = str(texts[para_idx]) if 0 <= para_idx < len(texts) else ""
+    if not t:
+        return
+    token = str(tag.get("token", ""))
+    is_loc = token.endswith("-LOC")
+    # 统计词扫描窗口：位置标记（…对应测点位置为[A-MAX-LOC]）里统计词离得较远
+    stat_win = 40 if is_loc else 12
+    # 只在本句（最后句号之后）里找指标词；分号后子句若自带指标词
+    # （“…；地震监测数据的绝对最大值为[D-MAX]”）则按子句归属，
+    # 否则沿用整句（“…索力最大值为…；最小值为”）
+    sent_start = max(t.rfind("。", 0, pos), t.rfind("！", 0, pos),
+                     t.rfind("？", 0, pos)) + 1
+    sentence = t[sent_start:pos]
+    semi = sentence.rfind("；")
+    if semi != -1:
+        clause = sentence[semi + 1:]
+        clause_metric = _nearest_word(clause, len(clause), 60, METRIC_WORDS,
+                                      skip={"load", "vehicle_count"})
+        if clause_metric:
+            sentence = clause
+    best_metric = _nearest_word(sentence, len(sentence), 60, METRIC_WORDS,
+                                skip={"load", "vehicle_count"})
+    best_stat = _nearest_word(sentence, len(sentence), stat_win, STAT_WORDS)
+    TAG_METRICS = {
+        "temperature", "humidity", "structure_temperature", "wind_speed",
+        "strain", "deflection", "rotation", "displacement", "bearing_displacement",
+        "cable_force", "crack", "earthquake_load", "vibration",
+    }
+    if best_metric in TAG_METRICS and best_stat:
+        suffix = ".loc" if is_loc else ""
+        tag["placeholder"] = f"{{{{stats.{best_metric}.{best_stat}{suffix}}}}}"
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +772,7 @@ def parse_docx(path: str) -> dict:
     doc = Document(path)
     paragraphs = []  # 所有段落文本（含表格内、页眉页脚）
     numbers = []
+    tags = []
     images = []
     # 表格布局：每个 cell_ref 段落 → (title, row_idx, col_idx, row_label, col_header)
     # 供后续 cell_ref 处理使用，避免只用 letter+position
@@ -598,6 +794,7 @@ def parse_docx(path: str) -> dict:
                     header_context=full_ctx,
                 )
             )
+            tags.extend(_extract_tags(text, {"page": 1, "paragraph": idx}))
         for img in imgs:
             images.append(
                 {
@@ -682,30 +879,48 @@ def parse_docx(path: str) -> dict:
     # 以及"表格 Excel 单元格引用"（H(行,列) / M(行,列) / J(行,列)）
     chart_texts = []
     seen_para = set()  # 避免同一段被多次加入
+    # 车辆累计通过数量统计表：结构化表格（行=数值/比例，列=车道1..N）。
+    # 源表没有“字母(行,列)”引用，单独生成带 位置(车道X)+特征(交通荷载) 的 cell 占位符，
+    # 避免退化成无语义的 {{data.N}}。
+    for _pidx, _info in table_layout_for_para.items():
+        col_h = str(_info.get("col_header") or "")
+        row_l = str(_info.get("row_label") or "")
+        if re.fullmatch(r"车道\d+", col_h) and re.fullmatch(r"(数值/辆|比例/%)", row_l):
+            chart_texts.append({
+                "paragraph": _pidx,
+                "kind": "cell_ref",
+                "chart_id": f"cell_vehicle_{_info['row_idx']}_{_info['col_idx']}",
+                "metric": "vehicle_count",
+                "text": str(paragraphs[_pidx] if _pidx < len(paragraphs) else ""),
+                "table_letter": "V",
+                "row": _info.get("row_idx", 0),
+                "col": _info.get("col_idx", 0),
+                "row_label": col_h,          # 位置：车道1
+                "col_header": row_l,          # 统计：数值/辆 或 比例/%
+                "table_title": _info.get("title", ""),
+                "position": 0,
+                "verdict": "replace",
+                "source": "cell_ref",
+                "vehicle": True,
+            })
     for i, t in enumerate(paragraphs):
         t = t.strip()
         if not t or i in seen_para:
             continue
         m = CHART_TEXT_RE.search(t)
         if m:
-            kind = m.group(1)
+            kind_raw = next((g for g in m.groups() if g), None) or ""
+            # 中英文图型归一化（“时程曲线图/频率分布直方图” 与 time_series/histogram 等价）
+            if kind_raw in ("time_series", "curve", "时程曲线", "时程曲线图", "时间序列图"):
+                kind = "time_series"
+            elif kind_raw in ("histogram", "频率分布直方图", "频率分布图", "直方图"):
+                kind = "histogram"
+            else:
+                kind = kind_raw
             # 从文本前缀提取指标关键字，生成更有意义的图表 ID
             prefix = t[:m.start()].strip()
-            metric_kw = next(
-                (kw for kw in ("挠度", "应变", "转角", "索夹", "位移", "风速", "车辆",
-                               "温度", "湿度", "振动", "应力", "沉降", "索力")
-                 if kw in prefix),
-                "chart",
-            )
-            metric_en = {
-                "挠度": "deflection", "应变": "strain", "转角": "rotation",
-                "索夹": "cable_clamp", "位移": "displacement", "风速": "wind_speed",
-                "车辆": "vehicle_count", "温度": "temperature", "湿度": "humidity",
-                "振动": "vibration", "应力": "stress", "沉降": "settlement",
-                "索力": "cable_force",
-            }.get(metric_kw, "chart")
-            chart_id = "trend" if kind in ("time_series", "curve") else \
-                       "histogram" if kind == "histogram" else kind
+            metric_en = _metric_from_chart_text(prefix)
+            chart_id = "trend" if kind in ("time_series", "curve") else "histogram"
             chart_texts.append({
                 "paragraph": i,
                 "kind": kind,
@@ -727,21 +942,7 @@ def parse_docx(path: str) -> dict:
                                "沉降", "振动", "结构", "桥面", "主梁", "塔", "钢桁")
         ):
             # 从图题中推断指标
-            metric_kw = next(
-                (kw for kw in ("挠度", "应变", "转角", "索夹", "位移", "风速", "风向",
-                               "车辆", "温度", "湿度", "振动", "应力", "沉降", "索力",
-                               "交通", "荷载", "车流")
-                 if kw in t),
-                None,
-            )
-            metric_en = {
-                "挠度": "deflection", "应变": "strain", "转角": "rotation",
-                "索夹": "cable_clamp", "位移": "displacement", "风速": "wind_speed",
-                "风向": "wind_dir", "车辆": "vehicle_count", "温度": "temperature",
-                "湿度": "humidity", "振动": "vibration", "应力": "stress",
-                "沉降": "settlement", "索力": "cable_force",
-                "交通": "vehicle_count", "荷载": "load", "车流": "vehicle_count",
-            }.get(metric_kw, "chart")
+            metric_en = _metric_from_chart_text(t)
             # 推断图表类型
             if "直方" in t or "分布" in t or "频次" in t or "频谱" in t:
                 kind = "histogram"
@@ -852,6 +1053,7 @@ def parse_docx(path: str) -> dict:
     return {
         "images": images,
         "numbers": numbers,
+        "tags": tags,
         "_table_layout": table_layout_for_para,
         "_chart_texts_raw": chart_texts,
 
@@ -950,6 +1152,43 @@ def _build_doc_text(parsed: dict, max_chars: int = 22000) -> str:
     return "\n".join(lines)
 
 
+def _build_doc_chunks(parsed: dict, max_chars: int = 10000) -> List[tuple]:
+    """按节标题把报告文本切分为若干分批片段。
+
+    每段尽量从“数字编号节标题”开始（跨小节合并到接近 max_chars），
+    避免把整份报告一次性塞给大模型。
+    返回 [(文本, 起始段落, 结束段落)]。
+    """
+    texts = parsed.get("texts") or []
+    heading_re = re.compile(r"^\d+(?:\.\d+){0,3}\.?(?=[\u4e00-\u9fa5\s])")
+    chunks = []
+    cur_start = 0
+    cur_lines = []
+    cur_len = 0
+    for i, t in enumerate(texts):
+        ts = str(t).strip()
+        if not ts or not re.search(r"\d", ts):
+            continue
+        is_heading = bool(heading_re.match(ts)) and len(ts) <= 60
+        # 遇到新节标题且当前片段已超过一半上限 -> 切段（新标题作为下一段开头）
+        if is_heading and cur_lines and cur_len >= max_chars * 0.5:
+            chunks.append((cur_start, i, "\n".join(cur_lines)))
+            cur_start = i
+            cur_lines = []
+            cur_len = 0
+        line = ts if len(ts) <= 150 else ts[:150] + "…"
+        cur_lines.append(f"段落{i}: {line}")
+        cur_len += len(line) + 8
+        if cur_len >= max_chars:
+            chunks.append((cur_start, i + 1, "\n".join(cur_lines)))
+            cur_start = i + 1
+            cur_lines = []
+            cur_len = 0
+    if cur_lines:
+        chunks.append((cur_start, len(texts), "\n".join(cur_lines)))
+    return chunks
+
+
 def _locate_value(value: str, snippet: str, texts: list) -> Optional[tuple]:
     """在段落文本中定位某个数字，返回 (paragraph_index, position) 或 None。
 
@@ -1012,6 +1251,17 @@ def recognize(path: str, llm_cfg: Optional[dict] = None) -> dict:
         if ph and not re.match(r"^stats\.[a-zA-Z_]+\.(max|min|avg|median|std|range)$", ph):
             n["placeholder"] = None
 
+    # 原文占位标记（[A-MAX]、[A-MAX-LOC] 等）：按上下文映射为 stats.* 占位符
+    texts_all = parsed.get("texts") or []
+    for tag in parsed.get("tags", []) or []:
+        _classify_tag(tag, texts_all)
+    log.info("原文占位标记识别：%d 个（如 A-MAX/A-MAX-LOC）", len(parsed.get("tags", []) or []))
+
+    # 静态数字保护：位置名/塔号/跨号/测点数量/节标题编号等一律保留
+    n_static = _protect_static_numbers(parsed)
+    if n_static:
+        log.info("静态数字保护：%d 个数字改回保留（位置/塔号/跨号/数量词/标题编号）", n_static)
+
     # 第二轮：LLM 完整性校验
     classifier = LLMClassifier(llm_cfg)
 
@@ -1033,16 +1283,48 @@ def recognize(path: str, llm_cfg: Optional[dict] = None) -> dict:
             "value": n.get("value", ""),
             "snippet": n.get("snippet", ""),
             "placeholder": n.get("placeholder") or "",
+            "paragraph": n.get("paragraph"),
         }
         for n in parsed["numbers"]
         if n["verdict"] == "replace"
     ]
 
+    # 第一轮：按节分批识别 文字/表格 的动态数字（避免整份报告一次塞给大模型）
+    chunks = _build_doc_chunks(parsed, max_chars=10000)
+    log.info("LLM 数字识别按节分批：共 %d 段", len(chunks))
+    chunk_results = []
+    for p0, p1, chunk_text in chunks:
+        def _in_range(item):
+            try:
+                return p0 <= int(item.get("paragraph")) < p1
+            except (TypeError, ValueError):
+                return False
+        extracted_chunk = [e for e in extracted if _in_range(e)]
+        review_chunk = [n for n in llm_batch_reviews if _in_range(n)]
+        r = classifier.verify_and_complete(
+            doc_text=chunk_text,
+            extracted=extracted_chunk,
+            review_items=review_chunk,
+            images=[],
+            review_images=[],
+        )
+        chunk_results.append(r)
+
+    # 合并各节结果
+    llm_result = {
+        "complete": all(r.get("complete") for r in chunk_results) if chunk_results else False,
+        "missed": [m for r in chunk_results for m in (r.get("missed") or [])],
+        "wrong": [w for r in chunk_results for w in (r.get("wrong") or [])],
+        "review_decisions": {k: v for r in chunk_results
+                             for k, v in (r.get("review_decisions") or {}).items()},
+        "text_replacements": [t for r in chunk_results
+                              for t in (r.get("text_replacements") or [])],
+        "raw": "\n".join(r.get("raw") or "" for r in chunk_results),
+    }
     doc_text = _build_doc_text(parsed)
-    llm_result = classifier.verify_and_complete(
+    # 第二轮：单独识别图片
+    images_result = classifier.verify_images(
         doc_text=doc_text,
-        extracted=extracted,
-        review_items=llm_batch_reviews,
         images=parsed["images"],
         review_images=review_images,
     )
@@ -1076,6 +1358,12 @@ def recognize(path: str, llm_cfg: Optional[dict] = None) -> dict:
     texts = parsed.get("texts") or []
     data_fallback_counter = [sum(1 for n in parsed["numbers"] if n["verdict"] == "replace")]
     for m in llm_result["missed"]:
+        # 跳过原文占位标记（[A-MAX] 等）：已由本地上下文映射处理，避免重复替换
+        if TAG_TOKEN_RE.fullmatch(str(m.get("value", ""))):
+            continue
+        # 跳过非数字值（如 LLM 把 “RE24-RE25” 节点板编号误当漏掉的动态值）
+        if not re.fullmatch(r"[\d.+\-–—~～eE%％,，\s]+", str(m.get("value", "")).strip()):
+            continue
         loc = _locate_value(m.get("value", ""), m.get("snippet", ""), texts)
         if loc is None:
             continue
@@ -1111,18 +1399,18 @@ def recognize(path: str, llm_cfg: Optional[dict] = None) -> dict:
             n["reasons"].append("LLM 判定为静态值，改回保留")
             n["placeholder"] = None
 
-    # 2d. 应用图片 review 判定与误判纠正
+    # 2d. 应用图片 review 判定与误判纠正（第二轮图片识别结果）
     for img in review_images:
         idx = img.pop("_review_index")
-        v = llm_result["images_review"].get(idx)
+        v = images_result["images_review"].get(idx)
         if v in ("replace", "keep"):
             img["verdict"] = v
             img["confidence"] = 0.85
-            img["reasons"].append("LLM 判定")
+            img["reasons"].append("LLM 判定（图片轮）")
     for img in parsed["images"]:
-        if img["verdict"] == "replace" and img["_image_index"] in llm_result["images_wrong"]:
+        if img["verdict"] == "replace" and img["_image_index"] in images_result["images_wrong"]:
             img["verdict"] = "keep"
-            img["reasons"].append("LLM 判定为固定图，改回保留")
+            img["reasons"].append("LLM 判定为固定图（图片轮），改回保留")
     for img in parsed["images"]:
         img.pop("_image_index", None)
 
@@ -1153,6 +1441,7 @@ def recognize(path: str, llm_cfg: Optional[dict] = None) -> dict:
         "summary": summary,
         "images": parsed["images"],
         "numbers": parsed["numbers"],
+        "tags": parsed.get("tags", []),
         "chart_texts": parsed.get("chart_texts", []),
         "text_replacements": llm_result.get("text_replacements", []),
         "texts": parsed.get("texts", []),
@@ -1230,6 +1519,468 @@ def _suggest_chart_id(caption: str, fallback: str) -> str:
     return fallback
 
 
+def _infer_chart_location(paragraph, cell_ref_paras: Dict[int, tuple],
+                          heading_paras=None, lookahead: int = 120) -> str:
+    """推断图表占位符对应的监测位置。
+
+    cell_ref_paras: {段落索引: (表标题, row_label)}。
+    取图表段落之后“最近的表格”（中间不能跨节标题）的全部 row_label；
+    只有单位置时才返回该位置，多位置（如跨中断面 3 个箱内/桥面测点）
+    留给运行时按表格全量补图，返回空串。
+    """
+    if not isinstance(paragraph, int) or not cell_ref_paras:
+        return ""
+    nxt = [p for p in cell_ref_paras if p > paragraph]
+    if not nxt:
+        return ""
+    p_first = min(nxt)
+    # 图表段与表格之间不能出现新的节标题（说明表格属于下一节，如风荷载表在图上）
+    if heading_paras:
+        for hp in heading_paras:
+            if paragraph < hp < p_first:
+                return ""
+    title_first = cell_ref_paras[p_first][0]
+    rows = []
+    for p in sorted(cell_ref_paras):
+        if p_first <= p <= p_first + lookahead and cell_ref_paras[p][0] == title_first:
+            rows.append(cell_ref_paras[p][1])
+    uniq = sorted({str(x).strip() for x in rows if str(x).strip()})
+    return uniq[0] if len(uniq) == 1 else ""
+
+
+def _chart_block_locations(paragraph, cell_ref_paras: Dict[int, tuple],
+                           heading_paras=None, lookahead: int = 160,
+                           texts: Optional[list] = None) -> List[str]:
+    """图表块下方“最近的表格”的监测部位集合（保持表格行顺序，去重）。
+
+    规则：
+      - 优先向下找最近的表格；中间不能跨节标题；
+      - 向下找不到时向上找（图表块可能位于表格之后，如 风速节“下图为…”在统计表后）；
+      - 同标题表格多张相邻时（源报告常把不同节表格都命名为“xx监测统计”），
+        以最近的节标题为界，只取本节的表格，避免把后面几节的监测部位全收进来。
+    """
+    if not isinstance(paragraph, int) or not cell_ref_paras:
+        return []
+    nxt = [p for p in cell_ref_paras if p > paragraph]
+    p_first = min(nxt) if nxt else None
+    forward_ok = p_first is not None
+    if forward_ok and heading_paras:
+        for hp in heading_paras:
+            if paragraph < hp < p_first:
+                forward_ok = False  # 最近的表被节标题隔开，向下查找作废
+                break
+    rows = []
+    if forward_ok:
+        title_first = cell_ref_paras[p_first][0]
+        hi = p_first + lookahead
+        if heading_paras:
+            for hp in heading_paras:
+                if p_first < hp < hi:
+                    hi = hp
+                    break
+        for p in sorted(cell_ref_paras):
+            if p_first <= p < hi and cell_ref_paras[p][0] == title_first:
+                rows.append(cell_ref_paras[p][1])
+    if not rows:
+        # 向下没有归属表格：向上找同节最近的表格（图表块在表格之后）
+        prev = [p for p in cell_ref_paras if p < paragraph]
+        h_prev = 0
+        if heading_paras:
+            for hp in heading_paras:
+                if hp < paragraph:
+                    h_prev = hp
+                else:
+                    break
+            prev = [p for p in prev if p > h_prev]
+        if prev:
+            p_last = max(prev)
+            title_prev = cell_ref_paras[p_last][0]
+            lo = h_prev
+            for p in sorted(cell_ref_paras):
+                if lo < p <= p_last and cell_ref_paras[p][0] == title_prev:
+                    rows.append(cell_ref_paras[p][1])
+    uniq = []
+    for r in rows:
+        r = str(r).strip()
+        # 保留“左侧/右侧”等方向行——它们是两个特征（如左支座/右支座），
+        # 需要各自展开 时程图+直方图（由 _expand_chart_blocks 用节标题位置补全）
+        if r and len(r) >= 1 and r not in uniq:
+            uniq.append(r)
+    if not uniq:
+        return uniq
+    # X/Y 是同一特征的方向（如 支座右侧X/支座右侧Y、梁端左侧X/左侧Y），
+    # 不单独成图：全部行都以 X/Y 结尾时折叠回基础位置（右侧/左侧…）
+    xy_rows = [r for r in uniq if re.fullmatch(r".+[XY]", r)]
+    if len(xy_rows) == len(uniq):
+        bases = []
+        for r in uniq:
+            b = r[:-1]
+            if b and b not in bases:
+                bases.append(b)
+        if bases:
+            uniq = bases
+    # “顶板测点N / 底板测点N”：顶板/底板是不同的特征部位，测点N只是该特征下
+    # 的传感器序号。折叠成特征前缀，并用表格标题补全成完整位置
+    # （如 上游炎陵侧边跨跨中截面顶板 / …底板），避免 5 个测点行展开成 10 张图。
+    prefixes = []
+    ok = True
+    for r in uniq:
+        m = re.match(r"^(.+?)测点\s*\d*\s*$", r)
+        if not m:
+            ok = False
+            break
+        p = m.group(1).strip()
+        if p and p not in prefixes:
+            prefixes.append(p)
+    if ok and prefixes:
+        base = _position_from_title(title_first)
+        # 表标题太泛（如“结构温度监测统计”）时提取不到基座，回退到节标题
+        if not base and heading_paras and texts:
+            for hp in reversed(heading_paras):
+                if hp < paragraph:
+                    base = _position_from_title(str(texts[hp]))
+                    if base:
+                        break
+        if base:
+            out = []
+            for p in prefixes:
+                # 前缀已是完整位置（如 行标签“吉首侧索塔中截面测点N”的前缀
+                # “吉首侧索塔中截面”），不能再和基座拼接重复
+                if base in p or p in base:
+                    composed = p if len(p) >= len(base) else base
+                else:
+                    composed = base + p
+                if composed not in out:
+                    out.append(composed)
+            return out
+    return uniq
+
+
+def _position_from_title(title: str) -> str:
+    """从节标题/表标题提取监测位置（去掉章节号、指标词、监测/统计等）。"""
+    # 只剥掉章节号（如 3.3.6.1），不能吃掉墩号数字（如 “2#墩…” 开头的 2）
+    t = re.sub(r"^\d+(?:\.\d+){0,3}(?!\s*#)\s*", "", str(title or ""))
+    for w in ("结构应变监测", "环境湿度监测", "环境温度监测", "结构温度监测",
+              "挠度监测", "位移监测", "倾角监测", "裂缝监测", "索力监测",
+              "风速风向监测", "风速监测", "支座位移监测", "交通监测",
+              "空间变位监测", "空间变位", "变位监测", "变位",
+              "地震监测", "振动监测", "应力监测", "承台监测",
+              "时程曲线图", "频率分布直方图", "相关性散点图", "散点图",
+              "曲线图", "直方图", "如下图所示", "时程",
+              "结构应变", "结构温度", "环境温度", "环境湿度",
+              "挠度", "位移", "应变", "倾角", "裂缝", "索力",
+              "风速", "风向", "支座", "监测", "数据分析", "统计",
+              "结果如下表", "结果", "如下表"):
+        t = t.replace(w, "")
+    t = re.sub(r"[\s：:。]+", "", t)
+    t = t.rstrip("表")  # 表标题末尾的“表”字（如 …监测统计表）
+    t = t.strip("、，,和及")
+    return t if len(t) >= 2 else ""
+
+
+def _norm(text: str) -> str:
+    """轻量归一化：小写、去空格、全角转半角（与 bridge_source._norm 一致）。"""
+    if not text:
+        return ""
+    out = []
+    for ch in str(text):
+        code = ord(ch)
+        if code == 0x3000:
+            out.append(" ")
+        elif 0xFF01 <= code <= 0xFF5E:
+            out.append(chr(code - 0xFEE0))
+        else:
+            out.append(ch)
+    return "".join(out).strip().lower().replace(" ", "")
+
+
+def _scatter_position_from_caption(caption: str, fallback: str = "") -> str:
+    """从“第五跨L/4处主梁截面测点1结构应变-温度相关性散点图”提取位置。"""
+    t = str(caption or "")
+    for w in ("结构应变-温度相关性散点图", "应变-温度相关性散点图",
+              "结构应变-温度相关性", "-温度相关性散点图", "相关性散点图",
+              "应变-温度", "-温度", r"截面测点\d+"):
+        t = re.sub(w, "", t)
+    t = re.sub(r"截面测点\d+", "", t)
+    t = re.sub(r"测点\d+", "", t)
+    t = t.replace("截面", "").replace("测点", "").strip("、，,和及")
+    return t if len(t) >= 2 else fallback
+
+
+def _expand_chart_blocks(analysis: dict, cell_ref_paras: Dict[int, tuple],
+                         heading_paras=None) -> tuple:
+    """把图表文本占位行按“监测部位 × 图型”展开为带位置的占位符。
+
+    例如“第6、7跨跨中断面环境温度监测…如下图所示：”+ 表格 3 个部位
+    → 展开 6 个 {{chart.temperature_<部位>_<图型>_<n>}}。
+    图型集合取“占位行后缀 + 描述行关键词”（时程曲线图/频率分布直方图），
+    保证“锚固区环境湿度…时程曲线图、频率分布直方图”这类两种图都生成。
+    表格行是“测点N”时，位置从节标题回推（如“第五跨L/4处主梁”）。
+    “相关性散点图”图题单独生成 scatter 占位符。
+
+    返回 (targets, inserts, new_entries, removed_paras)：
+      targets:      {段落索引: marker}
+      inserts:      {锚点段落索引: [marker, ...]}  需要插入的新占位段落
+      new_entries:  展开后的 chart_texts 条目（替换原 explicit_suffix 条目）
+      removed_paras: 块内多余、应清空的段落索引
+    """
+    cts = analysis.get("chart_texts", []) or []
+    texts = analysis.get("texts", []) or []
+    suffix_items = sorted(
+        [ct for ct in cts if ct.get("source") == "explicit_suffix"],
+        key=lambda c: c.get("paragraph") or 0,
+    )
+    # 相邻段落（<=3）归为同一个图表块
+    blocks = []
+    for item in suffix_items:
+        p = item.get("paragraph")
+        if blocks and isinstance(p, int) and isinstance(blocks[-1][-1].get("paragraph"), int) \
+                and p - blocks[-1][-1]["paragraph"] <= 3:
+            blocks[-1].append(item)
+        else:
+            blocks.append([item])
+
+    targets: Dict[int, str] = {}
+    inserts: Dict[int, List[str]] = {}
+    new_entries = []
+    removed: set = set()
+    counter: Dict[str, int] = {}
+
+    for block in blocks:
+        paras = sorted({c["paragraph"] for c in block if isinstance(c.get("paragraph"), int)})
+        if not paras:
+            continue
+        p_min = paras[0]
+        kinds = []
+        for c in block:
+            k = c.get("kind")
+            norm = "trend" if k in ("time_series", "trend", "curve") else "histogram"
+            if norm not in kinds:
+                kinds.append(norm)
+        # 描述行关键词（“…时程曲线图、频率分布直方图如下图所示：”）
+        for pi in range(p_min - 1, max(p_min - 5, -1), -1):
+            t = str(texts[pi]) if 0 <= pi < len(texts) else ""
+            if ("如下图所示" in t or "下图" in t) and ("曲线图" in t or "直方图" in t):
+                if "时程曲线图" in t or "时间序列" in t:
+                    if "trend" not in kinds:
+                        kinds.append("trend")
+                if "频率分布直方图" in t or "直方图" in t:
+                    if "histogram" not in kinds:
+                        kinds.append("histogram")
+                break
+        if "trend" in kinds and "histogram" in kinds:
+            kinds = ["trend", "histogram"]
+        elif not kinds:
+            kinds = ["trend"]
+        metric = str(block[0].get("metric") or "chart")
+        locations = _chart_block_locations(p_min, cell_ref_paras, heading_paras,
+                                           texts=texts)
+        if metric == "chart" and locations:
+            # 占位行没有中文关键词（如 new_sensor_group_1）时，从下方表格标题回推指标
+            nxt = [p for p in cell_ref_paras if p > p_min]
+            if nxt:
+                metric = _metric_from_chart_text(cell_ref_paras[min(nxt)][0]) or metric
+        title_fallback = False
+        if not locations:
+            # 表格行是“测点N”等无位置行时，从上方节标题回推单位置
+            for pi in range(p_min - 1, max(p_min - 6, -1), -1):
+                t = str(texts[pi]) if 0 <= pi < len(texts) else ""
+                # 标题即使含“如下图所示”（如 “1/2主跨…结构温度时程曲线图、频率分布直方图如下图所示:”）
+                # 也是标题，应作为位置来源
+                if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*[^\d]", t.strip()):
+                    pos = _position_from_title(t)
+                    if pos:
+                        locations = [pos]
+                        title_fallback = True
+                        if "结构温度" in t:
+                            metric = "structure_temperature"
+                        break
+        _DIRECTION_NORM = {"左侧", "右侧", "上游", "下游", "上游侧", "下游侧",
+                           "左", "右", "左x", "右x", "左y", "右y",
+                           "左幅", "右幅", "上游幅", "下游幅"}
+        if locations and all(_norm(str(l)) in _DIRECTION_NORM for l in locations):
+            # 行标签是方向词（如 支座位移表 的“左侧/右侧”、倾角表 的“左X/右X”），
+            # 表示两个特征方向，用节标题位置补全成完整位置后各自展开 时程+直方图
+            base_pos = ""
+            for pi in range(p_min - 1, max(p_min - 6, -1), -1):
+                t = str(texts[pi]) if 0 <= pi < len(texts) else ""
+                if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*[^\d]", t.strip()):
+                    base_pos = _position_from_title(t)
+                    if base_pos:
+                        if "结构温度" in t:
+                            metric = "structure_temperature"
+                        break
+            if base_pos:
+                def _compose(d):
+                    dn = _norm(str(d))
+                    if len(dn) == 2 and dn[1] in ("x", "y"):
+                        side = "左侧" if dn[0] == "左" else "右侧"
+                        return base_pos + side + dn[1].upper()
+                    return base_pos + str(d)
+                locations = [_compose(l) for l in locations]
+
+        # 块内可替换段落：explicit_suffix 段 + 块范围内的 bare_caption 图题段
+        block_paras = set(paras)
+        for ct in cts:
+            if ct.get("source") == "bare_caption" and isinstance(ct.get("paragraph"), int):
+                if p_min <= ct["paragraph"] <= paras[-1]:
+                    block_paras.add(ct["paragraph"])
+        block_paras = sorted(block_paras)
+
+        if locations:
+            # 标题回推单位置：每个占位行（含“第2组”等额外行）都保留并带上位置，
+            # 而不是折叠成“位置×图型”后丢掉多余的占位行
+            if title_fallback and len(locations) == 1:
+                loc0 = locations[0]
+                for c in block:
+                    counter[metric] = counter.get(metric, 0) + 1
+                    k = ("trend" if c.get("kind") in ("time_series", "trend", "curve")
+                         else "histogram")
+                    uid = f"{metric}_{loc0}_{k}_{counter[metric]}"
+                    targets[c["paragraph"]] = f"{{{{chart.{uid}}}}}"
+                    new_entries.append({
+                        "paragraph": c.get("paragraph"),
+                        "kind": k,
+                        "chart_id": "trend" if k == "trend" else "histogram",
+                        "metric": metric,
+                        "text": c.get("text", ""),
+                        "source": "expanded_block",
+                        "_unique_chart_id": uid,
+                        "location": loc0,
+                    })
+                continue
+            markers = []
+            meta = []
+            for loc in locations:
+                for k in kinds:
+                    counter[metric] = counter.get(metric, 0) + 1
+                    uid = f"{metric}_{loc}_{k}_{counter[metric]}"
+                    markers.append(f"{{{{chart.{uid}}}}}")
+                    meta.append({"uid": uid, "loc": loc, "kind": k, "metric": metric})
+            for i, m in enumerate(markers):
+                if i < len(block_paras):
+                    targets[block_paras[i]] = m
+                    meta[i]["paragraph"] = block_paras[i]
+                else:
+                    inserts.setdefault(block_paras[-1], []).append(m)
+                    # 插入段落没有独立段落索引，用锚点段落（块内最后一段），
+                    # 保证运行时按节聚类时这些图表归入同一节，避免被误判为缺图重复补图
+                    meta[i]["paragraph"] = block_paras[-1]
+            for p in block_paras[len(markers):]:
+                removed.add(p)
+            for m in meta:
+                new_entries.append({
+                    "paragraph": m["paragraph"],
+                    "kind": m["kind"],
+                    "chart_id": "trend" if m["kind"] == "trend" else "histogram",
+                    "metric": m["metric"],
+                    "text": "",
+                    "source": "expanded_block",
+                    "_unique_chart_id": m["uid"],
+                    "location": m["loc"],
+                })
+        else:
+            # 找不到表格：保持原格式（每个占位行一个 marker）
+            for c in block:
+                counter[metric] = counter.get(metric, 0) + 1
+                k = ("trend" if c.get("kind") in ("time_series", "trend", "curve")
+                     else "histogram")
+                uid = f"{metric}_{k}_{counter[metric]}"
+                targets[c["paragraph"]] = f"{{{{chart.{uid}}}}}"
+                new_entries.append({
+                    "paragraph": c.get("paragraph"),
+                    "kind": c.get("kind"),
+                    "chart_id": c.get("chart_id"),
+                    "metric": metric,
+                    "text": c.get("text", ""),
+                    "source": "explicit_suffix",
+                    "_unique_chart_id": uid,
+                    "location": "",
+                })
+
+    # 相关性散点图图题 -> scatter 占位符（原文明确提到就要插入）
+    for ct in cts:
+        if ct.get("source") != "bare_caption":
+            continue
+        cap = str(ct.get("text") or "")
+        if "相关性散点图" not in cap:
+            continue
+        p = ct.get("paragraph")
+        if not isinstance(p, int) or p in targets or p in removed:
+            continue
+        pos = _scatter_position_from_caption(cap)
+        if not pos:
+            for pi in range(p - 1, max(p - 6, -1), -1):
+                t = str(texts[pi]) if 0 <= pi < len(texts) else ""
+                if ("如下图所示" not in t
+                        and re.match(r"^\d+(?:\.\d+){0,3}\.?\s*[^\d]", t.strip())):
+                    pos = _position_from_title(t)
+                    if pos:
+                        break
+        if not pos:
+            continue
+        # 顶板/底板/左幅/右幅等是同一特征下的监测位置，不是不同的特征变量：
+        # 位置之间没有相关性可画（如 应变监测节 顶板/底板 不生成 应变-温度 散点图），
+        # 只有当同一位置有两个特征变量（如 温度-湿度）时才需要相关性图
+        if any(w in pos for w in ("顶板", "底板", "左幅", "右幅", "腹板", "翼板", "侧板")):
+            continue
+        metric = _metric_from_chart_text(cap) or "chart"
+        counter[metric] = counter.get(metric, 0) + 1
+        uid = f"{metric}_{pos}_scatter_{counter[metric]}"
+        targets[p] = f"{{{{chart.{uid}}}}}"
+        new_entries.append({
+            "paragraph": p, "kind": "scatter", "chart_id": "scatter",
+            "metric": metric, "text": cap, "source": "expanded_scatter",
+            "_unique_chart_id": uid, "location": pos,
+        })
+    return targets, inserts, new_entries, removed
+
+
+def _special_strain_positions(texts, pidx):
+    """从“4#、5#墩底部结构应变监测”类标题提取两个墩底位置的原文（保留实际字符）。"""
+    for i in range(pidx - 1, max(pidx - 6, -1), -1):
+        t = str(texts[i]) if 0 <= i < len(texts) else ""
+        m = re.search(r"(\d+#)\u3001(\d+#)(.+?)\u7ed3\u6784\u5e94\u53d8\u76d1\u6d4b", t)
+        if m:
+            suffix = m.group(3)
+            return m.group(1) + suffix, m.group(2) + suffix
+    return "4#\u58a9\u5e95\u90e8", "5#\u58a9\u5e95\u90e8"
+
+
+def _flatten_omml(p_el) -> None:
+    """把段落里的 OMML 数学公式（如 m/s2）转成纯文本，删掉公式节点。
+
+    python-docx 的 paragraph.text 不含 OMML；模板替换 run 时公式节点可能悬空，
+    导致单位渲染到段落外面（如 “振动绝对最大值为[I-MAX]。” + 孤立的 m/s2）。
+    这里把公式文本并入句末（句号前），并删除公式节点。
+    """
+    ommls = p_el.findall(".//{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath")
+    if not ommls:
+        return
+    unit = "".join((t.text or "") for om in ommls
+                   for t in om.iter("{http://schemas.openxmlformats.org/officeDocument/2006/math}t"))
+    for om in ommls:
+        parent = om.getparent()
+        if parent is not None:
+            parent.remove(om)
+    if not unit:
+        return
+    from docx.oxml import OxmlElement as _OE
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    runs = p_el.findall(W + "r")
+    if not runs:
+        return
+    t_el = runs[-1].find(W + "t")
+    if t_el is None:
+        t_el = _OE("w:t")
+        runs[-1].append(t_el)
+    txt = t_el.text or ""
+    if txt.endswith("。"):
+        t_el.text = txt[:-1] + unit + "。"
+    else:
+        t_el.text = txt + unit
+
+
 def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
                   analysis: Optional[dict] = None) -> dict:
     """把识别出的动态项改写为占位符，生成标注草稿（仅 DOCX）。
@@ -1244,6 +1995,8 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     analysis: 可传入已计算好的识别结果，避免重复调用 LLM（内部会重新 recognize）
     """
     from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.table import Table
     from docx.text.paragraph import Paragraph
@@ -1255,8 +2008,106 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     doc = Document(src)
 
     num_targets = {}   # paragraph index -> {pos: marker}
+    minus_positions = {}   # paragraph index -> set(数字起始位置)：该数字前导 '-' 一并替换
     data_counter = [0]
     data_values = {}   # data.N -> original value (for fallback resolution)
+    texts_all = analysis.get("texts", []) or []
+
+    def _canon_placeholder(raw: str) -> str:
+        """把 LLM/启发式给出的 stats 键规范成运行时指标键。"""
+        m = re.match(r"^\{\{stats\.([a-zA-Z_]+)\.([a-zA-Z_]+)\}\}$", raw)
+        if m:
+            mm = {"structural_temp": "structure_temperature"}.get(m.group(1), m.group(1))
+            return f"{{{{stats.{mm}.{m.group(2)}}}}}"
+        return raw
+
+    def _dash_sign(para_idx, pos, value) -> bool:
+        """判断数字前导 '-' 是否为负号（'-' 前是中文/℃/% 等量词）。
+        传感器编号（如 6RX(S)-22）前是 ')'，不吸收。"""
+        if not isinstance(para_idx, int) or not isinstance(pos, int) or pos <= 0:
+            return False
+        t = str(texts_all[para_idx]) if 0 <= para_idx < len(texts_all) else ""
+        if pos > len(t) or t[pos - 1] != "-":
+            return False
+        prev = t[pos - 2] if pos >= 2 else ""
+        return bool(prev and ("\u4e00" <= prev <= "\u9fff" or prev in "℃%％ "))
+
+    # 总结/结论段里 data.N 升级为 stats.* 的白名单指标（有真实传感器统计，
+    # 车辆数/荷载等无统计值的指标不升级，保持原文回填）
+    UPGRADE_METRICS = {
+        "temperature", "humidity", "structure_temperature", "wind_speed",
+        "strain", "deflection", "rotation", "displacement", "bearing_displacement",
+        "cable_force", "crack",
+    }
+
+    def _try_upgrade_stats(para_idx, pos, value, marker) -> str:
+        """“最高/最低/最大/最小 + 指标词”的 data.N 数字升级为 stats.*（重算），
+        避免总结段出现“最高值回填旧值、最低值重算新值”的混用。"""
+        if not marker.startswith("{{data."):
+            return marker
+        if not isinstance(para_idx, int) or not isinstance(pos, int):
+            return marker
+        t = str(texts_all[para_idx]) if 0 <= para_idx < len(texts_all) else ""
+        if not t:
+            return marker
+        ctx = t[max(0, pos - 30):pos + len(value) + 30]
+        if not any(s in ctx for s in ("最高", "最低", "最底", "最大", "最小", "平均", "均值")):
+            return marker
+        # 指标词只在同一句里找（结论段常见“索力最大值为…，对应测点位置为…；最小值为”
+        # 长句，指标词离数字很远；但跨句的“结构温度…，地震…”不能串扰）
+        sent_start = max(t.rfind("。", 0, pos), t.rfind("！", 0, pos),
+                         t.rfind("？", 0, pos)) + 1
+        sentence = t[sent_start:pos]
+        semi = sentence.rfind("；")
+        if semi != -1:
+            clause = sentence[semi + 1:]
+            clause_metric = _nearest_word(clause, len(clause), 60, METRIC_WORDS,
+                                          skip={"load", "vehicle_count"})
+            if clause_metric:
+                sentence = clause
+        best_metric = _nearest_word(sentence, len(sentence), 60, METRIC_WORDS,
+                                    skip={"load", "vehicle_count"})
+        best_stat = _nearest_word(sentence, len(sentence), 12, STAT_WORDS)
+        if not best_metric or not best_stat or best_metric not in UPGRADE_METRICS:
+            return marker
+        return f"{{{{stats.{best_metric}.{best_stat}}}}}"
+
+    def _fix_stat_key(para_idx, pos, marker) -> str:
+        """按数字前的上下文纠正 stats 占位符的 max/min/range 键。
+        LLM 可能把“最低湿度”错标成 max，这里用最近统计词兜底纠错。"""
+        if not marker.startswith("{{stats."):
+            return marker
+        m = re.match(r"^\{\{stats\.([a-zA-Z_]+)\.([a-zA-Z_]+)\}\}$", marker)
+        if not m or not isinstance(para_idx, int) or not isinstance(pos, int):
+            return marker
+        metric, stat = m.group(1), m.group(2)
+        t = str(texts_all[para_idx]) if 0 <= para_idx < len(texts_all) else ""
+        win = t[max(0, pos - 12):pos]
+        if "最大差值" in win or "最小差值" in win:
+            expect = "range"
+        elif "最高" in win or "最大" in win:
+            expect = "max"
+        elif "最低" in win or "最底" in win or "最小" in win:
+            expect = "min"
+        else:
+            return marker
+        if stat != expect:
+            return f"{{{{stats.{metric}.{expect}}}}}"
+        return marker
+
+    # 第一遍：LLM 补充识别（value 自带负号，如 "-2.08"）优先占用数字起始位置
+    dash_wins = {}   # (paragraph, 数字起始位置) -> marker
+    for n in analysis["numbers"]:
+        if n["verdict"] != "replace":
+            continue
+        value = str(n.get("value", ""))
+        pos = n.get("position")
+        if not value.startswith("-") or not isinstance(pos, int):
+            continue
+        digit_pos = pos + 1
+        marker = _canon_placeholder(n.get("placeholder") or "")
+        dash_wins[(n.get("paragraph"), digit_pos)] = marker
+
     for n in analysis["numbers"]:
         if n["verdict"] != "replace":
             continue
@@ -1265,15 +2116,56 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
             data_counter[0] += 1
             data_key = f"data.{data_counter[0]}"
             marker = f"{{{{data.{data_counter[0]}}}}}"
-            # 保存原始值，供 report_builder 回填
-            data_values[data_key] = n.get("value", "")
         elif not marker.startswith("{{"):
             # 统一补花括号（suggest_placeholder 返回无花括号的 key）
             marker = f"{{{{{marker}}}}}"
-        num_targets.setdefault(n["paragraph"], {})[n["position"]] = marker
+        else:
+            marker = _canon_placeholder(marker)
+        para_idx = n.get("paragraph")
+        pos = n.get("position")
+        value = str(n.get("value", ""))
+        # 带负号的 LLM 条目：数字实际起始位置 = pos+1，吸收前导 '-'；
+        # 同时跳过同位置普通条目，避免 data.N 覆盖 stats 占位符
+        if value.startswith("-") and isinstance(pos, int):
+            pos = pos + 1
+            absorb = True
+            marker = dash_wins.get((para_idx, pos), marker)
+            marker = _fix_stat_key(para_idx, pos, marker)
+        else:
+            marker = _try_upgrade_stats(para_idx, pos, value, marker)
+            marker = _fix_stat_key(para_idx, pos, marker)
+            absorb = isinstance(pos, int) and _dash_sign(para_idx, pos, value)
+        if isinstance(para_idx, int) and isinstance(pos, int):
+            if (para_idx, pos) in dash_wins and not value.startswith("-"):
+                continue  # 已被带负号的 LLM 条目占用
+            num_targets.setdefault(para_idx, {})[pos] = marker
+            if absorb:
+                minus_positions.setdefault(para_idx, set()).add(pos)
+            # data.N 原始值（负号吸收时存带负号的值；升级为 stats 后不再回填）
+            if marker.startswith("{{data.") and (para_idx, pos) not in dash_wins:
+                data_key = marker.strip("{}")
+                data_values.setdefault(data_key, f"-{value}" if absorb else value)
 
     # 将 data_values 存入 analysis，供后续 report_builder 使用
     analysis["data_values"] = data_values
+
+    # 原文占位标记（[A-MAX]、A-MAX-LOC 等）→ 占位符
+    tag_targets = {}   # paragraph index -> {pos: (end, marker)}
+    for tag in analysis.get("tags", []) or []:
+        if tag.get("verdict") != "replace":
+            continue
+        marker = tag.get("placeholder")
+        if not marker:
+            # 推断不到指标/统计量的标记：用 data.N 回填（保留原标记文本，血缘日志标注未重算）
+            data_counter[0] += 1
+            data_key = f"data.{data_counter[0]}"
+            data_values[data_key] = tag.get("value", "")
+            marker = f"{{{{data.{data_counter[0]}}}}}"
+        pp = tag.get("paragraph")
+        pos = tag.get("position")
+        end = tag.get("end")
+        if isinstance(pp, int) and isinstance(pos, int) and isinstance(end, int):
+            tag_targets.setdefault(pp, {})[pos] = (end, marker)
 
     img_targets = {}   # paragraph index -> [(image_index, marker)]
     for im in analysis["images"]:
@@ -1288,6 +2180,9 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     chart_text_targets = {}   # paragraph index -> marker
     chart_text_counter = {}
     cell_ref_targets = {}     # paragraph index -> {pos: marker}
+    vehicle_cell_targets = {} # paragraph index -> marker（整段替换）
+    cell_seq_rows = {}        # (metric, table_letter, table_title, row_label) -> 已出现的行号集合
+    cell_ref_paras: Dict[int, tuple] = {}   # paragraph -> (表标题, row_label)，用于图表占位符位置推断
     # bare_caption 图题文本段（仅做识别提示，不替换为占位符；由 build_report 阶段补上编号图注）
     bare_caption_paras: set = set()
 
@@ -1332,6 +2227,33 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         "wind_speed": wind_row_to_col,
     }
 
+    # 预扫描：先收集全部 cell_ref 段落的 (表标题, row_label)，
+    # 供图表占位符做“位置关联”（图表段在其后表格的上方，遍历顺序不一定按段落序）
+    for ct in analysis.get("chart_texts", []):
+        if ct.get("source") == "cell_ref":
+            p = ct.get("paragraph")
+            rl = str(ct.get("row_label") or "").strip()
+            if isinstance(p, int) and rl and not rl.startswith("测点"):
+                cell_ref_paras[p] = (str(ct.get("table_title") or ""), rl)
+
+    # 节标题段落索引（数字编号标题），用于图表位置推断的“不跨节”约束
+    _texts_all = analysis.get("texts", []) or []
+    heading_paras = [
+        i for i, t in enumerate(_texts_all)
+        if re.match(r"^\d+(?:\.\d+){0,3}\.?(?=[\u4e00-\u9fa5\s])", str(t).strip())
+        and len(str(t).strip()) <= 60
+    ]
+
+    # 图表文本占位行按“监测部位 × 图型”展开（带位置），并更新 chart_texts 条目
+    chart_block_targets, chart_block_inserts, chart_block_entries, chart_block_removed = \
+        _expand_chart_blocks(analysis, cell_ref_paras, heading_paras)
+    chart_text_targets.update(chart_block_targets)
+    if chart_block_entries:
+        kept = [ct for ct in analysis.get("chart_texts", [])
+                if ct.get("source") != "explicit_suffix"]
+        kept.extend(chart_block_entries)
+        analysis["chart_texts"] = kept
+
     for ct in analysis.get("chart_texts", []):
         if ct.get("source") == "cell_ref":
             # 静态表的 cell_ref 不替换（保持原值）
@@ -1361,31 +2283,70 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
                 column = column_from_map
             else:
                 column = row_slug or column_from_map or f"unknown_{metric}_r{row}"
-            marker = f"{{{{cell.{metric}.{column}.{stat}}}}}"
+            # 同一表格同一位置的多个测点行：占位符统一加 #N 行号索引
+            # （如 {{cell.crack.5#塔底部.avg#1}} / ...avg#2），运行时按 #N 精确取对应传感器。
+            # 按“行号”计数——同一行不同列（avg/max/min/range）共用同一个行序号。
+            seq_key = (metric, table_letter, ct.get("table_title", ""), row_label)
+            rows = cell_seq_rows.setdefault(seq_key, set())
+            rows.add(row)
+            seq = len(rows)
+            ct["_cell_seq"] = seq
+            suffix = f"#{seq}"
+            marker = f"{{{{cell.{metric}.{column}.{stat}{suffix}}}}}"
+            # 车辆累计表：整段是一个数字，直接整段替换为占位符
+            if ct.get("vehicle"):
+                vehicle_cell_targets[ct["paragraph"]] = marker
+                continue
             cell_ref_targets.setdefault(ct["paragraph"], {})[ct.get("position", 0)] = marker
+            if row_label and not row_label.startswith("测点"):
+                cell_ref_paras[ct["paragraph"]] = (str(ct.get("table_title") or ""), row_label)
         else:
             # 图表文本占位符
+            # explicit_suffix / expanded_block 已由 _expand_chart_blocks
+            # 按“监测部位×图型”展开，不能再重复编号
+            if ct.get("source") in ("explicit_suffix", "expanded_block",
+                                    "expanded_scatter", "special_strain"):
+                continue
             # bare_caption 是图题文本（如“跨中断面环境温度时程曲线图”），源头 DOCX
             # 在 _time_series / _histogram 占位符之后紧接着就是图题段。annotate_docx
             # 不应再为图题段生成 {{chart.*}} 占位符——否则 build_report 会重复插入
             # 同一张图，导致图片覆盖文字。
             if ct.get("source") == "bare_caption":
+                if ct["paragraph"] in chart_block_targets:
+                    continue  # 已被图表块展开占用（该段将替换为带位置的占位符）
                 bare_caption_paras.add(ct["paragraph"])
                 continue
             metric = ct.get("metric", "chart")
             cid = ct.get("chart_id", "trend")
             chart_text_counter[metric] = chart_text_counter.get(metric, 0) + 1
-            unique_cid = f"{metric}_{cid}_{chart_text_counter[metric]}"
+            # 图表占位符带监测位置：与下方表格的传感器位置关联（单位置时写入）
+            loc = _infer_chart_location(ct.get("paragraph"), cell_ref_paras,
+                                        heading_paras=heading_paras)
+            unique_cid = (f"{metric}_{loc}_{cid}_{chart_text_counter[metric]}" if loc
+                          else f"{metric}_{cid}_{chart_text_counter[metric]}")
             chart_text_targets[ct["paragraph"]] = f"{{{{chart.{unique_cid}}}}}"
             ct["_unique_chart_id"] = unique_cid  # 供运行时 agent 引用
+            if loc:
+                ct["location"] = loc
 
-    # 扫描“编号(特征)_图型”行（在 texts 里查找，替换为精确图表占位符）
+    # 扫描“编号(特征)_图型”行（在 texts 里查找，替换为精确图表占位符）。
+    # 同一传感器 X/Y/Z 三向重复行（304(xJsd)/304(yJsd)/304(zJsd)_时程曲线）
+    # 只保留第一个占位符，其余清空——三向是同一条时程曲线的三个方向，不是三张图。
+    last_sensor_line = {}    # (sensor_id, kind) -> 上一次出现的段落
+    cleared_sensor_lines = set()
     for pidx, t in enumerate(analysis.get("texts", []) or []):
         m = CHART_LINE_RE.match(str(t))
         if not m:
             continue
         sensor_id, feature_raw, chart_word = m.group(1), m.group(2), m.group(3)
         kind = "histogram" if "直方图" in chart_word or "直方" in chart_word else "trend"
+        skey = (sensor_id, kind)
+        last = last_sensor_line.get(skey)
+        if last is not None and pidx - last <= 3:
+            cleared_sensor_lines.add(pidx)
+            last_sensor_line[skey] = pidx
+            continue
+        last_sensor_line[skey] = pidx
         cid = f"chart_sensor_{sensor_id}_{kind}"
         chart_text_targets[pidx] = f"{{{{chart.{cid}}}}}"
         analysis.setdefault("chart_texts", []).append({
@@ -1401,6 +2362,39 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         chart_line_entries.append(cid)
     if chart_line_entries:
         log.info("识别 %d 行“编号(特征)_图型”精确图表占位符", len(chart_line_entries))
+
+    # 特殊应变行：特殊应变传感器_修正后时程曲线_2x2 / _频率分布_2x2
+    # -> 4#、5#墩底部应变图占位符（图库有 4#/5#墩底部 YB(rsg) 合并图）
+    special_strain_paras = {}   # pidx -> [第2个位置占位符]
+    for pidx, t in enumerate(analysis.get("texts", []) or []):
+        m = re.match(r"^\s*特殊应变传感器_修正后(时程曲线|频率分布)_2x2\s*$", str(t))
+        if not m:
+            continue
+        kind = "trend" if "时程" in m.group(1) else "histogram"
+        pos4, pos5 = _special_strain_positions(analysis.get("texts", []) or [], pidx)
+        cid4 = f"strain_{pos4}_{kind}_1"
+        cid5 = f"strain_{pos5}_{kind}_1"
+        chart_text_targets[pidx] = f"{{{{chart.{cid4}}}}}"
+        special_strain_paras[pidx] = [f"{{{{chart.{cid5}}}}}"]
+        analysis.setdefault("chart_texts", []).extend([
+            {
+                "paragraph": pidx,
+                "kind": "time_series" if kind == "trend" else "histogram",
+                "chart_id": kind, "metric": "strain", "text": str(t),
+                "source": "special_strain",
+                "_unique_chart_id": cid4, "location": pos4,
+            },
+            {
+                # 5# 占位符是插入段落，运行时同样需要条目（paragraph 指向同一节）
+                "paragraph": pidx,
+                "kind": "time_series" if kind == "trend" else "histogram",
+                "chart_id": kind, "metric": "strain", "text": str(t),
+                "source": "special_strain",
+                "_unique_chart_id": cid5, "location": pos5,
+            },
+        ])
+    if special_strain_paras:
+        log.info("识别 %d 行特殊应变图表（4#/5#墩底部应变）", len(special_strain_paras))
 
     # 文本级替换（季度/时间表述动态化）
     text_targets = {}   # paragraph index -> [(original, replacement)]
@@ -1437,37 +2431,94 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     replaced_texts = 0
     replaced_chart_texts = 0
     replaced_cell_refs = 0
+    pending_inserts = []   # [(anchor 段落元素, [marker, ...])] 遍历后统一插入
+
+    def _clean_chart_para(para) -> None:
+        """去掉图名(af3)样式并居中，避免图片段样式不一致导致 Word 渲染重叠。"""
+        pPr = para._p.find(qn("w:pPr"))
+        if pPr is not None:
+            st = pPr.find(qn("w:pStyle"))
+            if st is not None:
+                pPr.remove(st)
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     def process_paragraph(p, idx):
         nonlocal replaced_numbers, skipped_numbers, replaced_images, replaced_texts, replaced_chart_texts, replaced_cell_refs
+        # OMML 数学公式（如 “m/s2”）python-docx 读不到、替换 run 后还会悬空渲染：
+        # 转成纯文本并塞回句末，避免单位“跑到段落外面”
+        _flatten_omml(p._p)
+        if idx in cleared_sensor_lines:
+            _clear_paragraph_text(p)
+            return
+        # 图表块展开后多余的占位行/图题段：清空
+        if idx in chart_block_removed:
+            _clear_paragraph_text(p)
+            return
         # bare_caption 图题段：原 caption 文本会被 build_report 的 auto-caption 取代，
         # 清空段落文本，避免重复 caption
         if idx in bare_caption_paras:
             _clear_paragraph_text(p)
             return
+        # 车辆累计表单元格：整段数字 → {{cell.vehicle_count.车道X.数值#N}}
+        if idx in vehicle_cell_targets:
+            _replace_whole_paragraph(p, vehicle_cell_targets[idx])
+            replaced_cell_refs += 1
+            return
         # 图表文本占位优先（整段替换为 {{chart.<id>}}）
         if idx in chart_text_targets:
             _replace_whole_paragraph(p, chart_text_targets[idx])
+            _clean_chart_para(p)
             replaced_chart_texts += 1
+            # 同一锚点段要插入的多个占位符必须合并成一条，应用时 reversed()
+            # 才会还原成原始顺序；拆成多条会逐条插到锚点段之后导致顺序反转。
+            extra_markers = (list(special_strain_paras.get(idx, []))
+                             + list(chart_block_inserts.get(idx, [])))
+            if extra_markers:
+                pending_inserts.append((p._p, extra_markers))
             return
-        # 表格单元格引用占位符（H(行,列) 等）→ {{cell.xxx}}，按位置替换
-        if idx in cell_ref_targets:
-            n_ok, n_skip = _replace_cell_refs_in_paragraph(p, cell_ref_targets[idx])
-            replaced_cell_refs += n_ok
-            skipped_numbers += n_skip
-        targets = num_targets.get(idx, {})
-        if targets:
+        # 数字 / 原文标记 / 表格单元格引用：合并成一次位置替换，
+        # 避免同一段多次替换后位置错位（坐标均基于原文）
+        num_t = num_targets.get(idx, {})
+        tag_t = tag_targets.get(idx, {})
+        cell_t = cell_ref_targets.get(idx, {})
+        if num_t or tag_t or cell_t:
             full = "".join(r.text for r in p.runs)
-            # 位置名里的数字（第7跨L3/4断面、第五跨L/4处主梁等）不替换
-            targets = _filter_location_numbers(full, targets)
-            n_ok, n_skip = _replace_numbers_in_paragraph(p, targets)
-            replaced_numbers += n_ok
-            skipped_numbers += n_skip
+            edits = []
+            if num_t:
+                num_t = _filter_location_numbers(full, num_t)
+                minus = minus_positions.get(idx, set())
+                for m in NUMBER_RE.finditer(full):
+                    if m.start() not in num_t:
+                        continue
+                    absorb = 1 if (m.start() in minus and m.start() > 0
+                                   and full[m.start() - 1] == "-") else 0
+                    edits.append((m.start() - absorb, m.end(), num_t[m.start()]))
+                    replaced_numbers += 1
+            if tag_t:
+                for s, (e, marker) in tag_t.items():
+                    if 0 <= s < e <= len(full):
+                        edits.append((s, e, marker))
+                        replaced_numbers += 1
+            if cell_t:
+                for m in CELL_REF_RE.finditer(full):
+                    if m.start() in cell_t:
+                        edits.append((m.start(), m.end(), cell_t[m.start()]))
+                        replaced_cell_refs += 1
+            _apply_position_edits(p, edits, full)
         if img_targets.get(idx):
             _replace_image_paragraph(p, img_targets[idx][0][1])
             replaced_images += 1
         if text_targets.get(idx):
             for original, replacement in text_targets[idx]:
+                # 年份吸收：“2025年第一季度”→{{date.period_label_cn}}（period_label_cn
+                # 自带年份，前面的“2025年”应一并吞掉，避免输出“2025年2026年第1季度”）
+                if replacement == "{{date.period_label_cn}}" and re.match(
+                        r"^第?.{0,3}季度$", original.strip()):
+                    full2 = "".join(r.text for r in p.runs)
+                    m2 = re.search(r"(20\d{2}年)" + re.escape(original.strip())
+                                   + r"(?![0-9])", full2)
+                    if m2:
+                        original = m2.group(1) + original.strip()
                 if _replace_text_in_paragraph(p, original, replacement):
                     replaced_texts += 1
 
@@ -1489,6 +2540,15 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         for p in section.footer.paragraphs:
             process_paragraph(p, idx)
             idx += 1
+
+    # 图表块展开需要额外插入的占位段落（统一在遍历后插入，避免干扰段落迭代）
+    for anchor_el, markers in pending_inserts:
+        for marker in reversed(markers):
+            new_p = OxmlElement("w:p")
+            anchor_el.addnext(new_p)
+            np = Paragraph(new_p, doc)
+            np.add_run(marker)
+            _clean_chart_para(np)
 
     os.makedirs(os.path.dirname(os.path.abspath(dst)) or ".", exist_ok=True)
     doc.save(dst)
@@ -1539,16 +2599,20 @@ def _replace_text_in_paragraph(p, original: str, replacement: str) -> bool:
     return True
 
 
-def _replace_numbers_in_paragraph(p, targets: dict):
+def _replace_numbers_in_paragraph(p, targets: dict, minus_positions: set = None):
     """在段落里按全局位置替换数字。
 
     当数字跨多个 run 时（如 '3' + '9.93' 分属不同 run），
     先合并所有 run 再替换，避免跨 run 匹配被跳过。
+    minus_positions: 数字起始位置集合；命中时把数字紧邻的前导 '-' 一并替换
+    （如 “最低温度为-2.08℃” -> “最低温度为{{stats.…}}℃”），
+    避免运行时负值输出成 “--3.6”。
     """
     runs = p.runs
     if not runs:
         return 0, 0
     full = "".join(r.text for r in runs)
+    minus_positions = minus_positions or set()
     offsets = []
     cur = 0
     for r in runs:
@@ -1588,17 +2652,139 @@ def _replace_numbers_in_paragraph(p, targets: dict):
             skip += 1
             continue
         rel = start - offsets[ri]
-        runs[ri].text = runs[ri].text[:rel] + marker + runs[ri].text[rel + (end - start):]
+        # 负号吸收：识别阶段标记的 minus_positions（前导 '-' 属于负号而非编号），
+        # 把 '-' 一并替换进占位符。
+        absorb = 0
+        if start in minus_positions and start > 0 and full[start - 1] == "-":
+            absorb = 1
+        runs[ri].text = (runs[ri].text[:rel - absorb] + marker
+                         + runs[ri].text[rel + (end - start):])
         ok += 1
     return ok, skip
 
 
-# 位置名中的数字（第7跨L3/4断面、第五跨L/4处主梁、4#墩 等）应视为静态
-LOCATION_SPAN_RE = re.compile(
-    r"第\s*\d+\s*跨|L\s*\d+\s*/\s*\d+\s*(?:断面|处)|L\s*/\s*\d+\s*(?:断面|处)|"
-    r"\d+\s*L\s*/\s*\d+\s*(?:断面|处)|"
-    r"第\s*\d+\s*跨\s*跨中|\d+\s*#\s*(?:塔|墩)|\d+\s*号\s*塔|第五跨L/\d+处"
+def _replace_tags_in_paragraph(p, targets: dict) -> int:
+    """按绝对位置替换原文占位标记（[A-MAX] 等），targets: {start: (end, marker)}。"""
+    runs = p.runs
+    if not runs or not targets:
+        return 0
+    full = "".join(r.text for r in runs)
+    offsets = []
+    cur = 0
+    for r in runs:
+        offsets.append(cur)
+        cur += len(r.text)
+    hits = sorted(
+        ((s, e, m) for s, (e, m) in targets.items() if 0 <= s < e <= len(full)),
+        key=lambda x: -x[0],
+    )
+    # 标记跨 run 时先合并
+    needs_merge = False
+    for s, e, _m in hits:
+        ri = max(i for i, off in enumerate(offsets) if off <= s)
+        if e > offsets[ri] + len(runs[ri].text):
+            needs_merge = True
+            break
+    if needs_merge:
+        runs[0].text = full
+        for r in runs[1:]:
+            r.text = ""
+        offsets = [0]
+        runs = [runs[0]]
+    ok = 0
+    for s, e, marker in hits:
+        ri = max(i for i, off in enumerate(offsets) if off <= s)
+        rel = s - offsets[ri]
+        runs[ri].text = runs[ri].text[:rel] + marker + runs[ri].text[rel + (e - s):]
+        ok += 1
+    return ok
+
+
+def _apply_position_edits(p, edits: list, full: str) -> None:
+    """把 (start, end, replacement) 编辑一次应用到段落全文。
+
+    数字/标记/单元格引用混在同一段时，各自的位置基于【原文】计算；
+    若分多次替换，前一次的长度变化会让后一次错位（如 标记 与
+    {{stats.*}} 数字叠加后出现乱码）。统一合并成一次替换可避免。
+    """
+    if not edits:
+        return
+    edits = sorted(edits, key=lambda e: -e[0])
+    pieces = []
+    last = len(full)
+    for s, e, rep in edits:
+        if s >= last:
+            continue  # 与已处理区间重叠（理论上不会）
+        pieces.append(full[e:last])
+        pieces.append(rep)
+        last = s
+    pieces.append(full[:last])
+    new_text = "".join(reversed(pieces))
+    # 源报告里不成对的方括号（如 “[D-MAX ，…对应测点位置为[D-MAX-LOC]。]”）
+    # 替换后留下的孤立 “[{{” / “}}]” 一并清掉
+    new_text = new_text.replace("[{{", "{{").replace("}}]", "}}")
+    if new_text == full:
+        return
+    runs = p.runs
+    if not runs:
+        return
+    runs[0].text = new_text
+    for r in runs[1:]:
+        r.text = ""
+
+
+# 静态数字保护：位置名/跨号/塔号/测点数量/节标题编号中的数字不应替换成占位符。
+# 同时用于 annotate 阶段剔除替换目标（_filter_location_numbers）。
+STATIC_NUMBER_RE = re.compile(
+    r"第\s*[\d、，,和及]+\s*跨(?:\s*跨中|\s*断面)?|"          # 第6、7、8跨跨中 / 第5、9跨跨中
+    r"L\s*[\d、，,和及/]+\s*(?:断面|处)|"                      # L3/8断面 / L/4处
+    r"\d+\s*L\s*[\d、，,和及/]+\s*(?:断面|处)|"                # 3L/4断面
+    r"\d+\s*#\s*(?:[、，,和及]+\s*\d+\s*#\s*)*(?:索塔|塔|墩)|"  # 4#墩 / 5#、6#索塔
+    r"\d+\s*号\s*(?:索塔|塔|墩)|"                              # 6号塔
+    r"\d+\s*个\s*(?:GNSS监测点|GNSS测点|测点|监测点|基站|监测站)|"  # 布设2个GNSS测点 / 15个监测点
+    r"共计\s*\d+\s*个|共\s*\d+\s*个|"                             # 共计1个 / 共117对
+    r"车道\s*\d+|"                                                # 车道1、车道2（静态车道号）
+    r"\d+\s*min(?![A-Za-z0-9])|"                                  # 10min平均风速（时间窗，非动态值）
+    r"\d+\s*个\s*螺栓|"                                           # 抽取61个螺栓（检查数量，静态）
+    r"\d+(?=\s*(?:主桁架|节点板))|"                               # 节点板编号（如 2774主桁架…节点板）
+    r"\d+\s*[～~-]\s*\d+\s*N\s*·?\s*m|"                           # 合格范围 62～63N·m（阈值）
+    r"\d+\s*N\s*·?\s*m\b|"                                        # 单值 N·m（扭矩阈值）
+    r"\d+\s*m\s*处|"                                              # 30m处（监测位置）
+    r"(?<![\d.])\d+\s*/\s*\d+(?=\s*(?:主跨|跨中|边跨|桥面|断面|截面|钢桁|箱梁|处))|"  # 1/2主跨、1/4处、1/4箱梁
+    r"^\d+(?:\.\d+){0,3}\.?(?=[\u4e00-\u9fa5\s])"              # 节标题编号（4.监测结论 / 3.5.1梁端倾角…）
 )
+LOCATION_SPAN_RE = STATIC_NUMBER_RE
+
+
+def _protect_static_numbers(parsed: dict) -> int:
+    """把静态数字（位置名/塔号/跨号/测点数量/节标题编号等）从替换目标中剔除。
+
+    在 LLM 二次筛选之前调用，避免把“第6、7、8跨跨中布设2个GNSS测点”这类
+    设计常量交给 LLM 或替换成占位符。
+    """
+    texts = parsed.get("texts") or []
+    changed = 0
+    for num in parsed.get("numbers", []):
+        if num.get("verdict") not in ("replace", "review"):
+            continue
+        p = num.get("paragraph")
+        if not isinstance(p, int) or not (0 <= p < len(texts)):
+            continue
+        pos = num.get("position", -1)
+        if pos < 0:
+            continue
+        hit = False
+        for m in STATIC_NUMBER_RE.finditer(str(texts[p])):
+            if m.start() <= pos < m.end():
+                hit = True
+                break
+        if hit:
+            num["verdict"] = "keep"
+            num["confidence"] = 0.92
+            num["reasons"].append("静态位置/塔号/跨号/数量词/标题编号")
+            num["placeholder"] = None
+            changed += 1
+    return changed
 
 
 def _filter_location_numbers(full_text: str, targets: dict) -> dict:
