@@ -25,9 +25,9 @@ data/*.csv
 !data/.gitkeep
 
 # ---------- 桥数据预处理产物（可在服务器重新生成） ----------
-preprocess/图库/
-preprocess/统计值/
-preprocess/日级数据/
+preprocess/图库_2026.1~3/
+preprocess/统计值_2026.1~3/
+
 preprocess/*.csv
 preprocess/*.log
 preprocess/status.json
