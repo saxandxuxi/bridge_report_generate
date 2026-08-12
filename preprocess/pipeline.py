@@ -128,6 +128,10 @@ def main() -> int:
     ap.add_argument("--skip-preprocess", action="store_true")
     ap.add_argument("--skip-charts", action="store_true")
     ap.add_argument("--skip-sensor-map", action="store_true")
+    ap.add_argument("--period", choices=["quarterly", "yearly"],
+                    default="quarterly",
+                    help="统计周期(传给 build_quarterly_stats.py；"
+                         "yearly 时统计值汇总桥根目录下所有 daily_* 子目录)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -171,6 +175,8 @@ def main() -> int:
             py, os.path.join(ROOT, "scripts", "preprocess_sensor_data.py"),
             "--mode", "preprocess", "--data-root", raw, "--output-root", daily,
         ]
+        if args.bridge:
+            cmd1 += ["--bridge", args.bridge]
         tag = period_tag(start, end)
         if tag:
             cmd1 += ["--period-tag", tag]
@@ -188,13 +194,19 @@ def main() -> int:
     # 2) 日级 -> 图库 + 统计值
     if not args.skip_charts:
         tag = period_tag(start, end)
-        daily_data = ((os.path.join(daily, f"daily_{tag}") if tag
-                       else os.path.join(daily, "daily")) if daily else "")
+        daily_base = os.path.join(daily, args.bridge) if (daily and args.bridge) \
+            else daily
+        daily_data = ((os.path.join(daily_base, f"daily_{tag}") if tag
+                       else os.path.join(daily_base, "daily"))
+                      if daily_base else "")
         cmd = [
             py, os.path.join(ROOT, "scripts", "build_chart_library.py"),
             "--daily-root", daily_data or ".",
             "--mode", "merged", "--dpi", "200",
+            "--lib-root", ROOT,
         ]
+        if args.bridge:
+            cmd += ["--bridge", args.bridge]
         # 图库/统计值目录名自动带年月范围（如 图库_2026.1~3）；
         # 仅命令行显式指定 --charts/--stats 时才用固定目录
         if args.charts:
@@ -212,6 +224,31 @@ def main() -> int:
         ok = run_step("日级数据->图库+统计值", cmd, status)
         if not ok:
             status["error"] = "图库/统计值生成步骤失败"
+            status["running"] = False
+            save_status(status)
+            return 1
+
+    # 2.5) 日级 -> 季度/年度统计值(按监测部位合并多传感器)
+    if not args.skip_charts:
+        if args.period == "yearly" and daily_base:
+            stats_daily_root = daily_base      # 桥根目录, 汇总所有 daily_*
+        else:
+            stats_daily_root = daily_data
+        cmd_q = [
+            py, os.path.join(ROOT, "scripts", "build_quarterly_stats.py"),
+            "--daily-root", stats_daily_root or ".",
+            "--lib-root", ROOT,
+            "--period", args.period,
+        ]
+        if args.bridge:
+            cmd_q += ["--bridge", args.bridge]
+        if start:
+            cmd_q += ["--start", start]
+        if end:
+            cmd_q += ["--end", end]
+        ok = run_step("日级数据->季度/年度统计值", cmd_q, status)
+        if not ok:
+            status["error"] = "季度/年度统计值生成步骤失败"
             status["running"] = False
             save_status(status)
             return 1

@@ -305,6 +305,18 @@ class ReportAgent:
                         })
             log.info("缺图推断：%d 节存在缺图（自动补齐 %d 张）",
                      len(chart_gaps), sum(len(v) for v in extra_charts.values()))
+            # 拆分的多面板合并图(时间序列图_2.png / _3.png ...)：
+            # 在对应图表位置后一并插入，避免只有第一张进报告
+            for cid, png in list(chart_images.items()):
+                if not png:
+                    continue
+                for _p in bridge.chart_siblings(png):
+                    extra_charts.setdefault(cid, []).append({
+                        "path": _p,
+                        "caption": "",
+                        "sensor_id": chart_sensors.get(cid, ""),
+                        "kind": chart_kinds.get(cid, ""),
+                    })
             # 模板中额外的位置化图表占位符（如特殊应变 4#/5#墩底部），
             # 未出现在 analysis chart_texts 时按位置直接解析，避免“有占位无图”
             try:

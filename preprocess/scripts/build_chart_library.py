@@ -62,7 +62,7 @@ except Exception:
 
 # ---------------- 默认路径（可按需修改/用命令行参数覆盖） ----------------
 DEFAULT_DAILY_ROOT = r"D:\preprocess_sensor_data\daily"   # 预处理后的 daily 目录
-DEFAULT_LIB_ROOT = "..\\"                                 # 图库/统计值 的上级目录(相对运行目录)
+DEFAULT_LIB_ROOT = ".\\preprocess"                        # 图库/统计值 的上级目录(相对运行目录)
 # 传感器对照表（固定产物，不随季度变化，统一挂在 preprocess/ 下）
 DEFAULT_SENSOR_MAP_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -143,6 +143,25 @@ def _fmt_cn_date(d):
         return f"{int(m)}月{int(day)}日"
     except ValueError:
         return d
+
+
+def _fmt_compact_time(t, with_year=False):
+    """紧凑时间: 1.18 3；with_year=True 时 2026.1.18 3。"""
+    if with_year:
+        return f"{t.year}.{t.month}.{t.day} {t.hour}"
+    return f"{t.month}.{t.day} {t.hour}"
+
+
+def _fmt_compact_range(start_s, end_s):
+    """紧凑时间段: 1.18 3~1.19 5(同年省年份)；跨年时两端带年份。"""
+    try:
+        t0 = dt.datetime.strptime(str(start_s), "%Y-%m-%d %H:%M")
+        t1 = dt.datetime.strptime(str(end_s), "%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return f"{start_s}~{end_s}"
+    if t0.year != t1.year:
+        return f"{_fmt_compact_time(t0, True)}~{_fmt_compact_time(t1, True)}"
+    return f"{_fmt_compact_time(t0)}~{_fmt_compact_time(t1)}"
 
 
 def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
@@ -834,6 +853,14 @@ def _fmt_cn_dt(s):
         return s
 
 
+def _fmt_dt_short(dt):
+    """紧凑时间标注：1.18 3（月.日 时），分钟非整时补 :MM；
+    同一年份不重复写年份，避免图上标注过长重叠。"""
+    if getattr(dt, "minute", 0) == 0:
+        return f"{dt.month}.{dt.day} {dt.hour}"
+    return f"{dt.month}.{dt.day} {dt.hour}:{dt.minute:02d}"
+
+
 def _series_bucket_seconds(hours) -> int:
     """由时间序列的相邻最小间隔反推聚合粒度(秒)：小时=3600、10分钟=600、秒级=1。"""
     if not hours or len(hours) < 2:
@@ -896,6 +923,72 @@ def _cap_shifts(shifts, max_n: int = 5):
     return sorted(shifts, key=key, reverse=True)[:max_n]
 
 
+def _cap_annotations(items, max_n=5, key=None):
+    """标注(缺失/突变段)过多时只保留最显著的 max_n 条并返回被截断的条数，
+    避免图上文字重叠；默认按缺失小时数降序。返回 (保留列表, 截断条数)。"""
+    items = list(items or [])
+    if len(items) <= max_n:
+        return items, 0
+    if key is None:
+        key = lambda it: float(it.get("缺失小时数", 0) or 0)
+    ordered = sorted(items, key=key, reverse=True)[:max_n]
+    return ordered, len(items) - max_n
+
+
+def _label_on_bands(ax, fig, items, fontsize=12, max_n=4):
+    """缺失/突变段 ≤ max_n 条时，文字统一放图上方留白区逐行排列：
+    - 按行高向上扩展 y 轴预留空间，文字不会压住数据线段；
+    - 一行一条，行高固定，绝不重叠；
+    - 图上色带保留，文字与色带通过紧凑时间段文字对应。"""
+    if not items:
+        return
+    try:
+        from matplotlib.dates import date2num
+    except Exception:  # noqa: BLE001
+        date2num = None
+    n = len(items)
+    y0, y1 = ax.get_ylim()
+    yspan = (y1 - y0) or 1.0
+    try:
+        ax_pt = (ax.get_window_extent(fig.canvas.get_renderer()).height
+                 * 72.0 / fig.dpi)
+    except Exception:  # noqa: BLE001
+        ax_pt = 250.0
+    row_pt = fontsize + 6.0
+    if ax_pt > n * row_pt:
+        expand = n * row_pt * yspan / (ax_pt - n * row_pt)
+    else:
+        expand = yspan * max(0.3, 0.05 * n)
+    y1_new = y1 + expand
+    ax.set_ylim(y0, y1_new)
+    row_h = expand / n
+    xlim0, xlim1 = ax.get_xlim()
+    x_left = xlim0 + (xlim1 - xlim0) * 0.02
+    for i, (label, color, xv, yv) in enumerate(items):
+        ax.text(x_left, y1_new - row_h * (i + 0.5), label,
+                ha="left", va="center", fontsize=fontsize,
+                fontweight="bold", color=color,
+                bbox=dict(facecolor="white", alpha=0.9, pad=0.9,
+                          edgecolor=color, linewidth=0.8))
+
+
+def _label_in_margin(fig, axes_region, items, fontsize=12):
+    """缺失/突变段 > max_n 条时，文字全部挪到子图右侧留白区逐行排列，
+    图内只保留色带；行高按子图纵向高度均分，不会重叠。"""
+    if not items:
+        return
+    n = len(items)
+    left, bottom, width, height = axes_region.bounds
+    row_h = height / n
+    x = left + width + 0.012
+    for i, (label, color, xv, yv) in enumerate(items):
+        fig.text(x, bottom + height - row_h * (i + 0.5), label,
+                 ha="left", va="center", fontsize=fontsize,
+                 fontweight="bold", color=color,
+                 bbox=dict(facecolor="white", alpha=0.9, pad=0.7,
+                           edgecolor=color, linewidth=0.8))
+
+
 def plot_time_series(sensor_id, sensor_name, feature, times, means,
                      out_path, shifts=None, replaced_indices=None,
                      replaced_range_indices=None, hour_level=True, gaps=None):
@@ -945,57 +1038,50 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
         ax.set_xticklabels([_fmt_cn_date(t) for t in times[::step]],
                            rotation=30, fontsize=9)
 
-    # 突变区间标注: 先给图内顶部留出文字空间，再逐条标注
-    if shifts:
-        y0, y1 = ax.get_ylim()
-        span = (y1 - y0) or 1.0
-        ax.set_ylim(y0, y1 + 0.16 * span + 0.04 * span * len(shifts))
-        for si, s in enumerate(shifts):
-            try:
-                t0 = dt.datetime.strptime(s["起始时间"], "%Y-%m-%d %H:%M")
-                t1 = dt.datetime.strptime(s["结束时间"], "%Y-%m-%d %H:%M")
-                if hour_level:
-                    a = min(range(len(times)),
-                            key=lambda i: abs((times[i] - t0).total_seconds()))
-                    b = min(range(len(times)),
-                            key=lambda i: abs((times[i] - t1).total_seconds()))
-                else:
-                    a = times.index(s["起始时间"][:10])
-                    b = times.index(s["结束时间"][:10])
-            except (ValueError, KeyError):
-                continue
-            color = "#d62728" if s["方向"] == "偏高" else "#2ca02c"
-            ax.axvspan(a - 0.5, b + 0.5, color=color, alpha=0.12)
-            label = (f"{_fmt_cn_dt(s['起始时间'])}~"
-                     f"{_fmt_cn_dt(s['结束时间'])} "
-                     f"均值{s['段内平均值']:.4g} {s['方向']}")
-            ax.text((a + b) / 2.0, y1 + 0.03 * span + si * 0.04 * span,
-                    label, ha="center", va="bottom", fontsize=9,
-                    color=color, bbox=dict(facecolor="white", alpha=0.75,
-                                           pad=1))
-
-    # 数据缺失(>=24h)标注: 着色 + 图内底部文字说明(已用插值填充)
-    if gaps:
-        y0, y1 = ax.get_ylim()
-        span = (y1 - y0) or 1.0
-        for gi, g in enumerate(gaps):
-            try:
-                t0 = dt.datetime.strptime(g["起始时间"], "%Y-%m-%d %H:%M")
-                t1 = dt.datetime.strptime(g["结束时间"], "%Y-%m-%d %H:%M")
+    # 突变区间 + 缺失段标注: 着色段全部画上；≤4 段文字标在带上，
+    # >4 段文字挪到图右侧留白区，图上只留色带
+    label_items = []   # [(label, color, xv, yv)]
+    for s in shifts or []:
+        try:
+            t0 = dt.datetime.strptime(s["起始时间"], "%Y-%m-%d %H:%M")
+            t1 = dt.datetime.strptime(s["结束时间"], "%Y-%m-%d %H:%M")
+            if hour_level:
                 a = min(range(len(times)),
                         key=lambda i: abs((times[i] - t0).total_seconds()))
                 b = min(range(len(times)),
                         key=lambda i: abs((times[i] - t1).total_seconds()))
-            except (ValueError, KeyError):
-                continue
-            ax.axvspan(a - 0.5, b + 0.5, color="#ff7f0e", alpha=0.18)
-            label = (f"数据缺失 {g['缺失小时数']}h: "
-                     f"{_fmt_cn_dt(g['起始时间'])}~"
-                     f"{_fmt_cn_dt(g['结束时间'])} (已线性填充)")
-            ax.text((a + b) / 2.0, y0 + 0.05 * span + gi * 0.05 * span,
-                    label, ha="center", va="bottom", fontsize=9,
-                    color="#d2691e",
-                    bbox=dict(facecolor="white", alpha=0.85, pad=1))
+            else:
+                a = times.index(s["起始时间"][:10])
+                b = times.index(s["结束时间"][:10])
+        except (ValueError, KeyError):
+            continue
+        color = "#d62728" if s["方向"] == "偏高" else "#2ca02c"
+        ax.axvspan(a - 0.5, b + 0.5, color=color, alpha=0.12)
+        yv = (plot_means[b] if b < len(plot_means)
+              else plot_means[a] if a < len(plot_means) else 0.0)
+        label_items.append(
+            (f"{_fmt_compact_range(s['起始时间'], s['结束时间'])} "
+             f"{s['方向']}", color, float(x[a]), yv))
+    for g in gaps or []:
+        try:
+            t0 = dt.datetime.strptime(g["起始时间"], "%Y-%m-%d %H:%M")
+            t1 = dt.datetime.strptime(g["结束时间"], "%Y-%m-%d %H:%M")
+            a = min(range(len(times)),
+                    key=lambda i: abs((times[i] - t0).total_seconds()))
+            b = min(range(len(times)),
+                    key=lambda i: abs((times[i] - t1).total_seconds()))
+        except (ValueError, KeyError):
+            continue
+        ax.axvspan(a - 0.5, b + 0.5, color="#ff7f0e", alpha=0.18)
+        yv = (plot_means[b] if b < len(plot_means)
+              else plot_means[a] if a < len(plot_means) else 0.0)
+        label_items.append(
+            (_fmt_compact_range(g['起始时间'], g['结束时间']), "#d2691e",
+             float(x[a]), yv))
+    if label_items:
+        y0, y1 = ax.get_ylim()
+        if len(label_items) <= 4:
+            _label_on_bands(ax, fig, label_items, fontsize=10)
 
     ax.set_xlabel("日期")
     ax.set_ylabel("数值")
@@ -1008,6 +1094,11 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
     ax.grid(True, alpha=0.3)
     ax.legend(loc="best", fontsize=10, title=f"编号 {sensor_id}")
     fig.tight_layout()
+    if label_items and len(label_items) > 4:
+        # 多段标注: 收缩子图宽度，文字画到右侧留白区
+        x0, y0, w, h = ax.get_position().bounds
+        ax.set_position([x0, y0, w * 0.76, h])
+        _label_in_margin(fig, ax.get_position(), label_items, fontsize=9)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -1115,9 +1206,9 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
         f"{sensor_id} {sensor_name}｜{feature_display(feature)}｜"
         f"{_fmt_cn_date(day_date)}", fontsize=14)
 
-    y0, y1 = ax.get_ylim()
-    span = (y1 - y0) or 1.0
-    text_count = 0
+    # 突变区间 + 缺失段标注: 着色段全部画上；≤4 段文字标在带上，
+    # >4 段文字挪到图右侧留白区，图上只留色带
+    label_items = []   # [(label, color, xv, yv)]
     for s in shifts or []:
         try:
             st = dt.datetime.strptime(s["起始时间"], "%Y-%m-%d %H:%M")
@@ -1130,13 +1221,11 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
             continue
         color = "#d62728" if s["方向"] == "偏高" else "#2ca02c"
         ax.axvspan(xs[a] - 0.01, xs[b] + 0.01, color=color, alpha=0.12)
-        label = (f"{_fmt_cn_dt(s['起始时间'])}~{_fmt_cn_dt(s['结束时间'])} "
-                 f"均值{s['段内平均值']:.4g} {s['方向']}")
-        ax.text((xs[a] + xs[b]) / 2.0,
-                y1 + 0.03 * span + text_count * 0.05 * span,
-                label, ha="center", va="bottom", fontsize=11, color=color,
-                bbox=dict(facecolor="white", alpha=0.8, pad=1))
-        text_count += 1
+        yv = (means[b] if b < len(means)
+              else means[a] if a < len(means) else 0.0)
+        label_items.append(
+            (f"{_fmt_compact_range(s['起始时间'], s['结束时间'])} "
+             f"{s['方向']}", color, float(xs[a]), yv))
     for g in gaps or []:
         try:
             st = dt.datetime.strptime(g["起始时间"], "%Y-%m-%d %H:%M")
@@ -1148,17 +1237,22 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
         except (ValueError, KeyError):
             continue
         ax.axvspan(xs[a] - 0.01, xs[b] + 0.01, color="#ff7f0e", alpha=0.18)
-        label = f"数据缺失 {g.get('缺失小时数', '')}h"
-        ax.text((xs[a] + xs[b]) / 2.0,
-                y0 + 0.05 * span + text_count * 0.05 * span,
-                label, ha="center", va="bottom", fontsize=11, color="#d2691e",
-                bbox=dict(facecolor="white", alpha=0.85, pad=1))
-        text_count += 1
-    if text_count:
-        ax.set_ylim(y0 - 0.02 * span,
-                    y1 + 0.12 * span + 0.04 * span * text_count)
+        yv = (means[b] if b < len(means)
+              else means[a] if a < len(means) else 0.0)
+        label_items.append(
+            (_fmt_compact_range(g['起始时间'], g['结束时间']), "#d2691e",
+             float(xs[a]), yv))
+    if label_items:
+        y0, y1 = ax.get_ylim()
+        if len(label_items) <= 4:
+            _label_on_bands(ax, fig, label_items, fontsize=12)
     ax.legend(loc="best", fontsize=10)
     fig.tight_layout()
+    if label_items and len(label_items) > 4:
+        # 多段标注: 收缩子图宽度，文字画到右侧留白区
+        x0, y0, w, h = ax.get_position().bounds
+        ax.set_position([x0, y0, w * 0.76, h])
+        _label_in_margin(fig, ax.get_position(), label_items, fontsize=11)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
@@ -1240,6 +1334,28 @@ def _safe_dirname(s: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", str(s)).strip()
 
 
+def _bridge_variants(name):
+    """桥名的常见写法变体(湘江特 <-> 湘江特大桥)，用于兼容预处理与
+    建图库传不同桥名时目录对不上(如预处理 --bridge 湘江特、建图库
+    --bridge 湘江特大桥)。"""
+    name = (name or "").strip()
+    if not name:
+        return []
+    variants = [name]
+    for suffix in ("特大桥", "大桥"):
+        if name.endswith(suffix):
+            variants.append(name[:-len(suffix)])
+        else:
+            variants.append(name + suffix)
+    seen = set()
+    out = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 def _feature_selected(feature: str, feature_arg: str) -> bool:
     """--features 过滤：留空=全部；否则特征名包含任一给定词即选中
     （如传 DZJSD 会匹配 DZJSD(xJsd)）。"""
@@ -1248,6 +1364,22 @@ def _feature_selected(feature: str, feature_arg: str) -> bool:
     fn = str(feature).lower()
     return any(t.strip() and t.strip().lower() in fn
                for t in feature_arg.split(","))
+
+
+def resolve_feature_dir(daily_root, sensor, feature):
+    """定位 daily 下某特征的目录。模块前缀不一致时(如对照表 DZJSD(xJsd)
+    但实际数据 SZJSD(xJsd))，按括号内编码(xJsd/yJsd/zJsd)匹配实际存在的目录。
+    返回 (目录路径, 实际特征名)。"""
+    d = os.path.join(daily_root, str(sensor), feature)
+    if os.path.isdir(d):
+        return d, feature
+    sroot = os.path.join(daily_root, str(sensor))
+    target = feature_code(feature)
+    if os.path.isdir(sroot):
+        for fn in sorted(os.listdir(sroot)):
+            if os.path.isdir(os.path.join(sroot, fn)) and feature_code(fn) == target:
+                return os.path.join(sroot, fn), fn
+    return d, feature
 
 
 def read_clean_hourly_means(daily_root, sensor, feature, start="", end="",
@@ -1264,7 +1396,7 @@ def read_clean_hourly_means(daily_root, sensor, feature, start="", end="",
       - records: 清洗记录明细（尖峰替代 / 范围外剔除）
       - shifts: 突变段记录（持续高于/低于基线，精确到数据粒度）
     """
-    feat_dir = os.path.join(daily_root, sensor, feature)
+    feat_dir, _feat = resolve_feature_dir(daily_root, sensor, feature)
     if not os.path.isdir(feat_dir):
         return [], [], [], [], [], [], []
     hours, means, _, _ = read_hourly_series(feat_dir)[:4]
@@ -1375,7 +1507,8 @@ def _build_merged_daily_charts(args, pos, g, gf_pairs, out_dir, issues):
         os.makedirs(out_dir, exist_ok=True)
         day_set = set()
         for sensor, feat in gf_pairs:
-            feat_dir = os.path.join(args.daily_root, sensor, feat)
+            feat_dir, _feat = resolve_feature_dir(
+                args.daily_root, sensor, feat)
             if not os.path.isdir(feat_dir):
                 continue
             for fn in os.listdir(feat_dir):
@@ -1401,8 +1534,9 @@ def _build_merged_daily_charts(args, pos, g, gf_pairs, out_dir, issues):
             series = []
             day_total_secs = 0
             for sensor, feat in gf_pairs:
-                path = os.path.join(args.daily_root, sensor, feat,
-                                    day + ".csv")
+                feat_dir, _feat = resolve_feature_dir(
+                    args.daily_root, sensor, feat)
+                path = os.path.join(feat_dir, day + ".csv")
                 if not os.path.isfile(path):
                     continue
                 hours_d, means_d, maxs_d, mins_d, secs, miss = \
@@ -1493,12 +1627,9 @@ def _build_merged_daily_charts(args, pos, g, gf_pairs, out_dir, issues):
 
 def plot_group_time_series(position, group, series, out_path, dpi=200,
                            day_mode=False):
-    """同位置同特征组的时间序列图（子图布局，保证清晰度）：
-      - 单特征多测点：每个传感器一个子图，标题带传感器编号；
-      - 多特征：每个特征一个子图，子图内叠加各测点；
-      - 缺失时段橙色着色 + 文字“传感器XX缺失(起~止 数据)”（支持跨天）；
-      - 长时间突变段红/绿着色 + 文字“均值xx 偏高/偏低(起~止)”。
-      day_mode=True 时横轴改为 0~24 小时(秒级振动按天出图)，标题含日期。"""
+    """同位置同特征组的时间序列图。面板数 ≤6 时一张图；超过 6 个拆成
+    多张图(时间序列图.png / _2.png / _3.png ...)，每张 ≤6 个子图，
+    避免子图过小、标注看不清，便于插入报告。"""
     n = len(series)
     if n == 0:
         return
@@ -1512,28 +1643,74 @@ def plot_group_time_series(position, group, series, out_path, dpi=200,
     else:
         panels = [(f, [s for s in series if s["feature"] == f])
                   for f in feats]
+    max_panels = 6
+    chunks = [panels[i:i + max_panels]
+              for i in range(0, len(panels), max_panels)]
+    for ci, chunk in enumerate(chunks):
+        if ci == 0:
+            out = out_path
+        else:
+            base, ext = os.path.splitext(out_path)
+            out = f"{base}_{ci + 1}{ext}"
+        _plot_group_time_series_one(position, group, chunk, out, dpi, day_mode,
+                                    ci + 1, len(chunks))
 
-    # 面板布局：≤3 个面板纵向堆叠(每行一个，面板宽度充足、插入报告后可读)；
-    # 更多面板退回两列网格，避免图过高超出报告高度上限
+
+def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
+                                day_mode=False, chunk_idx=1, chunk_total=1):
+    """同位置同特征组的时间序列图（子图布局，保证清晰度）：
+      - 单特征多测点：每个传感器一个子图，标题带传感器编号；
+      - 多特征：每个特征一个子图，子图内叠加各测点；
+      - 缺失时段橙色着色 + 文字“传感器XX缺失(起~止 数据)”（支持跨天）；
+      - 长时间突变段红/绿着色 + 文字“均值xx 偏高/偏低(起~止)”。
+      day_mode=True 时横轴改为 0~24 小时(秒级振动按天出图)，标题含日期。"""
     n = len(panels)
-    if n <= 3:
+    single_feat = len({sub[0]["feature"] for _, sub in panels}) == 1
+    # 单传感器 X/Y/Z 等轴/方向分量(如 GNSS Δx/Δy/Δz)：三行一列竖排，
+    # 每个子图占满整幅宽度(约 9.5 英寸/行)，上下留白最小化
+    row3 = False
+    if len(panels) == 3:
+        feats3 = [sub[0]["feature"] for _, sub in panels]
+        sensors3 = {sub[0].get("sensor") for _, sub in panels}
+        if len(sensors3) == 1 and len(set(feats3)) == 3:
+            m3 = [re.search(r"\(([^)]+)\)$", f) for f in feats3]
+            if all(m3):
+                inners = {m.group(1) for m in m3}
+                axis_ok = all(
+                    (i in AXIS_INNER or i.lower() in AXIS_INNER
+                     or i.lower().endswith(("jd", "jsd")))
+                    for i in inners)
+                if axis_ok and len(inners) == 3:
+                    row3 = True
+    if row3:
         ncols = 1
-        panel_h = 3.2
+        panel_h = 3.4
+        panel_w = 9.5
+    elif n <= 3:
+        ncols = 1
+        panel_w = 9.5
+        panel_h = 3.4
     else:
         ncols = 2
-        panel_h = 4.8
+        panel_w = 9.5
+        panel_h = 5.0
     nrows = (n + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(9.5 * ncols, panel_h * nrows + 1.5),
+                             figsize=(panel_w * ncols, panel_h * nrows + 1.5),
                              squeeze=False)
     axes = axes.reshape(-1)
     colors = plt.cm.tab10.colors + plt.cm.Set2.colors
+    global_handles = []
+    global_labels = []
+    margin_labels = []    # [(ax_index, label, color, xv, yv)] 多段时画到右侧留白
 
     for pi, (ptitle, sub) in enumerate(panels):
         ax = axes[pi]
+        # 缺失/突变段全部着色并收集文字(带对应色带位置)
         any_gap = any(s["gaps"] for s in sub)
         any_shift = any(s.get("shifts") for s in sub)
-        text_count = 0
+        panel_labels = []   # [(label, color)]
+        panel_pos = []      # [(label, color, xv, yv)] 与 panel_labels 同步
         for i, s in enumerate(sub):
             plot_label = s["label"]
             bucket = _series_bucket_seconds(s["hours"])
@@ -1552,8 +1729,6 @@ def plot_group_time_series(position, group, series, out_path, dpi=200,
                 day_date = ""
             ax.plot(xs, plot_means, "-", linewidth=1.3,
                     color=colors[i % len(colors)], label=plot_label)
-            y0, y1 = ax.get_ylim()
-            span = (y1 - y0) or 1.0
             for g in s["gaps"]:
                 try:
                     t0 = dt.datetime.strptime(g["起始时间"], "%Y-%m-%d %H:%M")
@@ -1566,17 +1741,14 @@ def plot_group_time_series(position, group, series, out_path, dpi=200,
                         key=lambda k: abs((s["hours"][k] - t1).total_seconds()))
                 ax.axvspan(xs[a], xs[b],
                            color="#ff7f0e", alpha=0.18)
-                label = (f"传感器{s['sensor']}缺失({g['起始时间']}~"
-                         f"{g['结束时间']} 共{g['缺失小时数']}h 数据)")
-                mid = xs[a] + (xs[b] - xs[a]) / 2
-                ax.text(mid,
-                        y0 + 0.05 * span + text_count * 0.05 * span,
-                        label, ha="center", va="bottom", fontsize=12,
-                        fontweight="bold",
-                        color="#d2691e",
-                        bbox=dict(facecolor="white", alpha=0.88, pad=0.9,
-                                  edgecolor="#d2691e"))
-                text_count += 1
+                panel_labels.append(
+                    (_fmt_compact_range(g['起始时间'], g['结束时间']),
+                     "#d2691e"))
+                yv = (plot_means[b] if b < len(plot_means)
+                      else plot_means[a] if a < len(plot_means) else 0.0)
+                panel_pos.append(
+                    (_fmt_compact_range(g['起始时间'], g['结束时间']),
+                     "#d2691e", xs[a], yv))
             for sh in s.get("shifts") or []:
                 try:
                     t0 = dt.datetime.strptime(sh["起始时间"], "%Y-%m-%d %H:%M")
@@ -1590,17 +1762,14 @@ def plot_group_time_series(position, group, series, out_path, dpi=200,
                 color = "#d62728" if sh["方向"] == "偏高" else "#2ca02c"
                 ax.axvspan(xs[a], xs[b],
                            color=color, alpha=0.12)
-                label = (f"均值{sh.get('段内平均值', 0):.4g} {sh['方向']}"
-                         f"({sh['起始时间']}~{sh['结束时间']})")
-                mid = xs[a] + (xs[b] - xs[a]) / 2
-                ax.text(mid,
-                        y1 + 0.03 * span + text_count * 0.05 * span,
-                        label, ha="center", va="bottom", fontsize=12,
-                        fontweight="bold",
-                        color=color,
-                        bbox=dict(facecolor="white", alpha=0.85, pad=0.9,
-                                  edgecolor=color))
-                text_count += 1
+                panel_labels.append(
+                    (f"{_fmt_compact_range(sh['起始时间'], sh['结束时间'])} "
+                     f"{sh['方向']}", color))
+                yv = (plot_means[b] if b < len(plot_means)
+                      else plot_means[a] if a < len(plot_means) else 0.0)
+                panel_pos.append(
+                    (f"{_fmt_compact_range(sh['起始时间'], sh['结束时间'])} "
+                     f"{sh['方向']}", color, xs[a], yv))
             if s["spike_pts"]:
                 ax.plot([p[0] for p in s["spike_pts"]],
                         [p[1] for p in s["spike_pts"]],
@@ -1610,18 +1779,21 @@ def plot_group_time_series(position, group, series, out_path, dpi=200,
                         [p[1] for p in s["range_pts"]],
                         "x", color="#d62728", markersize=10, mew=2.2, zorder=5)
 
-        # 顶部留白给突变文字
-        if any_shift:
+        # 标注: ≤4 段标在带上(带间距近自动让位)；>4 段全部挪到图旁留白
+        if panel_labels:
             y0, y1 = ax.get_ylim()
-            span = (y1 - y0) or 1.0
-            ax.set_ylim(y0, y1 + 0.16 * span + 0.04 * span * min(6, text_count))
+            if len(panel_labels) <= 4:
+                _label_on_bands(ax, fig, panel_pos, fontsize=13)
+            else:
+                for item in panel_pos:
+                    margin_labels.append((pi, *item))
 
         if day_mode:
             ax.set_xticks(range(0, 25, 6))
             ax.set_xticklabels([f"{h}时" for h in range(0, 25, 6)],
-                               fontsize=12)
+                               fontsize=13)
             ax.set_xlim(0, 24)
-            ax.set_xlabel("时刻（小时）", fontsize=13)
+            ax.set_xlabel("时刻（小时）", fontsize=14)
         all_hours = sorted({h for s in sub for h in s["hours"]})
         if all_hours and not day_mode:
             day_starts = {}
@@ -1632,18 +1804,21 @@ def plot_group_time_series(position, group, series, out_path, dpi=200,
             ticks = [day_starts[d] for d in days[::step]]
             ax.set_xticks(ticks)
             ax.set_xticklabels([_fmt_cn_date(d) for d in days[::step]],
-                               rotation=30, fontsize=12)
+                               rotation=30, fontsize=13)
         if day_mode:
             ax.set_title(
                 f"{ptitle}｜{feature_display(sub[0]['feature'])}｜"
-                f"{_fmt_cn_date(day_date)}", fontsize=14)
+                f"{_fmt_cn_date(day_date)}", fontsize=15)
+        elif row3:
+            # 一行三列时子图标题直接用分量名(如 GNSS(Δx))，整图标题带位置
+            ax.set_title(feature_display(sub[0]["feature"]), fontsize=15)
         elif single_feat:
             ax.set_title(f"{ptitle}｜{feature_display(sub[0]['feature'])}",
-                         fontsize=14)
+                         fontsize=15)
         else:
-            ax.set_title(feature_display(ptitle), fontsize=14)
+            ax.set_title(feature_display(ptitle), fontsize=15)
         ax.set_ylabel(feature_display(sub[0]["feature"]) if single_feat
-                      else feature_display(ptitle), fontsize=13)
+                      else feature_display(ptitle), fontsize=14)
         ax.tick_params(axis="y", labelsize=12)
         ax.grid(True, alpha=0.3)
 
@@ -1664,30 +1839,72 @@ def plot_group_time_series(position, group, series, out_path, dpi=200,
             handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#2ca02c",
                                          alpha=0.25))
             labels.append("长时间偏低")
-        if handles:
-            ax.legend(handles, labels, loc="best", fontsize=11)
+        # 子图不画图例(避免遮挡数据)；统一收集到整图底部一个全局图例
+        for h, lb in zip(handles, labels):
+            if lb not in global_labels:
+                global_labels.append(lb)
+                global_handles.append(h)
 
     for j in range(len(panels), len(axes)):
         axes[j].axis("off")
 
+    _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
     if day_mode:
         fig.suptitle(
             f"{position}｜{group} 小时均值时间序列（{n} 个测点）｜"
-            f"{_fmt_cn_date(day_date)}", fontsize=18)
+            f"{_fmt_cn_date(day_date)}{_chunk_txt}", fontsize=19)
     else:
-        fig.suptitle(f"{position}｜{group} 小时均值时间序列（{n} 个测点）",
-                     fontsize=18)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+        fig.suptitle(
+            f"{position}｜{group} 小时均值时间序列（{n} 个测点）{_chunk_txt}",
+            fontsize=19)
+    if global_handles:
+        fig.legend(global_handles, global_labels, loc="lower center",
+                   ncol=min(len(global_labels), 8), fontsize=12,
+                   frameon=True, borderaxespad=0.3)
+        fig.tight_layout(rect=(0, 0.09, 1, 0.95))
+    else:
+        fig.tight_layout(rect=(0, 0, 1, 0.97))
+    # 多段标注: 收缩子图宽度，把右侧留白区让出来放文字
+    if margin_labels:
+        for a in axes:
+            x0, y0, w, h = a.get_position().bounds
+            a.set_position([x0, y0, w * 0.78, h])
+        by_ax = {}
+        for pi, label, color, xv, yv in margin_labels:
+            by_ax.setdefault(pi, []).append((label, color, xv, yv))
+        for pi, items in by_ax.items():
+            _label_in_margin(fig, axes[pi].get_position(), items,
+                             fontsize=12)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
 def plot_group_histogram(position, group, series, out_path, dpi=200):
-    """频率分布图：每个测点(传感器-特征)一个子图，不再叠加。"""
+    """频率分布图：每个测点(传感器-特征)一个子图，不再叠加。
+    超过 6 个测点时拆成多张图(频率分布图.png / _2.png / ...)。"""
     n = len(series)
     if n == 0:
         return
-    cols = 2
+    max_panels = 6
+    chunks = [series[i:i + max_panels]
+              for i in range(0, n, max_panels)]
+    for ci, chunk in enumerate(chunks):
+        if ci == 0:
+            out = out_path
+        else:
+            base, ext = os.path.splitext(out_path)
+            out = f"{base}_{ci + 1}{ext}"
+        _plot_group_histogram_chunk(position, group, chunk, out, dpi,
+                                    ci + 1, len(chunks))
+
+
+def _plot_group_histogram_chunk(position, group, series, out_path, dpi=200,
+                                chunk_idx=1, chunk_total=1):
+    """频率分布图单个图块：每个测点(传感器-特征)一个子图。"""
+    n = len(series)
+    if n == 0:
+        return
+    cols = 1 if n == 1 else 2
     rows = (n + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(7.5 * cols, 3.8 * rows))
     axes = np.array(axes).reshape(-1)
@@ -1704,8 +1921,10 @@ def plot_group_histogram(position, group, series, out_path, dpi=200):
         ax.grid(True, alpha=0.3)
     for j in range(n, len(axes)):
         axes[j].axis("off")
-    fig.suptitle(f"{position}｜{group} 频率分布直方图（{n} 个测点）",
-                 fontsize=17)
+    _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
+    fig.suptitle(
+        f"{position}｜{group} 频率分布直方图（{n} 个测点）{_chunk_txt}",
+        fontsize=17)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -1713,7 +1932,29 @@ def plot_group_histogram(position, group, series, out_path, dpi=200):
 
 def plot_group_histogram_from_counts(position, group, hist_acc, bin_edges,
                                      out_path, dpi=200):
-    """振动(秒级)合并频率分布图：每个 (传感器,特征) 一个子图，计数按季度逐日累积。"""
+    """振动(秒级)合并频率分布图：每个 (传感器,特征) 一个子图，计数按季度逐日累积。
+    超过 6 个测点时拆成多张图。"""
+    keys = sorted(hist_acc)
+    if not keys:
+        return
+    max_panels = 6
+    chunks = [keys[i:i + max_panels]
+              for i in range(0, len(keys), max_panels)]
+    for ci, chunk in enumerate(chunks):
+        if ci == 0:
+            out = out_path
+        else:
+            base, ext = os.path.splitext(out_path)
+            out = f"{base}_{ci + 1}{ext}"
+        sub_acc = {k: hist_acc[k] for k in chunk}
+        _plot_group_histogram_from_counts_chunk(
+            position, group, sub_acc, bin_edges, out, dpi, ci + 1, len(chunks))
+
+
+def _plot_group_histogram_from_counts_chunk(position, group, hist_acc,
+                                            bin_edges, out_path, dpi=200,
+                                            chunk_idx=1, chunk_total=1):
+    """振动(秒级)合并频率分布图单个图块。"""
     keys = sorted(hist_acc)
     if not keys:
         return
@@ -1740,8 +1981,10 @@ def plot_group_histogram_from_counts(position, group, hist_acc, bin_edges,
         ax.grid(True, alpha=0.3)
     for j in range(n, len(axes)):
         axes[j].axis("off")
-    fig.suptitle(f"{position}｜{group} 频率分布直方图（{n} 个测点，按日累积）",
-                 fontsize=17)
+    _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
+    fig.suptitle(
+        f"{position}｜{group} 频率分布直方图（{n} 个测点，按日累积）{_chunk_txt}",
+        fontsize=17)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -1963,7 +2206,8 @@ def main():
                     help="merged=按监测部位合并出图(多传感器/多特征一张图，默认)；"
                          "per_sensor=旧的按传感器出图")
     ap.add_argument("--position-map", default="",
-                    help="传感器名称对照 json 路径(默认扫描 统计值/传感器名称对照/*.json)")
+                    help="传感器名称对照 json 路径(默认扫描 "
+                         "传感器对照/传感器名称对照/*.json)")
     ap.add_argument("--dpi", type=int, default=200,
                     help="图片分辨率(默认 200，保证插入 Word 清晰)")
     ap.add_argument("--daily-root", default=None,
@@ -1980,7 +2224,8 @@ def main():
     ap.add_argument("--stats-dir", default="",
                     help="统计值输出目录(默认 <lib-root>/统计值)")
     ap.add_argument("--sensor-map", default="",
-                    help="传感器编号名称.json 路径(默认 统计值/传感器编号名称.json)")
+                    help="传感器编号名称.json 路径(默认 "
+                         "传感器对照/传感器编号名称.json)")
     ap.add_argument("--period-tag", default="",
                     help="目录名里的年月标签(如 2026.1~3)；默认自动从数据范围推导")
     ap.add_argument("--bridge", default="",
@@ -2015,6 +2260,9 @@ def main():
     ap.add_argument("--skip-per-sensor", action="store_true",
                     help="跳过逐传感器(per_sensor)出图，直接生成 merged 图"
                          "(单传感器单特征组也会由 merged 路径直接出图)")
+    ap.add_argument("--skip-stats", action="store_true",
+                    help="跳过统计值计算与写出(与 --skip-per-sensor 一起用时"
+                         "逐传感器统计整体跳过，只生成合并图；统计值保留上次结果)")
     ap.add_argument("--gap-fill-hours", type=float, default=24,
                     help="连续缺失达到该小时数时，图上标注并用线性插值"
                          "填充绘图(默认24小时，0=关闭)")
@@ -2066,8 +2314,22 @@ def main():
         daily_name = os.path.basename(DEFAULT_DAILY_ROOT.rstrip("/\\"))
         if args.year and args.quarter:
             daily_name = f"daily_{args.year}.{qs}~{qe}"
-        args.daily_root = (os.path.join(base, bridge, daily_name)
-                           if bridge else os.path.join(base, daily_name))
+        if bridge:
+            # 兼容桥名写法差异(湘江特 vs 湘江特大桥)：按目录存在性匹配，
+            # 避免预处理用 --bridge 湘江特、建图库用 --bridge 湘江特大桥 时
+            # daily 目录对不上
+            resolved = False
+            for v in _bridge_variants(bridge):
+                cand = os.path.join(base, v, daily_name)
+                if os.path.isdir(cand):
+                    bridge = v
+                    args.daily_root = cand
+                    resolved = True
+                    break
+            if not resolved:
+                args.daily_root = os.path.join(base, bridge, daily_name)
+        else:
+            args.daily_root = os.path.join(base, daily_name)
     if bridge:
         # 图库/统计值(相对路径)：图库_<期>/<桥名>、统计值_<期>/<桥名>
         chart_dir = os.path.join(chart_dir, bridge)
@@ -2102,7 +2364,14 @@ def main():
     t0 = time.time()
     issues = []   # 失败/数据不足记录
     overview = []
-    for idx, sensor in enumerate(sensors, 1):
+    # 只出合并图(--skip-per-sensor --skip-stats)时，逐传感器统计计算与出图
+    # 整体跳过，直接进入合并图库阶段，节省大量读取/统计时间
+    _sensor_iter = sensors
+    if args.skip_per_sensor and args.skip_stats:
+        print("--skip-per-sensor --skip-stats: 跳过逐传感器统计计算与出图，"
+              "直接生成合并图")
+        _sensor_iter = []
+    for idx, sensor in enumerate(_sensor_iter, 1):
         info = sensor_map.get(sensor, {})
         sensor_name = info.get("名称", "") or sensor
         bridge = info.get("桥名", "")
@@ -2424,9 +2693,10 @@ def main():
                 except Exception:  # noqa: BLE001
                     pass
 
-        with open(os.path.join(stats_dir, f"{sensor}.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump(sensor_stats, f, ensure_ascii=False, indent=2)
+        if not args.skip_stats:
+            with open(os.path.join(stats_dir, f"{sensor}.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(sensor_stats, f, ensure_ascii=False, indent=2)
 
         overview.append({
             "编号": sensor, "名称": sensor_name, "桥名": bridge,
@@ -2436,14 +2706,15 @@ def main():
             el = time.time() - t0
             print(f"  进度 {idx}/{len(sensors)}  已用 {el:.0f}s", flush=True)
 
-    with open(os.path.join(stats_dir, "总览.json"), "w",
-              encoding="utf-8") as f:
-        json.dump({
-            "说明": "全部传感器-特征图库总览",
-            "生成时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "传感器数量": len(overview),
-            "传感器": overview,
-        }, f, ensure_ascii=False, indent=2)
+    if not args.skip_stats:
+        with open(os.path.join(stats_dir, "总览.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({
+                "说明": "全部传感器-特征图库总览",
+                "生成时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "传感器数量": len(overview),
+                "传感器": overview,
+            }, f, ensure_ascii=False, indent=2)
 
     # ---------- 合并图库（按监测部位分组，一张图多测点/多特征） ----------
     if args.mode == "merged":
@@ -2458,12 +2729,30 @@ def main():
                 if os.path.isdir(old_nd):
                     nd_dir = old_nd
             if os.path.isdir(nd_dir):
-                for f in sorted(os.listdir(nd_dir)):
-                    if f.endswith(".json"):
-                        pm = load_position_map(os.path.join(nd_dir, f))
-                        for k, v in pm.items():
-                            pos_map.setdefault(k, []).extend(v)
+                files = [f for f in sorted(os.listdir(nd_dir))
+                         if f.endswith(".json")]
+                # 只加载当前桥的对照文件(文件名以桥名开头)，避免把
+                # 其它桥的位置也拉进来(如湘江特跑出洞庭湖/矮寨的位置)
+                if bridge:
+                    picks = [f for f in files if f[:-5].startswith(bridge)]
+                    if picks:
+                        files = picks
+                for f in files:
+                    pm = load_position_map(os.path.join(nd_dir, f))
+                    for k, v in pm.items():
+                        pos_map.setdefault(k, []).extend(v)
                 pos_map = {k: sorted(set(v)) for k, v in pos_map.items()}
+                # 安全网：按对照表里的桥名再过滤一遍
+                if bridge:
+                    def _same_bridge(info_bridge):
+                        return (bridge in (info_bridge or "")
+                                or (info_bridge or "") in bridge)
+                    pos_map = {
+                        k: [p for p in v
+                            if _same_bridge(sensor_map.get(p[0], {}).get("桥名", ""))]
+                        for k, v in pos_map.items()
+                    }
+                    pos_map = {k: v for k, v in pos_map.items() if v}
         if not pos_map:
             pos_map = load_position_map("", map_path)
         if not pos_map:
@@ -2590,8 +2879,12 @@ def main():
         f.write("\n".join(issues) if issues else "无\n")
     print(f"问题记录已写入: {issue_path} ({len(issues)} 条)")
 
-    print(f"[完成] 共处理 {len(sensors)} 个传感器，"
-          f"总耗时 {time.time()-t0:.0f}s")
+    if args.skip_per_sensor and args.skip_stats:
+        print(f"[完成] 跳过逐传感器处理(共 {len(sensors)} 个传感器)，"
+              f"仅生成合并图，总耗时 {time.time()-t0:.0f}s")
+    else:
+        print(f"[完成] 共处理 {len(sensors)} 个传感器，"
+              f"总耗时 {time.time()-t0:.0f}s")
     if not args.skip_per_sensor:
         _copy_per_sensor_dirs(args.lib_root, chart_dir, bridge)
     _write_status_dirs(args.lib_root, chart_dir, stats_dir)

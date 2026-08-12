@@ -36,13 +36,28 @@ def _apply_latest_bridge_dirs(cfg: dict, base: str) -> None:
     charts = dirs.get("charts") or ""
     if stats and os.path.isdir(stats):
         bridge_data["stats_dir"] = stats
-        sm = os.path.join(stats, "传感器编号名称.json")
+        # 传感器对照表是固定产物，统一放 preprocess/传感器对照/，
+        # 不再从统计值目录读取；旧布局(统计值目录内)仍兼容回退
+        map_dir = os.path.join(base, "preprocess", "传感器对照")
+        sm = os.path.join(map_dir, "传感器编号名称.json")
         if os.path.isfile(sm):
             bridge_data["sensor_map"] = sm
-        nd = os.path.join(stats, "传感器名称对照")
+        nd = os.path.join(map_dir, "传感器名称对照")
         if os.path.isdir(nd):
-            nd_file = os.path.join(nd, "赤石大桥.json")
-            bridge_data["name_dict"] = nd_file if os.path.isfile(nd_file) else ""
+            bridge_name = bridge_data.get("bridge_name", "") or ""
+            nd_file = os.path.join(nd, f"{bridge_name}大桥.json")
+            if os.path.isfile(nd_file):
+                bridge_data["name_dict"] = nd_file
+        # 旧布局回退：统计值目录内仍存在对照表时使用
+        sm = os.path.join(stats, "传感器编号名称.json")
+        if os.path.isfile(sm) and "sensor_map" not in bridge_data:
+            bridge_data["sensor_map"] = sm
+        nd = os.path.join(stats, "传感器名称对照")
+        if os.path.isdir(nd) and not bridge_data.get("name_dict"):
+            bridge_name = bridge_data.get("bridge_name", "") or ""
+            nd_file = os.path.join(nd, f"{bridge_name}大桥.json")
+            if os.path.isfile(nd_file):
+                bridge_data["name_dict"] = nd_file
     if charts and os.path.isdir(charts):
         bridge_data["charts_dir"] = charts
 

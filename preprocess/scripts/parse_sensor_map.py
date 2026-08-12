@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 从《五座桥测点编号表格.docx》提取传感器对照表，输出：
-  1) 传感器编号 -> 中文名称(默认 统计值/传感器编号名称.json)
-  2) 按五座桥分别保存的 名称对照(默认 统计值/传感器名称对照/<桥名>.json)，
+   1) 传感器编号 -> 中文名称(默认 preprocess/传感器对照/传感器编号名称.json)
+   2) 按五座桥分别保存的 名称对照(默认 preprocess/传感器对照/传感器名称对照/<桥名>.json)，
      每个文件包含:
        - 传感器名称: 名称 -> [{编号, 特征(监测类别), 位置, 方向, 特征编码, 测点}]
        - 测点映射:   结构应变/振动监测表的 断面位置 -> 测点N -> 编号
@@ -25,7 +25,7 @@ from collections import defaultdict
 
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
-DEFAULT_DOCX = r"D:\五座桥数据分析文件\五座桥测点编号表格.docx"
+DEFAULT_DOCX = r".\\inputs\\五座桥测点编号表格.docx"
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "..", "传感器对照", "传感器编号名称.json")
 DEFAULT_NAME_MAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -63,8 +63,11 @@ NOT_CATEGORY = {
     "均方根值", "绝对最大值", "序号",
 }
 
-# 表头"位置"列的值(上游/下游/左幅/右幅)，解析时前向填充给整组行
-SIDE_WORDS = {"上游", "下游", "左幅", "右幅"}
+# 表头"位置"列的值(上游/下游/左幅/右幅/左/右/顶/底 等方位)，
+# 解析时前向填充给整组行，并拼进传感器名称/监测部位(避免同一监测部位
+# 多个方位挤成一个位置导致子图过多)
+SIDE_WORDS = {"上游", "下游", "左幅", "右幅", "左侧", "右侧",
+              "顶部", "底部", "上游侧", "下游侧"}
 
 # 表头"方向"列的值(GNSS/地震/倾角等表格)，从监测部位里排除并单独保存
 DIRECTION_WORDS = {
@@ -144,6 +147,11 @@ def parse_docx(path):
                                  if c != location and c not in
                                  (location, "上游", "下游", "左幅", "右幅"))
                 name = location or (current_bridge + "-" + current_category)
+                # 方位(位置列: 上游/下游/左/右/顶/底 等)拼进名称/监测部位，
+                # 避免同一监测部位多个方位合并成一个位置(子图过多)；
+                # 已含该方位后缀(如"4#墩...左侧")时不再重复追加
+                if current_side and current_side not in name:
+                    name = name + current_side
                 for num in nums:
                     if num not in sensors:
                         sensors[num] = {
@@ -151,7 +159,7 @@ def parse_docx(path):
                             "类别": current_category,
                             "位置": current_side,
                             "方向": current_direction,
-                            "监测部位": location,
+                            "监测部位": name,
                             "附加": extra,
                             "名称": name,
                         }

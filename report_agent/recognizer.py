@@ -227,6 +227,10 @@ CHART_TEXT_RE = re.compile(
     r"|_(时程曲线图|频率分布直方图|频率分布图|时程曲线|时间序列图|直方图)$"
     r"|_(时程曲线图|频率分布直方图|频率分布图|时程曲线|时间序列图|直方图)_\d+$"
 )
+# 多传感器合并行：位移*906*907*908*时程曲线_x1 / 位移*906_907_908*频率分布_3x1
+CHART_MULTI_RE = re.compile(
+    r"^\s*位移[_＊*]([\d_＊*]+)[_＊*](时程曲线|频率分布)[_＊*]?(\d*)x(\d+)\s*$"
+)
 
 # 纯图题识别：图题末尾含"图"且包含动态图表关键词
 # 例：交通荷载监测_车辆累计通过数量统计图、梁端转角测点变化时程曲线图
@@ -297,6 +301,9 @@ STATIC_WORDS = [
     "车道", "限速", "荷载等级", "强度等级", "材料", "材质",
     "面积", "容积", "功率", "电压", "频率", "重量", "单价", "金额", "造价", "预算", "投资",
     "预应力", "钢束", "锚具", "斜拉索",
+    # 检查/检测类静态叙述：螺栓抽取数、扭力合格范围、节点板编号等
+    "螺栓", "扭力", "合格范围", "节点板", "大桩号", "小桩号", "主桁架",
+    "抽取", "检查", "复检", "抽检",
     # 签字表 / 机构信息
     "检测有限公司", "资质", "证书", "职称", "签字", "姓名", "岗位", "职业资格",
     # 规范引用（后面跟编号）
@@ -885,7 +892,9 @@ def parse_docx(path: str) -> dict:
     for _pidx, _info in table_layout_for_para.items():
         col_h = str(_info.get("col_header") or "")
         row_l = str(_info.get("row_label") or "")
-        if re.fullmatch(r"车道\d+", col_h) and re.fullmatch(r"(数值/辆|比例/%)", row_l):
+        # 行标签可能出现全角 ％（“比例/％”），先归一化
+        row_norm = row_l.replace("％", "%")
+        if re.fullmatch(r"车道\d+", col_h) and re.fullmatch(r"(数值/辆|比例/%|比例%)", row_norm):
             chart_texts.append({
                 "paragraph": _pidx,
                 "kind": "cell_ref",
@@ -896,7 +905,7 @@ def parse_docx(path: str) -> dict:
                 "row": _info.get("row_idx", 0),
                 "col": _info.get("col_idx", 0),
                 "row_label": col_h,          # 位置：车道1
-                "col_header": row_l,          # 统计：数值/辆 或 比例/%
+                "col_header": row_norm,       # 统计：数值/辆 或 比例/%
                 "table_title": _info.get("title", ""),
                 "position": 0,
                 "verdict": "replace",
@@ -928,6 +937,24 @@ def parse_docx(path: str) -> dict:
                 "metric": metric_en,
                 "text": t,
                 "source": "explicit_suffix",
+            })
+            seen_para.add(i)
+            continue
+        m2 = CHART_MULTI_RE.match(t)
+        if m2:
+            # “位移*906*907*908*时程曲线_x1”：多个传感器编号合并一行，
+            # 视为该位置的 时程/直方 占位行（位置由下方表格补全，多传感器合并成一张图）
+            kind = "time_series" if "时程" in m2.group(2) else "histogram"
+            chart_id = "trend" if kind == "time_series" else "histogram"
+            metric_en = _metric_from_chart_text(t) or "displacement"
+            chart_texts.append({
+                "paragraph": i,
+                "kind": kind,
+                "chart_id": chart_id,
+                "metric": metric_en,
+                "text": t,
+                "source": "explicit_suffix",
+                "sensor_ids": m2.group(1),
             })
             seen_para.add(i)
             continue
@@ -2750,7 +2777,7 @@ STATIC_NUMBER_RE = re.compile(
     r"\d+\s*[～~-]\s*\d+\s*N\s*·?\s*m|"                           # 合格范围 62～63N·m（阈值）
     r"\d+\s*N\s*·?\s*m\b|"                                        # 单值 N·m（扭矩阈值）
     r"\d+\s*m\s*处|"                                              # 30m处（监测位置）
-    r"(?<![\d.])\d+\s*/\s*\d+(?=\s*(?:主跨|跨中|边跨|桥面|断面|截面|钢桁|箱梁|处))|"  # 1/2主跨、1/4处、1/4箱梁
+    r"(?<![\d.])\d+\s*/\s*\d+(?=\s*(?:主跨|跨中|边跨|跨|桥面|断面|截面|钢桁|箱梁|处))|"  # 1/2主跨、1/4处、2/4跨
     r"^\d+(?:\.\d+){0,3}\.?(?=[\u4e00-\u9fa5\s])"              # 节标题编号（4.监测结论 / 3.5.1梁端倾角…）
 )
 LOCATION_SPAN_RE = STATIC_NUMBER_RE
@@ -2770,11 +2797,22 @@ def _protect_static_numbers(parsed: dict) -> int:
         p = num.get("paragraph")
         if not isinstance(p, int) or not (0 <= p < len(texts)):
             continue
+        p_text = str(texts[p])
+        # 节标题整体保护：编号标题（3.3.1.2  2/4跨主梁截面挠度监测）里的数字
+        # 都是位置/编号（跨号、墩号、1/4、30m 等），一律不替换。
+        # 年份/季度若出现在标题里，由文本替换（text_replacements）另行处理，不受影响。
+        if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*[\u4e00-\u9fa5A-Za-z#\d]", p_text):
+            num["verdict"] = "keep"
+            num["confidence"] = 0.95
+            num["reasons"].append("节标题数字整体保护")
+            num["placeholder"] = None
+            changed += 1
+            continue
         pos = num.get("position", -1)
         if pos < 0:
             continue
         hit = False
-        for m in STATIC_NUMBER_RE.finditer(str(texts[p])):
+        for m in STATIC_NUMBER_RE.finditer(p_text):
             if m.start() <= pos < m.end():
                 hit = True
                 break

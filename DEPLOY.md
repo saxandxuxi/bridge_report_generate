@@ -26,7 +26,7 @@
 | 组件 | 说明 |
 |---|---|
 | 原始数据 | 各传感器的按日/小时原始文件 |
-| 桥数据预处理产物 | `统计值/*.json`、`图库/*/...png`、`传感器编号名称.json`、`总览.json` |
+| 桥数据预处理产物 | `统计值_<期>/<桥名>/*.json`、`图库_<期>/<桥名>/*.png`、`传感器对照/*.json`、`总览.json` |
 | 报告智能体 | `run_agent.py` / `serve_scheduler.py` / `report_agent/` |
 | Web 管理台 | `web/app.py`（bridge 模式，默认 8080；含数据路径配置、模板上传、调度器控制、季度/年度周期） |
 | 调度器 | 按 `config_<桥>.json → schedule` 自动出报告 |
@@ -81,9 +81,9 @@ mkdir -p /data/bridge /data/raw
     "bridge_name": "赤石",
     "stats_dir": "/data/bridge/统计值",
     "charts_dir": "/data/bridge/图库",
-    "sensor_map": "/data/bridge/统计值/传感器编号名称.json",
+    "sensor_map": "/data/bridge/传感器对照/传感器编号名称.json",
     "overview": "/data/bridge/统计值/总览.json",
-    "name_dict": "/data/bridge/统计值/传感器名称对照/<桥名>.json",
+    "name_dict": "/data/bridge/传感器对照/传感器名称对照/<桥名>.json",
     "metrics": { ... },
     "sensor_exclude": ["101", "106"],
     "sensor_aliases": {},
@@ -96,7 +96,7 @@ mkdir -p /data/bridge /data/raw
 关键配置项：
 
 - `bridge_data.metrics.<指标>.feature`：模板里的指标对应预处理的特征名（如 `WSD(temp)`）。特征名不确定时留空，系统会退化为“该传感器第一个特征”。
-- `bridge_data.name_dict`：人工维护的名称→编号对照表（`统计值/传感器名称对照/<桥名>.json`），精确命中优先于模糊匹配；未配置时系统自动按 `bridge_name` 查找。
+- `bridge_data.name_dict`：人工维护的名称→编号对照表（`传感器对照/传感器名称对照/<桥名>.json`，固定产物），精确命中优先于模糊匹配；未配置时系统自动按 `bridge_name` 查找。
 - `bridge_data.sensor_exclude`：数据异常的传感器编号或名称，统计时排除。
 - `bridge_data.chart_map`：图表占位符 → 传感器编号的人工映射，用于补齐图库自动匹配不到的那 20%。
 - `bridge_data.sensor_aliases`：模板测点写法 → 传感器编号的精确映射（如 `"测点1": "100"`）。

@@ -3,8 +3,10 @@
 
 桥数据预处理项目（D:/Code/桥数据预处理/）会产出：
   统计值/<传感器编号>.json        每个传感器的分特征统计（中文键）+ 每日统计
-  统计值/传感器编号名称.json       编号 -> 中文监测部位对照
   统计值/总览.json                全部传感器-特征总览
+  统计值_<期>/<桥名>/季度总结/     季度/年度聚合统计（季度统计.json、年度统计.json）
+  传感器对照/传感器编号名称.json    编号 -> 中文监测部位对照（固定产物）
+  传感器对照/传感器名称对照/<桥名>.json  中文名称 -> 编号/特征（固定产物）
   图库/<传感器编号>/<特征>/时间序列图.png / 频率分布图.png / 相关性_*.png
 
 本模块把这些产物变成报告生成引擎的“数据源”：
@@ -230,6 +232,7 @@ class BridgeData:
         self.table_map: Dict = {}                        # 表格映射：表类 -> 墩/位置 -> {编号, 特征}
         self._category_sensors: Dict[str, List[str]] = {}  # 类别 -> 编号列表（从名称对照表）
         self._stats_cache: Dict[str, Dict] = {}          # 编号 -> 统计值 JSON
+        self._agg_cache: Optional[Dict] = None            # 季度/年度统计.json 缓存
         self._sensor_features: Dict[str, List[str]] = {} # 编号 -> 特征列表
         self._match_stats = {"name_dict": 0, "alias": 0, "sensor_map": 0, "fuzzy": 0, "metric_fallback": 0}
         self._chart_seq: Dict = {}                       # (metric,位置) -> 已分配序号
@@ -311,8 +314,20 @@ class BridgeData:
         return self.status()
 
     def _load_name_dict(self) -> None:
-        """加载 统计值/传感器名称对照/<桥名>.json（名称 -> 编号/特征）。"""
+        """加载 传感器对照/传感器名称对照/<桥名>.json（名称 -> 编号/特征）。
+        对照表是固定产物，统一放 preprocess/传感器对照/；旧布局
+        (统计值_<期>/<桥名>/传感器名称对照/)仍兼容回退。"""
         path = self.name_dict_path
+        if not path:
+            base = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "preprocess", "传感器对照", "传感器名称对照")
+            for cand in (f"{self.bridge_name}大桥.json",
+                         f"{self.bridge_name}.json"):
+                p = os.path.join(base, cand)
+                if os.path.isfile(p):
+                    path = p
+                    break
         if not path and self.stats_dir:
             base = os.path.join(self.stats_dir, "传感器名称对照")
             for cand in (f"{self.bridge_name}大桥.json", f"{self.bridge_name}.json"):
@@ -480,7 +495,12 @@ class BridgeData:
             "sensor_count": len(self.sensor_map),
             "sensor_map_path": self.sensor_map_path,
             "name_dict_path": self.name_dict_path or (
-                os.path.join(self.stats_dir, "传感器名称对照") if self.stats_dir else ""),
+                os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "preprocess", "传感器对照", "传感器名称对照")
+                if os.path.isdir(os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "preprocess", "传感器对照", "传感器名称对照")) else ""),
             "name_dict_count": len(self.name_dict),
             "match_stats": dict(self._match_stats),
             "error": self.load_error,
@@ -539,7 +559,7 @@ class BridgeData:
             self._match_stats["alias"] += 1
             return str(alias)
 
-        # 2. 人工名称对照表（统计值/传感器名称对照/<桥名>.json）——精确命中率最高
+        # 2. 人工名称对照表（传感器对照/传感器名称对照/<桥名>.json）——精确命中率最高
         key = _norm(col)
         sid = self._pick_from_name_dict(key, metric) if key else None
         if sid:
@@ -621,6 +641,56 @@ class BridgeData:
             self._stats_cache[sensor_id] = None
             return None
 
+    def _load_aggregate_stats(self) -> Dict:
+        """加载 季度统计.json / 年度统计.json(按监测部位聚合)，用于血缘回退。
+
+        新布局: 统计值_<期>/<桥名>/季度总结/季度统计.json；
+        同时兼容旧布局 统计值_<期>/<桥名>/季度统计.json。
+        """
+        if self._agg_cache is not None:
+            return self._agg_cache
+        agg = {}
+        candidates = []
+        for fn in ("季度统计.json", "年度统计.json"):
+            candidates.append((fn, os.path.join(self.stats_dir, "季度总结", fn)))
+            candidates.append((fn, os.path.join(self.stats_dir, fn)))  # 旧布局回退
+        for fn, p in candidates:
+            if fn in agg or not os.path.isfile(p):
+                continue
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    agg[fn] = json.load(f)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("读取聚合统计 %s 失败: %s", p, exc)
+        self._agg_cache = agg
+        return agg
+
+    def _aggregate_sensor_stat(self, sensor_id: str, metric: str, stat: str,
+                               feature: str = "") -> Optional[float]:
+        """通过 季度/年度统计文件(按桥+监测部位+特征)查找统计值。"""
+        info = self.sensor_map.get(str(sensor_id), {})
+        bridge = info.get("桥名", "") or ""
+        loc = info.get("监测部位") or info.get("名称") or ""
+        feat = feature or self.metrics.get(metric, {}).get("feature", "")
+        if not bridge or not loc or not feat:
+            return None
+        agg = self._load_aggregate_stats()
+        for data in agg.values():
+            bridges = data.get("桥", {}) or {}
+            b = next((bk for bk in bridges if bridge in bk or bk in bridge), None)
+            if not b:
+                continue
+            pos = bridges[b].get(loc)
+            if not pos:
+                continue
+            fe = pos.get(feat)
+            if not fe:
+                continue
+            v = (fe.get("统计") or {}).get(stat)
+            if v is not None:
+                return v
+        return None
+
     def _feature_stats(self, sensor_id: str, metric: str, feature: str = "") -> Optional[Dict]:
         data = self._load_sensor_stats(sensor_id)
         if not data:
@@ -641,7 +711,8 @@ class BridgeData:
         """读取单个传感器（可指定特征）在报告期内的统计值。"""
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
         if not fstats:
-            return None
+            return self._aggregate_sensor_stat(sensor_id, metric, stat,
+                                               feature=feature)
         daily = self._period_daily(fstats, period)
         if daily:
             return self._aggregate_daily(daily, stat, fstats=fstats)
@@ -652,7 +723,21 @@ class BridgeData:
         """单个传感器统计 + 数据来源明细；读不到返回 None。"""
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
         if not fstats:
-            return None
+            v = self._aggregate_sensor_stat(sensor_id, metric, stat,
+                                            feature=feature)
+            if v is None:
+                return None
+            info = self.sensor_map.get(str(sensor_id), {})
+            return {
+                "传感器编号": str(sensor_id),
+                "监测部位": info.get("名称") or info.get("监测部位") or "",
+                "特征": feature or self.metrics.get(metric, {}).get("feature", ""),
+                "统计文件": os.path.join(self.stats_dir, "季度总结",
+                                       "季度统计.json"),
+                "数据来源": "季度/年度聚合统计",
+                "天数": 0,
+                "值": v,
+            }
         info = self.sensor_map.get(str(sensor_id), {})
         daily = self._period_daily(fstats, period)
         if daily:
@@ -1475,6 +1560,23 @@ class BridgeData:
             subs = [d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d))]
             return subs[0] if subs else None
         return None
+
+    def chart_siblings(self, path: str) -> List[str]:
+        """同一图表拆分出的多张图(时间序列图_2.png / _3.png ...)，
+        按序号返回；找不到返回空列表。"""
+        if not path:
+            return []
+        base, ext = os.path.splitext(path)
+        out = []
+        k = 2
+        while True:
+            p = f"{base}_{k}{ext}"
+            if os.path.isfile(p):
+                out.append(p)
+                k += 1
+            else:
+                break
+        return out
 
     def _position_for_sensor(self, sensor_id: str) -> str:
         """从名称对照表反查传感器所在位置名（与合并图库目录同名）。

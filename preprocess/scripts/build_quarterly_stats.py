@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-季度统计值生成(小时级，按监测部位合并多传感器)
+季度/年度统计值生成(小时级，按监测部位合并多传感器)
 ================================================
 
 1) 读取 daily/<传感器>/<特征>/<日期>.csv 的小时级数据；
@@ -10,12 +10,17 @@
    均值(最大值取各传感器最大、最小值取各传感器最小)；
 4) 按小时级数据计算季度统计值。
 
-输出: 统计值/季度统计.json
+输出: 统计值_<期>/<桥名>/季度总结/季度统计.json
+      或 统计值_<期>/<桥名>/季度总结/年度统计.json(--period yearly)
+      季度总结单独一个文件夹，不与逐传感器统计 JSON 混在一起
 结构: {桥名: {监测部位: {特征: {统计: {...}, 传感器: [...], 剔除异常值: n}}}}
 
 用法:
     python build_quarterly_stats.py [--daily-root ...] [--lib-root ...]
+                                    [--bridge 桥名] [--period quarterly|yearly]
                                     [--start ...] [--end ...]
+    年度统计时 --daily-root 传桥根目录(如 D:\preprocess_sensor_data\湘江特)，
+    脚本会汇总其下所有 daily_* 子目录的数据。
 """
 
 import argparse
@@ -33,6 +38,33 @@ import build_chart_library as bcl
 
 DEFAULT_DAILY_ROOT = r"D:\preprocess_sensor_data\daily"
 DEFAULT_LIB_ROOT = "..\\"
+# 传感器对照表(固定产物，不随季度变化)统一放 preprocess/传感器对照/
+DEFAULT_SENSOR_MAP_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "传感器对照")
+
+
+def _derive_period_tag(daily_root="", start="", end=""):
+    """从 daily 目录名(如 daily_2026.1~3)或 --start/--end 推导期次标签。
+    返回如 "2026.1~3"，推导不到返回空串。"""
+    tag = ""
+    base = os.path.basename(os.path.normpath(daily_root or ""))
+    if base.startswith("daily_"):
+        tag = base[len("daily_"):]
+    if tag:
+        return tag
+    try:
+        if start and end:
+            d0 = dt.datetime.strptime(start, "%Y-%m-%d").date()
+            d1 = dt.datetime.strptime(end, "%Y-%m-%d").date()
+            if d0.year == d1.year:
+                return (f"{d0.year}.{d0.month}"
+                        f"~{d1.month}" if d0.month != d1.month
+                        else f"{d0.year}.{d0.month:02d}")
+            return f"{d0.year}.{d0.month}~{d1.year}.{d1.month}"
+    except (ValueError, AttributeError):
+        pass
+    return ""
 
 
 def load_sensor_map(path):
@@ -62,7 +94,7 @@ def discover_pairs(daily_root):
 def clean_sensor_series(hours, means, maxs, mins, feature):
     """单传感器清洗：物理范围 + 尖峰(与图库一致)。返回 (hours, m,x,n, 剔除数)。"""
     vrange = bcl.feature_range(feature)
-    spike_k = (0 if bcl.feature_code(feature) in bcl.DIRECTION_CODES else 5.0)
+    spike_k = (0 if bcl._is_direction_feature(feature) else 5.0)
     means, r1, _, _ = bcl.clean_series_value(
         hours, means, "小时均值", spike_k, hour_level=True, vrange=vrange)
     maxs, r2, _, _ = bcl.clean_series_value(
@@ -101,17 +133,27 @@ def main():
     ap.add_argument("--daily-root", default=DEFAULT_DAILY_ROOT)
     ap.add_argument("--lib-root", default=DEFAULT_LIB_ROOT)
     ap.add_argument("--sensor-map", default="",
-                    help="传感器编号名称.json 路径(默认 统计值/传感器编号名称.json)")
+                    help="传感器编号名称.json 路径(默认 preprocess/传感器对照/"
+                         "传感器编号名称.json)")
     ap.add_argument("--bridge", default="",
                     help="大桥名称(如 赤石)；统计值输出到 <lib-root>/统计值/<桥名>/，"
                          "daily 根目录取 <daily根>/<桥名>/daily。不填按对照表自动推导")
     ap.add_argument("--start", default="")
     ap.add_argument("--end", default="")
     ap.add_argument("--limit-sensors", type=int, default=0)
+    ap.add_argument("--period", choices=["quarterly", "yearly"],
+                    default="quarterly",
+                    help="统计周期: quarterly=季度统计.json(默认)；"
+                         "yearly=年度统计.json(daily-root 传桥根目录, "
+                         "汇总其下所有 daily_* 子目录)")
     args = ap.parse_args()
+    period = args.period
 
-    stats_dir0 = os.path.join(args.lib_root, "统计值")
-    map_path = args.sensor_map or os.path.join(stats_dir0, "传感器编号名称.json")
+    tag = _derive_period_tag(args.daily_root, args.start, args.end)
+    stats_dir0 = (os.path.join(args.lib_root, f"统计值_{tag}")
+                  if tag else os.path.join(args.lib_root, "统计值"))
+    map_path = (args.sensor_map
+                or os.path.join(DEFAULT_SENSOR_MAP_DIR, "传感器编号名称.json"))
     sensor_map = load_sensor_map(map_path)
     print(f"传感器名称对照: {'已加载(' + str(len(sensor_map)) + '个)' if sensor_map else '未找到'}")
     bridge = args.bridge or ""
@@ -120,15 +162,41 @@ def main():
         names = [n for n in names if n]
         if names:
             bridge = max(set(names), key=names.count)
-    stats_dir = os.path.join(args.lib_root, "统计值", bridge) if bridge \
-        else stats_dir0
-    os.makedirs(stats_dir, exist_ok=True)
     if bridge and args.daily_root == DEFAULT_DAILY_ROOT:
-        args.daily_root = os.path.join(
-            os.path.dirname(DEFAULT_DAILY_ROOT.rstrip("/\\")), bridge,
-            os.path.basename(DEFAULT_DAILY_ROOT.rstrip("/\\")))
+        base = os.path.dirname(DEFAULT_DAILY_ROOT.rstrip("/\\"))
+        daily_name = os.path.basename(DEFAULT_DAILY_ROOT.rstrip("/\\"))
+        # 兼容桥名写法差异(湘江特 vs 湘江特大桥 等)，按目录存在性匹配
+        resolved = False
+        for v in bcl._bridge_variants(bridge):
+            cand = os.path.join(base, v, daily_name)
+            if os.path.isdir(cand):
+                bridge = v
+                args.daily_root = cand
+                resolved = True
+                break
+        if not resolved:
+            args.daily_root = os.path.join(base, bridge, daily_name)
+    stats_dir = os.path.join(stats_dir0, bridge) if bridge else stats_dir0
+    os.makedirs(stats_dir, exist_ok=True)
 
-    pairs = discover_pairs(args.daily_root)
+    # 年度统计: daily-root 传桥根目录, 汇总其下所有 daily_* 子目录
+    if period == "yearly":
+        if not os.path.isdir(args.daily_root):
+            print(f"[错误] daily 根目录不存在: {args.daily_root}")
+            sys.exit(1)
+        sub_roots = [os.path.join(args.daily_root, d)
+                     for d in sorted(os.listdir(args.daily_root))
+                     if os.path.isdir(os.path.join(args.daily_root, d))
+                     and (d == "daily" or d.startswith("daily"))]
+        if not sub_roots:
+            sub_roots = [args.daily_root]
+    else:
+        sub_roots = [args.daily_root]
+
+    pairs = set()
+    for sr in sub_roots:
+        pairs.update(discover_pairs(sr))
+    pairs = sorted(pairs)
     if not pairs:
         print(f"[错误] daily 目录为空: {args.daily_root}")
         sys.exit(1)
@@ -147,7 +215,8 @@ def main():
         groups[key]["feature"] = feat
 
     t0 = time.time()
-    result = {"说明": "季度统计值(小时级, 同监测部位多传感器取均值)，"
+    _label = "年度统计值" if period == "yearly" else "季度统计值"
+    result = {"说明": _label + "(小时级, 同监测部位多传感器取均值)，"
                       "统计前已做物理范围过滤与尖峰清洗",
               "生成时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
               "桥": {}}
@@ -156,25 +225,30 @@ def main():
         hour_map = defaultdict(lambda: {"m": [], "x": [], "n": []})
         removed_total = 0
         for sensor in g["sensors"]:
-            fdir = os.path.join(args.daily_root, sensor, feat)
-            (hours, means, maxs, mins, _, _, _, _, _, _) = \
-                bcl.read_hourly_series(fdir)
-            if not hours:
-                continue
-            keep = [i for i, h in enumerate(hours)
-                    if (not args.start or h.date().isoformat() >= args.start)
-                    and (not args.end or h.date().isoformat() <= args.end)]
-            hours = [hours[i] for i in keep]
-            means = [means[i] for i in keep]
-            maxs = [maxs[i] for i in keep]
-            mins = [mins[i] for i in keep]
-            hours, means, maxs, mins, removed = clean_sensor_series(
-                hours, means, maxs, mins, feat)
-            removed_total += removed
-            for h, m, x, n in zip(hours, means, maxs, mins):
-                hour_map[h]["m"].append(m)
-                hour_map[h]["x"].append(x)
-                hour_map[h]["n"].append(n)
+            for sr in sub_roots:
+                fdir = os.path.join(sr, sensor, feat)
+                if not os.path.isdir(fdir):
+                    continue
+                (hours, means, maxs, mins, _, _, _, _, _, _) = \
+                    bcl.read_hourly_series(fdir)
+                if not hours:
+                    continue
+                keep = [i for i, h in enumerate(hours)
+                        if (not args.start
+                            or h.date().isoformat() >= args.start)
+                        and (not args.end
+                             or h.date().isoformat() <= args.end)]
+                hours = [hours[i] for i in keep]
+                means = [means[i] for i in keep]
+                maxs = [maxs[i] for i in keep]
+                mins = [mins[i] for i in keep]
+                hours, means, maxs, mins, removed = clean_sensor_series(
+                    hours, means, maxs, mins, feat)
+                removed_total += removed
+                for h, m, x, n in zip(hours, means, maxs, mins):
+                    hour_map[h]["m"].append(m)
+                    hour_map[h]["x"].append(x)
+                    hour_map[h]["n"].append(n)
         if not hour_map:
             continue
         hours = sorted(hour_map)
@@ -195,7 +269,11 @@ def main():
         if done % 50 == 0:
             print(f"  进度 {done} 组, 用时 {time.time()-t0:.0f}s", flush=True)
 
-    out = os.path.join(stats_dir, "季度统计.json")
+    # 季度/年度总结独立放 "季度总结" 子文件夹，不与其他统计 JSON 混放
+    summary_dir = os.path.join(stats_dir, "季度总结")
+    os.makedirs(summary_dir, exist_ok=True)
+    out_name = "年度统计.json" if period == "yearly" else "季度统计.json"
+    out = os.path.join(summary_dir, out_name)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     print(f"[完成] 共 {done} 个(部位,特征)组合 -> {out}")
