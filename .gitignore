@@ -33,7 +33,8 @@ monitor_credentials.json
 # ---------- 桥数据预处理产物（可在服务器重新生成） ----------
 preprocess/图库*/
 preprocess/统计值*/
-
+inputs/矮寨大桥_车道统计_*
+inputs/赤石大桥_车道统计_*
 preprocess/*.csv
 preprocess/*.log
 preprocess/status.json
