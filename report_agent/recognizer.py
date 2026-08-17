@@ -64,6 +64,7 @@ _FALLBACK_STATIC_TITLES = [
 # 标题关键词 → metric 名
 _TITLE_TO_METRIC = [
     # (匹配词, metric, 中文标签)
+    ("结构温度", "structure_temperature", "结构温度"),
     ("温度", "temperature", "温度"),
     ("湿度", "humidity", "湿度"),
     ("应变", "strain", "应变"),
@@ -74,6 +75,7 @@ _TITLE_TO_METRIC = [
     ("索力", "cable_force", "索力"),
     ("风速", "wind_speed", "风速"),
     ("风向", "wind_dir", "风向"),
+    ("地震", "earthquake_load", "地震"),
     ("位移", "displacement", "位移"),
     ("变位", "displacement", "变位"),
     ("偏位", "displacement", "偏位"),
@@ -98,6 +100,10 @@ _HEADER_TO_STAT = [
     (["最小", "最低"], "min", 0),
     (["绝对最大"], "abs_max", 0),
     (["均方根"], "rms", 0),
+    (["应变差"], "range", 0),          # 最大应变差/με
+    (["剔除温度最大"], "temp_rm_max", 0),   # 剔除温度效应后的应变最大值
+    (["剔除温度最小"], "temp_rm_min", 0),   # 剔除温度效应后的应变最小值
+    (["相关性系数", "相关系数"], "corr", 0), # 应变-温度相关性系数
     (["温差", "差值", "极差"], "range", 0),
     (["标准差", "std"], "std", 0),
     (["中位数", "median"], "median", 0),
@@ -139,9 +145,12 @@ def slugify_label(label: str) -> str:
         return ""
     out = label.strip()
     # 去除单位括号：平均温度/℃ → 平均温度
-    out = re.sub(r"/[\w℃%°/]+$", "", out).strip()
+    # 注意不能用 \w（会匹配中文，把“跨中1/2截面”的 /2截面 误当单位剥掉），
+    # 只剥 ASCII 字母数字 + ℃%°/ 组成的单位后缀
+    out = re.sub(r"/[A-Za-z0-9℃%°/]+$", "", out).strip()
     # 去除纯符号
-    out = re.sub(r"[\s/\\()\[\]{}]+", "_", out)
+    # 位置里的 “/”（如 跨中1/2截面）必须保留，才能与名称对照/图库目录匹配
+    out = re.sub(r"[\s\\()\[\]{}]+", "_", out)
     out = re.sub(r"_+", "_", out).strip("_")
     return out or label.strip()
 
@@ -162,6 +171,12 @@ def stat_from_col_header(header: str) -> str:
     """从列头推断统计类型。"""
     if not header:
         return "value"
+    # 通用“差”规则：最大湿度差/最大温度差/最大应变差/差值/极差 → range。
+    # “标准差/标准偏差” 除外（→ std）。
+    if "标准" in header and ("差" in header or "偏差" in header):
+        return "std"
+    if "差" in header:
+        return "range"
     # 用最长匹配（"绝对最大值" 优先于 "最大"）
     candidates = []
     for keys, stat, _ in _HEADER_TO_STAT:
@@ -231,6 +246,19 @@ CHART_TEXT_RE = re.compile(
 CHART_MULTI_RE = re.compile(
     r"^\s*位移[_＊*]([\d_＊*]+)[_＊*](时程曲线|频率分布)[_＊*]?(\d*)x(\d+)\s*$"
 )
+# “编号(特征)_图型”行（309(xJsd)_时程曲线）：转为位置展开的占位行，
+# 不再生成 chart_sensor_<编号>_<图型>（位置/方位由表格补全）
+CHART_LINE_RE = re.compile(
+    r"^\s*(\d{1,5})\s*\(([^()]+)\)\s*_(时程曲线|频率分布直方图|时间序列图|时间序列|直方图|时程|曲线)\s*$"
+)
+# 特征编码 -> 指标（xJsd/yJsd/zJsd 是振动三向；xJd/yJd 是倾角）
+FEATURE_METRIC = {
+    "xjsd": "vibration", "yjsd": "vibration", "zjsd": "vibration",
+    "xjd": "rotation", "yjd": "rotation",
+    "temp": "temperature", "rh": "humidity",
+    "rsg": "strain", "nd": "deflection", "sl": "cable_force",
+    "wy": "displacement", "lf": "crack",
+}
 
 # 纯图题识别：图题末尾含"图"且包含动态图表关键词
 # 例：交通荷载监测_车辆累计通过数量统计图、梁端转角测点变化时程曲线图
@@ -649,6 +677,76 @@ def _nearest_word(text: str, pos: int, win: int, words: dict, skip=()) -> Option
     return best[1] if best else None
 
 
+# 故障/异常位置判断句：位置+测点 一直为0/数据异常/传感器故障导致 等。
+# 例：“上游炎陵侧边跨跨中截面顶板测点2、汝城侧边跨跨中截面3个测点一直为0℃，
+#     为传感器故障导致。其他测点均在正常范围内，未对桥梁结构造成影响。”
+SUMMARY_FAULT_RE = re.compile(
+    r"[^。；]*?(?:"
+    r"(?:一直|始终|持续|长期|连续)为\s*0(?:\s*[℃%％]?)|"
+    r"由设备设置错误引起|为传感器故障导致|传感器故障|监测数据异常|数据出现异常"
+    r")[^。]*。"
+    r"(?:\s*其他[^。]*?(?:正常|无异常|未对[^。]*影响)[^。]*。)?"
+)
+
+# 判断句需含位置/测点词，避免误伤普通数据描述句
+SUMMARY_POS_RE = re.compile(
+    r"测点|监测部位|位置|截面|索塔|塔冠|塔|墩|跨|梁端|锚固区|箱梁|桥面|"
+    r"主缆|加劲梁|索鞍|塔底|塔顶"
+)
+
+
+def _metrics_in_text(text: str, skip=("load", "vehicle_count")) -> list:
+    """按出现顺序返回文本中的指标键（长词优先；结构温度>温度、支座位移>位移）。
+    避免“结构温度最高为…；温度最低为…”里裸“温度”被误判成环境温度。"""
+    kws = sorted(((k, v) for k, v in METRIC_WORDS.items() if v not in skip),
+                 key=lambda kv: -len(kv[0]))
+    pat = re.compile("|".join(re.escape(k) for k, _ in kws))
+    seen = []
+    for m in pat.finditer(str(text)):
+        v = next((v for k, v in kws if k == m.group(0)), None)
+        if v and v not in seen:
+            seen.append(v)
+    if "structure_temperature" in seen and "temperature" in seen:
+        seen.remove("temperature")
+    if "bearing_displacement" in seen and "displacement" in seen:
+        seen.remove("displacement")
+    return seen
+
+
+def detect_summary_placeholders(texts_all: list) -> dict:
+    """识别“…位置一直为0/数据异常…为传感器故障导致…”总结句，
+    按该句附近（前 60 字窗口）的特征词生成 {{summary.<metric>}} 占位符。
+    一段同时总结多个特征（如 挠度+结构温度）时，按特征各生成一个占位符：
+    第一个原位替换整句，其余紧跟其后插入。
+    返回 {段落索引: [(start, end, marker), ...]}（坐标基于原文）。"""
+    out = {}
+    for i, t in enumerate(texts_all or []):
+        t = str(t)
+        if not t:
+            continue
+        for m in SUMMARY_FAULT_RE.finditer(t):
+            seg = m.group(0)
+            if not SUMMARY_POS_RE.search(seg):
+                continue
+            window = t[max(0, m.start() - 120):m.end()]
+            metrics = _metrics_in_text(window)
+            if not metrics:
+                metrics = _metrics_in_text(t)
+            if not metrics:
+                continue
+            spans = []
+            for k, metric in enumerate(metrics):
+                if k == 0:
+                    spans.append((m.start(), m.end(),
+                                  f"{{{{summary.{metric}}}}}"))
+                else:
+                    # 其余特征占位符紧跟整句之后插入
+                    spans.append((m.end(), m.end(),
+                                  f"{{{{summary.{metric}}}}}"))
+            out.setdefault(i, []).extend(spans)
+    return out
+
+
 def _extract_tags(text: str, base: dict) -> list:
     """提取 [A-MAX] / A-MAX-LOC 等原文占位标记。"""
     out = []
@@ -715,6 +813,21 @@ def _classify_tag(tag: dict, texts: list) -> None:
             sentence = clause
     best_metric = _nearest_word(sentence, len(sentence), 60, METRIC_WORDS,
                                 skip={"load", "vehicle_count"})
+    # F-MAX / F-MIN：剔除温度效应后的应变最大/最小差值（残差），
+    # 与普通 E-MAX 不同，映射到 temp_rm_range / temp_rm_min；
+    # 对应位置标记取“差值”本身的最值位置（temp_rm_range.loc），
+    # 而不是剔除温度残差最大值的传感器位置（temp_rm_max.loc）。
+    if re.search(r"^F-(MAX|MIN)(-LOC)?$", token):
+        if best_metric == "strain":
+            if token == "F-MAX-LOC":
+                tag["placeholder"] = "{{stats.strain.temp_rm_range.loc}}"
+            elif token == "F-MAX":
+                tag["placeholder"] = "{{stats.strain.temp_rm_range}}"
+            elif token == "F-MIN-LOC":
+                tag["placeholder"] = "{{stats.strain.temp_rm_min.loc}}"
+            else:
+                tag["placeholder"] = "{{stats.strain.temp_rm_min}}"
+            return
     best_stat = _nearest_word(sentence, len(sentence), stat_win, STAT_WORDS)
     TAG_METRICS = {
         "temperature", "humidity", "structure_temperature", "wind_speed",
@@ -722,8 +835,15 @@ def _classify_tag(tag: dict, texts: list) -> None:
         "cable_force", "crack", "earthquake_load", "vibration",
     }
     if best_metric in TAG_METRICS and best_stat:
+        # 方向后缀：如 [G-MAX-X] / [G-MAX-Y] / [G-MAX-Z]（GNSS 三方向）、
+        # [I-MAX-X] 等，生成 direction 后缀，运行时按方向取对应特征
+        direction = ""
+        dm = re.search(r"-(X|Y|Z)(?:-LOC)?$", token)
+        if dm:
+            direction = "_" + dm.group(1).lower()
         suffix = ".loc" if is_loc else ""
-        tag["placeholder"] = f"{{{{stats.{best_metric}.{best_stat}{suffix}}}}}"
+        tag["placeholder"] = (
+            f"{{{{stats.{best_metric}{direction}.{best_stat}{suffix}}}}}")
 
 
 # ---------------------------------------------------------------------------
@@ -915,6 +1035,29 @@ def parse_docx(path: str) -> dict:
     for i, t in enumerate(paragraphs):
         t = t.strip()
         if not t or i in seen_para:
+            continue
+        m3 = CHART_LINE_RE.match(t)
+        if m3:
+            # “309(xJsd)_时程曲线”：传感器编号行。不再生成 chart_sensor_<编号>，
+            # 改为 explicit_suffix 占位行，位置/方位由下方表格补全（上游/下游等）。
+            feature_raw = m3.group(2).strip()
+            kind = ("histogram" if ("直方" in m3.group(3) or "频率" in m3.group(3))
+                    else "time_series")
+            chart_id = "trend" if kind == "time_series" else "histogram"
+            metric_en = (FEATURE_METRIC.get(_norm(feature_raw), "")
+                         or _metric_from_chart_text(t)
+                         or "chart")
+            chart_texts.append({
+                "paragraph": i,
+                "kind": kind,
+                "chart_id": chart_id,
+                "metric": metric_en,
+                "text": t,
+                "source": "explicit_suffix",
+                "sensor_ids": m3.group(1),
+                "feature": feature_raw,
+            })
+            seen_para.add(i)
             continue
         m = CHART_TEXT_RE.search(t)
         if m:
@@ -1241,8 +1384,14 @@ def _locate_value(value: str, snippet: str, texts: list) -> Optional[tuple]:
     return None
 
 
-def recognize(path: str, llm_cfg: Optional[dict] = None) -> dict:
+def recognize(path: str, llm_cfg: Optional[dict] = None,
+              sensor_map: Optional[dict] = None) -> dict:
     """解析报告并给图片/数字打上 replace / keep / review 结论。
+
+    sensor_map: 传感器对照表 {编号: {监测部位/名称/类别/特征编码...}}，
+        用于“编号(特征)_图型”行反查监测部位，生成位置化图表占位符
+        （如 vibration_随州侧边跨跨中截面上游_trend_1），
+        避免用传感器编号作占位符导致运行时难以匹配图库。
 
     两轮筛选流程：
       第一轮 — 关键词打分：classify_number / classify_image 基于关键词和文本
@@ -1472,6 +1621,7 @@ def recognize(path: str, llm_cfg: Optional[dict] = None) -> dict:
         "chart_texts": parsed.get("chart_texts", []),
         "text_replacements": llm_result.get("text_replacements", []),
         "texts": parsed.get("texts", []),
+        "sensor_map": sensor_map or {},
     }
 
 
@@ -1680,18 +1830,32 @@ def _chart_block_locations(paragraph, cell_ref_paras: Dict[int, tuple],
                 if composed not in out:
                     out.append(composed)
             return out
+    # 节标题方位词补全：标题带“上游侧/下游侧”等方位，而表格位置未带时，
+    # 把方位词拼进位置（湘江：3.1.1.1上游侧箱梁内环境温度 + 表“随州侧边跨跨中截面”
+    # → “随州侧边跨跨中截面上游”），否则运行时图库/名称对照匹配不到。
+    if heading_paras and texts:
+        heading_dir = ""
+        for hp in reversed(heading_paras):
+            if hp < paragraph:
+                ht = str(texts[hp])
+                # 只取最近的节标题；若它本身没有方位词，就不继续往回找
+                heading_dir = next((w for w in ("上游", "下游") if w in ht), "")
+                break
+        if heading_dir:
+            uniq = [r if heading_dir in r else r + heading_dir for r in uniq]
     return uniq
 
 
 def _position_from_title(title: str) -> str:
     """从节标题/表标题提取监测位置（去掉章节号、指标词、监测/统计等）。"""
     # 只剥掉章节号（如 3.3.6.1），不能吃掉墩号数字（如 “2#墩…” 开头的 2）
-    t = re.sub(r"^\d+(?:\.\d+){0,3}(?!\s*#)\s*", "", str(title or ""))
+    t = re.sub(r"^\d+(?:\.\d+){0,3}(?![.\d#])\s*", "", str(title or ""))
     for w in ("结构应变监测", "环境湿度监测", "环境温度监测", "结构温度监测",
               "挠度监测", "位移监测", "倾角监测", "裂缝监测", "索力监测",
               "风速风向监测", "风速监测", "支座位移监测", "交通监测",
               "空间变位监测", "空间变位", "变位监测", "变位",
               "地震监测", "振动监测", "应力监测", "承台监测",
+              "振动的", "位移的", "温度的", "湿度的", "挠度的", "应变的",
               "时程曲线图", "频率分布直方图", "相关性散点图", "散点图",
               "曲线图", "直方图", "如下图所示", "时程",
               "结构应变", "结构温度", "环境温度", "环境湿度",
@@ -1703,6 +1867,32 @@ def _position_from_title(title: str) -> str:
     t = t.rstrip("表")  # 表标题末尾的“表”字（如 …监测统计表）
     t = t.strip("、，,和及")
     return t if len(t) >= 2 else ""
+
+
+def _cell_position_from_title(title: str) -> str:
+    """从表格标题提取 cell 占位符的位置基座（比 _position_from_title 更宽，
+    保留“上游/下游/左/右”等方位，供行标签拼接）。
+
+    例：“上游位置环境温度监测统计” -> “上游”
+        “上游随州侧边跨跨中箱梁结构温度监测统计” -> “上游随州侧边跨跨中箱梁”
+        “随州侧边跨跨中截面环境温度监测统计” -> “随州侧边跨跨中截面”
+    """
+    t = re.sub(r"^\d+(?:\.\d+){0,3}(?![.\d#])\s*", "", str(title or ""))
+    for w in ("结构温度监测", "环境温度监测", "环境湿度监测", "应变监测",
+              "挠度监测", "位移监测", "倾角监测", "振动监测", "地震监测",
+              "索力监测", "裂缝监测", "风速监测", "风向监测",
+              "支座位移监测", "结构应变监测", "结构振动监测",
+              "时程曲线图", "频率分布直方图", "监测统计", "监测数据",
+              "监测结果", "统计结果", "如下表", "监测", "统计",
+              "结果", "数据分析", "平均温度", "最高温度", "最低温度",
+              "最大温差", "平均应变", "最大应变", "最小应变",
+              "最大应变差", "平均", "最高", "最低", "最大", "最小",
+              "差值", "剔除温度", "相关性系数", "均方根", "标准差"):
+        t = t.replace(w, "")
+    t = re.sub(r"[\s：:。]+", "", t)
+    t = t.rstrip("表")
+    t = t.strip("、，,和及")
+    return t if len(t) >= 1 else ""
 
 
 def _norm(text: str) -> str:
@@ -1975,41 +2165,99 @@ def _special_strain_positions(texts, pidx):
 
 
 def _flatten_omml(p_el) -> None:
-    """把段落里的 OMML 数学公式（如 m/s2）转成纯文本，删掉公式节点。
+    """把段落里的 OMML 数学公式（如 m/s2）转成纯文本并原位替换。
 
     python-docx 的 paragraph.text 不含 OMML；模板替换 run 时公式节点可能悬空，
     导致单位渲染到段落外面（如 “振动绝对最大值为[I-MAX]。” + 孤立的 m/s2）。
-    这里把公式文本并入句末（句号前），并删除公式节点。
+
+    - 原位替换：公式在句中什么位置，单位文本就留在什么位置
+      （如 “绝对最大值为[D-MAX]m/s2，…” 单位紧跟数值，不跑到句末）。
+    - 表头形如 “绝对最大值（）” + m/s2 时，把单位塞回空括号内：
+      “绝对最大值（m/s²）”。
+    - 上标统一转 Unicode 上标（m/s2 -> m/s²），保持 Word 公式的观感。
     """
-    ommls = p_el.findall(".//{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath")
+    M = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    ommls = [c for c in p_el if c.tag == M + "oMath"]
+    for omp in p_el.findall(M + "oMathPara"):
+        om = omp.find(M + "oMath")
+        if om is not None and om not in ommls:
+            ommls.append(om)
     if not ommls:
         return
-    unit = "".join((t.text or "") for om in ommls
-                   for t in om.iter("{http://schemas.openxmlformats.org/officeDocument/2006/math}t"))
-    for om in ommls:
-        parent = om.getparent()
-        if parent is not None:
-            parent.remove(om)
-    if not unit:
-        return
     from docx.oxml import OxmlElement as _OE
+    import copy as _copy
+
+    for om in ommls:
+        unit = "".join((t.text or "") for t in om.iter(M + "t"))
+        parent = om.getparent()
+        if parent is None:
+            continue
+        if not unit:
+            parent.remove(om)
+            continue
+        unit_txt = _pretty_unit_text(unit)
+        prev = om.getprevious()
+        # 表头 “绝对最大值（）” + 公式：单位塞回空括号内
+        if prev is not None:
+            prev_t = prev.find(W + "t")
+            if prev_t is not None and prev_t.text:
+                m = re.search(r"([（(])\s*([)）])\s*$", prev_t.text)
+                if m:
+                    prev_t.text = prev_t.text[:m.start()] + m.group(1) + unit_txt + m.group(2)
+                    parent.remove(om)
+                    continue
+        r = _OE("w:r")
+        prev_rpr = prev.find(W + "rPr") if prev is not None else None
+        if prev_rpr is not None:
+            r.append(_copy.deepcopy(prev_rpr))
+        t = _OE("w:t")
+        t.text = unit_txt
+        r.append(t)
+        parent.replace(om, r)
+
+
+def _pretty_unit_text(unit: str) -> str:
+    """单位里的数字转 Unicode 上标：m/s2 -> m/s²、m/s^2 -> m/s²。"""
+    sup = {"0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+           "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹"}
+    u = str(unit or "").replace("^", "")
+    return re.sub(r"(?<=[A-Za-z0-9/·])-?(\d+)",
+                  lambda m: "".join(sup.get(c, c) for c in m.group(1)), u)
+
+
+def _collect_unit_inserts(p) -> List[Tuple[int, str]]:
+    """返回段落里 oMath 单位在【无单位文本】中的插入偏移与美化文本。
+
+    flatten 会把 oMath 转成普通 run，使原文坐标整体后移；记录每个公式在
+    原文本中的偏移，供主路径的 num/tag/cell 位置编辑统一平移修正。
+    """
     W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    runs = p_el.findall(W + "r")
-    if not runs:
-        return
-    t_el = runs[-1].find(W + "t")
-    if t_el is None:
-        t_el = _OE("w:t")
-        runs[-1].append(t_el)
-    txt = t_el.text or ""
-    if txt.endswith("。"):
-        t_el.text = txt[:-1] + unit + "。"
-    else:
-        t_el.text = txt + unit
+    M = "{http://schemas.openxmlformats.org/officeDocument/2006/math}"
+    out = []
+    off = 0
+    for child in p._p:
+        tag = child.tag
+        if tag == W + "r":
+            t = child.find(W + "t")
+            if t is not None and t.text:
+                off += len(t.text)
+        elif tag == M + "oMath":
+            unit = "".join((x.text or "") for x in child.iter(M + "t"))
+            if unit:
+                out.append((off, _pretty_unit_text(unit)))
+        elif tag == M + "oMathPara":
+            om = child.find(M + "oMath")
+            if om is not None:
+                unit = "".join((x.text or "") for x in om.iter(M + "t"))
+                if unit:
+                    out.append((off, _pretty_unit_text(unit)))
+    return out
 
 
 def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
-                  analysis: Optional[dict] = None) -> dict:
+                  analysis: Optional[dict] = None,
+                  sensor_map: Optional[dict] = None) -> dict:
     """把识别出的动态项改写为占位符，生成标注草稿（仅 DOCX）。
 
     - 动态数字 -> {{stats.<指标>.<统计>}}（无法映射时 {{data.N}}）
@@ -2020,6 +2268,8 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
 
     llm_cfg: LLM 配置字典，传入则启用 LLM 二次筛选
     analysis: 可传入已计算好的识别结果，避免重复调用 LLM（内部会重新 recognize）
+    sensor_map: 传感器对照表 {编号: {...}}，用于“编号(特征)_图型”行反查
+        监测部位并生成位置化图表占位符（避免 chart_sensor_<编号>_<图型>）。
     """
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -2031,7 +2281,9 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     from .report_builder import iter_block_items
 
     if analysis is None:
-        analysis = recognize(src, llm_cfg=llm_cfg)
+        analysis = recognize(src, llm_cfg=llm_cfg, sensor_map=sensor_map)
+    elif sensor_map and not analysis.get("sensor_map"):
+        analysis["sensor_map"] = sensor_map
     doc = Document(src)
 
     num_targets = {}   # paragraph index -> {pos: marker}
@@ -2039,6 +2291,20 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     data_counter = [0]
     data_values = {}   # data.N -> original value (for fallback resolution)
     texts_all = analysis.get("texts", []) or []
+
+    # 故障/异常位置判断句 -> {{summary.<metric>}} 占位符
+    summary_targets = detect_summary_placeholders(texts_all)
+    if summary_targets:
+        analysis["summary_placeholders"] = [
+            {
+                "placeholder": marker,
+                "metric": marker.strip("{}").split(".", 1)[1],
+                "paragraph": idx,
+                "snippet": str(texts_all[idx])[max(0, s - 20):e + 20],
+            }
+            for idx, spans in summary_targets.items()
+            for s, e, marker in spans
+        ]
 
     def _canon_placeholder(raw: str) -> str:
         """把 LLM/启发式给出的 stats 键规范成运行时指标键。"""
@@ -2271,6 +2537,11 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         and len(str(t).strip()) <= 60
     ]
 
+    # “编号(特征)_图型”行已由 parse_docx 转为 explicit_suffix，
+    # 由 _expand_chart_blocks 用下方表格的监测部位（上游/下游等）展开成位置化占位符，
+    # 不再生成 chart_sensor_<编号>_<图型>。
+    cleared_sensor_lines = set()
+
     # 图表文本占位行按“监测部位 × 图型”展开（带位置），并更新 chart_texts 条目
     chart_block_targets, chart_block_inserts, chart_block_entries, chart_block_removed = \
         _expand_chart_blocks(analysis, cell_ref_paras, heading_paras)
@@ -2310,10 +2581,70 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
                 column = column_from_map
             else:
                 column = row_slug or column_from_map or f"unknown_{metric}_r{row}"
+            # 结合表格标题/上下文补全位置：
+            # - 行标签是“顶板测点1/底板测点3”等部位词时，从标题取位置基座拼接
+            #   （如 标题“上游随州侧边跨跨中箱梁结构温度监测统计”+“顶板测点1”
+            #     -> column=“上游随州侧边跨跨中箱梁顶板测点1”）
+            # - 行标签已是完整位置（含 截面/箱梁/墩/跨 等）时保留，仅在
+            #   标题带“上游/下游/左/右”方位且行标签缺方位时补方位。
+            table_title_ctx = str(ct.get("table_title") or "")
+            if row_label and not column_from_map:
+                base_pos = _cell_position_from_title(table_title_ctx)
+                rn = _norm(row_label)
+                loc_words = ("截面", "箱梁", "墩", "跨", "断面", "梁段",
+                             "索塔", "塔", "锚固", "桥面")
+                has_loc = any(w in rn for w in loc_words)
+                if not has_loc:
+                    # 行标签只是“顶板测点1/底板测点3/测点2”时拼位置基座
+                    if base_pos:
+                        column = base_pos + row_label
+                    else:
+                        # 表格标题太泛（如“结构温度监测统计”）时，
+                        # 从上方最近的小节标题继承位置
+                        # （如 3.2.1.5上游湘潭侧中跨1/4箱梁结构温度监测）
+                        para_idx = ct.get("paragraph")
+                        if isinstance(para_idx, int):
+                            _texts = analysis.get("texts", []) or []
+                            # 先定位表格标题段（数据 cell 段落可能在表格内部，
+                            # 直接向上扫不到节标题），再向上找最近的小节标题
+                            start = para_idx - 1
+                            if table_title_ctx:
+                                for pi in range(para_idx - 1,
+                                                max(para_idx - 40, -1), -1):
+                                    _tt = str(_texts[pi]) if 0 <= pi < len(_texts) else ""
+                                    if _tt.strip() == table_title_ctx.strip():
+                                        start = pi - 1
+                                        break
+                            for pi in range(start,
+                                            max(start - 30, -1), -1):
+                                _t = str(_texts[pi]) if 0 <= pi < len(_texts) else ""
+                                if not re.match(r"^\d+(?:\.\d+){0,3}",
+                                                _t.strip()):
+                                    continue
+                                _bp = _cell_position_from_title(_t)
+                                if _bp:
+                                    column = _bp + row_label
+                                    break
+                else:
+                    # 行标签已有位置，标题带方位且行标签缺方位时补方位
+                    for side in ("上游", "下游", "左侧", "右侧", "左", "右"):
+                        if side in _norm(table_title_ctx) and side not in rn:
+                            column = side + row_label
+                            break
             # 同一表格同一位置的多个测点行：占位符统一加 #N 行号索引
-            # （如 {{cell.crack.5#塔底部.avg#1}} / ...avg#2），运行时按 #N 精确取对应传感器。
-            # 按“行号”计数——同一行不同列（avg/max/min/range）共用同一个行序号。
-            seq_key = (metric, table_letter, ct.get("table_title", ""), row_label)
+            # （如 ...顶板测点1.avg#1 / ...顶板测点2.avg#2），运行时按 #N
+            # 精确取对应传感器。
+            # 按“表格 + 位置基座”分组计数：位置基座去掉“测点N”后缀，
+            # 让 顶板测点1/顶板测点2/底板测点1... 在同一位置组内按行号递增；
+            # 不能含完整 column/row_label，否则每行都从 #1 开始，
+            # 同一位置的多个测点会取到同一个传感器。
+            # 位置基座保留“顶板/底板/腹板/翼板”等部位词（顶板与底板是
+            # 表格映射里的不同位置组，row_index 须各自从 0 开始），
+            # 只去掉“测点N”后缀
+            col_base = re.sub(r"测点\s*\d+$", "", column).strip(" 、，,和及") \
+                or column
+            seq_key = (metric, table_letter, ct.get("table_title", ""),
+                       col_base)
             rows = cell_seq_rows.setdefault(seq_key, set())
             rows.add(row)
             seq = len(rows)
@@ -2355,40 +2686,6 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
             ct["_unique_chart_id"] = unique_cid  # 供运行时 agent 引用
             if loc:
                 ct["location"] = loc
-
-    # 扫描“编号(特征)_图型”行（在 texts 里查找，替换为精确图表占位符）。
-    # 同一传感器 X/Y/Z 三向重复行（304(xJsd)/304(yJsd)/304(zJsd)_时程曲线）
-    # 只保留第一个占位符，其余清空——三向是同一条时程曲线的三个方向，不是三张图。
-    last_sensor_line = {}    # (sensor_id, kind) -> 上一次出现的段落
-    cleared_sensor_lines = set()
-    for pidx, t in enumerate(analysis.get("texts", []) or []):
-        m = CHART_LINE_RE.match(str(t))
-        if not m:
-            continue
-        sensor_id, feature_raw, chart_word = m.group(1), m.group(2), m.group(3)
-        kind = "histogram" if "直方图" in chart_word or "直方" in chart_word else "trend"
-        skey = (sensor_id, kind)
-        last = last_sensor_line.get(skey)
-        if last is not None and pidx - last <= 3:
-            cleared_sensor_lines.add(pidx)
-            last_sensor_line[skey] = pidx
-            continue
-        last_sensor_line[skey] = pidx
-        cid = f"chart_sensor_{sensor_id}_{kind}"
-        chart_text_targets[pidx] = f"{{{{chart.{cid}}}}}"
-        analysis.setdefault("chart_texts", []).append({
-            "paragraph": pidx,
-            "kind": "histogram" if kind == "histogram" else "time_series",
-            "chart_id": "trend" if kind == "trend" else "histogram",
-            "text": str(t),
-            "source": "sensor_line",
-            "_unique_chart_id": cid,
-            "sensor_id": sensor_id,
-            "feature": feature_raw,
-        })
-        chart_line_entries.append(cid)
-    if chart_line_entries:
-        log.info("识别 %d 行“编号(特征)_图型”精确图表占位符", len(chart_line_entries))
 
     # 特殊应变行：特殊应变传感器_修正后时程曲线_2x2 / _频率分布_2x2
     # -> 4#、5#墩底部应变图占位符（图库有 4#/5#墩底部 YB(rsg) 合并图）
@@ -2458,6 +2755,7 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     replaced_texts = 0
     replaced_chart_texts = 0
     replaced_cell_refs = 0
+    replaced_summaries = 0
     pending_inserts = []   # [(anchor 段落元素, [marker, ...])] 遍历后统一插入
 
     def _clean_chart_para(para) -> None:
@@ -2470,29 +2768,32 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     def process_paragraph(p, idx):
-        nonlocal replaced_numbers, skipped_numbers, replaced_images, replaced_texts, replaced_chart_texts, replaced_cell_refs
-        # OMML 数学公式（如 “m/s2”）python-docx 读不到、替换 run 后还会悬空渲染：
-        # 转成纯文本并塞回句末，避免单位“跑到段落外面”
-        _flatten_omml(p._p)
+        nonlocal replaced_numbers, skipped_numbers, replaced_images, replaced_texts, replaced_chart_texts, replaced_cell_refs, replaced_summaries
         if idx in cleared_sensor_lines:
+            # 清空整段前先转换公式节点，避免 oMath 悬空渲染
+            _flatten_omml(p._p)
             _clear_paragraph_text(p)
             return
         # 图表块展开后多余的占位行/图题段：清空
         if idx in chart_block_removed:
+            _flatten_omml(p._p)
             _clear_paragraph_text(p)
             return
         # bare_caption 图题段：原 caption 文本会被 build_report 的 auto-caption 取代，
         # 清空段落文本，避免重复 caption
         if idx in bare_caption_paras:
+            _flatten_omml(p._p)
             _clear_paragraph_text(p)
             return
         # 车辆累计表单元格：整段数字 → {{cell.vehicle_count.车道X.数值#N}}
         if idx in vehicle_cell_targets:
+            _flatten_omml(p._p)
             _replace_whole_paragraph(p, vehicle_cell_targets[idx])
             replaced_cell_refs += 1
             return
         # 图表文本占位优先（整段替换为 {{chart.<id>}}）
         if idx in chart_text_targets:
+            _flatten_omml(p._p)
             _replace_whole_paragraph(p, chart_text_targets[idx])
             _clean_chart_para(p)
             replaced_chart_texts += 1
@@ -2505,11 +2806,31 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
             return
         # 数字 / 原文标记 / 表格单元格引用：合并成一次位置替换，
         # 避免同一段多次替换后位置错位（坐标均基于原文）
+        # OMML 公式（如 m/s2）flatten 成普通 run 会让原文坐标后移：
+        # 先记录公式偏移，flatten 后统一平移 num/tag/cell 的位置。
+        unit_inserts = _collect_unit_inserts(p)
+        _flatten_omml(p._p)
         num_t = num_targets.get(idx, {})
         tag_t = tag_targets.get(idx, {})
         cell_t = cell_ref_targets.get(idx, {})
-        if num_t or tag_t or cell_t:
+        summary_t = summary_targets.get(idx, [])
+        if num_t or tag_t or cell_t or summary_t:
             full = "".join(r.text for r in p.runs)
+            if unit_inserts:
+                # 起始坐标：字符本身在单位之后则平移；结束边界：单位恰好在
+                # 边界处（如 “[D-MAX]m/s²” 的 end=37）时边界在单位之前，不平移。
+                def _shift_start(pos):
+                    return pos + sum(len(u) for off, u in unit_inserts if off <= pos)
+
+                def _shift_end(pos):
+                    return pos + sum(len(u) for off, u in unit_inserts if off < pos)
+                num_t = {_shift_start(k): v for k, v in num_t.items()}
+                tag_t = {_shift_start(k): (_shift_end(e), m) for k, (e, m) in tag_t.items()}
+                cell_t = {_shift_start(k): v for k, v in cell_t.items()}
+                summary_t = [(_shift_start(s), _shift_end(e), m)
+                             for s, e, m in summary_t]
+                if minus_positions.get(idx):
+                    minus_positions[idx] = {_shift_start(k) for k in minus_positions[idx]}
             edits = []
             if num_t:
                 num_t = _filter_location_numbers(full, num_t)
@@ -2531,6 +2852,12 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
                     if m.start() in cell_t:
                         edits.append((m.start(), m.end(), cell_t[m.start()]))
                         replaced_cell_refs += 1
+            # 故障/异常位置判断句整体替换为 {{summary.<metric>}}
+            # （区间起点早于句内数字，_apply_position_edits 会先应用并覆盖内部编辑）
+            for s, e, marker in summary_t:
+                if 0 <= s < e <= len(full):
+                    edits.append((s, e, marker))
+                    replaced_summaries += 1
             _apply_position_edits(p, edits, full)
         if img_targets.get(idx):
             _replace_image_paragraph(p, img_targets[idx][0][1])
@@ -2587,6 +2914,7 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         "replaced_texts": replaced_texts,
         "replaced_chart_texts": replaced_chart_texts,
         "replaced_cell_refs": replaced_cell_refs,
+        "replaced_summaries": replaced_summaries,
         "llm_summary": analysis["summary"].get("llm", {}),
     }
 
@@ -2736,17 +3064,23 @@ def _apply_position_edits(p, edits: list, full: str) -> None:
     """
     if not edits:
         return
-    edits = sorted(edits, key=lambda e: -e[0])
+    # 按起点升序处理：低起点（通常区间更大，如 单元格引用 I(2,2)）先应用，
+    # 内部数字等重叠编辑被跳过
+    edits = sorted(edits, key=lambda e: e[0])
     pieces = []
-    last = len(full)
+    last = 0
+    applied = []   # 已应用的区间 (start, end)，用于跳过重叠编辑
     for s, e, rep in edits:
-        if s >= last:
-            continue  # 与已处理区间重叠（理论上不会）
-        pieces.append(full[e:last])
+        # 与已应用区间重叠时跳过（如 I(2,2) 内部的数字 2、2 应被整体替换覆盖）
+        if any(s < ae and e > as_ for as_, ae in applied):
+            continue
+        pieces.append(full[last:s])
         pieces.append(rep)
+        applied.append((s, e))
         last = s
-    pieces.append(full[:last])
-    new_text = "".join(reversed(pieces))
+        last = e
+    pieces.append(full[last:])
+    new_text = "".join(pieces)
     # 源报告里不成对的方括号（如 “[D-MAX ，…对应测点位置为[D-MAX-LOC]。]”）
     # 替换后留下的孤立 “[{{” / “}}]” 一并清掉
     new_text = new_text.replace("[{{", "{{").replace("}}]", "}}")

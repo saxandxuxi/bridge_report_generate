@@ -36,7 +36,8 @@ def main() -> int:
     )
 
     parser = argparse.ArgumentParser(description="数据分析报告智能体")
-    parser.add_argument("--config", default=None, help="配置文件路径（默认 config.json）")
+    parser.add_argument("--config", default=None,
+                        help="配置文件路径（默认 config/config.json）")
     parser.add_argument("--bridge", default=None,
                         help="桥梁 ID（从 bridges/registry.json 解析配置文件）")
     parser.add_argument("--list-bridges", action="store_true",
@@ -46,6 +47,8 @@ def main() -> int:
     parser.add_argument("--date", default=None, help="报告结束日期 YYYY-MM-DD（默认今天）")
     parser.add_argument("--engine", choices=["auto", "matlab", "python"], default=None,
                         help="图表引擎：auto 自动选择，matlab 强制 MATLAB，python 强制 matplotlib")
+    parser.add_argument("--template", default=None,
+                        help="本次运行使用的模板 .docx 路径(不修改配置文件)")
     parser.add_argument("--inspect-template", action="store_true",
                         help="只识别模板中的动态内容并输出分析 JSON，不生成报告")
     args = parser.parse_args()
@@ -92,6 +95,7 @@ def main() -> int:
             mode=args.mode,
             report_date=args.date,
             engine=args.engine,
+            template_override=args.template,
         )
         cfg = load_config(args.config)
         save_summary(summary, cfg["output_dir"])

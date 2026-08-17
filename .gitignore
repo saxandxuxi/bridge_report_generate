@@ -1,5 +1,6 @@
 # ---------- Python / IDE / 系统 ----------
 .venv/
+.venv_web/
 __pycache__/
 *.pyc
 .idea/
@@ -16,13 +17,18 @@ Desktop.ini
 .env.*
 !.env.example
 
+# ---------- 根目录临时脚本（_sim*.py / _corr*.py / _xjr*.py 等） ----------
+/_*.py
+
 # ---------- 日志 ----------
 *.log
 
 # ---------- 运行时产物（不推送到服务器） ----------
 outputs/
+debug/
 data/*.csv
 !data/.gitkeep
+monitor_credentials.json
 
 # ---------- 桥数据预处理产物（可在服务器重新生成） ----------
 preprocess/图库*/

@@ -9,7 +9,9 @@
        - 测点映射:   结构应变/振动监测表的 断面位置 -> 测点N -> 编号
        - 表格映射:   梁端支座位移 / 墩顶支座倾角 / 裂缝 / 温湿度 表映射
 
-特征编码来自 Q1 统计值(统计值/<编号>.json)，取不到时按类别推断。
+特征编码仅作参考(来自 Q1 统计值或按类别推断)，实际特征以
+daily/<传感器编号>/ 下的特征目录为准，由 build_chart_library 生成
+图库/统计库时读取。
 
 用法:
     python parse_sensor_map.py [docx路径] [输出json路径] [统计值目录]
@@ -147,6 +149,10 @@ def parse_docx(path):
                                  if c != location and c not in
                                  (location, "上游", "下游", "左幅", "右幅"))
                 name = location or (current_bridge + "-" + current_category)
+                # "测点1/测点2..."只是同一位置不同传感器的索引，不属于位置名称；
+                # 去掉结尾的测点编号后，同一位置的多传感器归为一组，
+                # 测点序号由 enrich_entries 按组内顺序重新编号(测点1、测点2...)
+                name = re.sub(r"测点\d+$", "", name)
                 # 方位(位置列: 上游/下游/左/右/顶/底 等)拼进名称/监测部位，
                 # 避免同一监测部位多个方位合并成一个位置(子图过多)；
                 # 已含该方位后缀(如"4#墩...左侧")时不再重复追加
@@ -211,15 +217,18 @@ def build_name_map(sensors):
     return bridges
 
 
-def enrich_entries(name_map, sensors, data_feats):
-    """给每个条目补 特征编码(实际数据特征) 和 测点(应变/振动)。"""
+def enrich_entries(name_map, sensors, data_feats, feat_ref=None):
+    """给每个条目补 特征编码(仅作参考，实际以 daily 为准) 和 测点(应变/振动)。
+    feat_ref: {编号: 特征编码} 合并补充模式下保留旧传感器已有的参考编码。"""
     for name, entries in name_map.items():
         cat_count = {}   # 同一名称下按类别分别计数，避免跨类别错位
         for e in entries:
             info = sensors.get(e["编号"], {})
             cat = info.get("类别", "")
-            e["特征编码"] = (data_feats.get(e["编号"])
-                             or expected_features(info))
+            feats = data_feats.get(e["编号"])
+            if not feats and feat_ref:
+                feats = feat_ref.get(e["编号"])
+            e["特征编码"] = feats or expected_features(info)
             if cat in ("应变", "振动"):
                 cat_count[cat] = cat_count.get(cat, 0) + 1
                 e["测点"] = f"测点{cat_count[cat]}"
@@ -317,20 +326,22 @@ def build_table_map(sensors, bridge_full, data_feats):
     return tm
 
 
-def write_name_map_files(bridges, sensors, data_feats, out_dir):
+def write_name_map_files(bridges, sensors, data_feats, out_dir,
+                         feat_ref=None):
     """把完善后的按桥名称对照写成 5 个 JSON 文件。"""
     os.makedirs(out_dir, exist_ok=True)
     written = []
     for bridge in BRIDGE_ORDER:
         if bridge not in bridges:
             continue
-        enrich_entries(bridges[bridge], sensors, data_feats)
+        enrich_entries(bridges[bridge], sensors, data_feats, feat_ref)
         pos_map = build_position_map(sensors, bridge)
         table_map = build_table_map(sensors, bridge, data_feats)
         data = {
             "桥名": bridge,
             "说明": "传感器名称 -> 编号/特征/位置/方向 对照，"
-                    "含 特征编码(数据实际特征) 与 测点(应变/振动)；"
+                    "含 特征编码(仅作参考，实际特征以 daily/<编号>/ 目录"
+                    "为准) 与 测点(应变/振动)；"
                     "由《五座桥测点编号表格.docx》+ Q1 统计值生成",
             "传感器数量": sum(len(v) for v in bridges[bridge].values()),
             "传感器名称": bridges[bridge],
@@ -350,6 +361,7 @@ def main():
     docx_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DOCX
     out_path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_OUT
     stats_dir = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_STATS
+    merge_mode = "--merge" in sys.argv
 
     if not os.path.exists(docx_path):
         print(f"[错误] 找不到文档: {docx_path}")
@@ -365,14 +377,31 @@ def main():
     else:
         print("[提示] 未找到统计值 JSON，特征编码将按监测类别推断")
 
+    parsed_ids = set(sensors)
+    feat_ref = {}
+    if merge_mode and os.path.isfile(out_path):
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                existing = (json.load(f) or {}).get("传感器", {}) or {}
+            for num in existing:
+                feat_ref[num] = (existing[num] or {}).get("特征编码", [])
+            sensors = {**existing, **sensors}   # 新解析的覆盖同编号，其余保留
+            print(f"[合并] 已有对照 {len(existing)} 个，"
+                  f"本次新增/覆盖 {len(parsed_ids)} 个，"
+                  f"合并后共 {len(sensors)} 个")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[警告] 读取旧对照失败，按完整模式生成: {exc}")
+
     data = {
         "说明": "传感器编号 -> 中文监测部位对照表，"
-                "由《五座桥测点编号表格.docx》生成",
+                "由《五座桥测点编号表格.docx》生成；"
+                "特征编码仅作参考，实际特征以 daily/<编号>/ 目录为准",
         "生成时间": "",
         "传感器数量": len(sensors),
         "传感器": {
             num: {**info,
                   "特征编码": (data_feats.get(num)
+                               or feat_ref.get(num)
                                or expected_features(info))}
             for num, info in sensors.items()
         },
@@ -385,7 +414,7 @@ def main():
     # 按桥分组的 名称 -> 编号/特征 JSON(完善版)
     bridges = build_name_map(sensors)
     name_files = write_name_map_files(bridges, sensors, data_feats,
-                                      DEFAULT_NAME_MAP_DIR)
+                                      DEFAULT_NAME_MAP_DIR, feat_ref)
 
     print(f"共解析出 {len(sensors)} 个传感器")
     print(f"已保存: {out_path}")

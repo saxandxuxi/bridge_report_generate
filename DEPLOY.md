@@ -70,7 +70,7 @@ mkdir -p /data/bridge /data/raw
 
 ### 3. 创建本桥配置
 
-复制 `config_chishi.json` 为 `config_<桥>.json`，修改：
+复制 `config/config_chishi.json` 为 `config/config_<桥>.json`，修改：
 
 ```json
 {

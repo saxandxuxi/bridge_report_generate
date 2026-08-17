@@ -28,7 +28,7 @@ data_analysis/
 ├── bridges/registry.json         # 六座桥注册表（服务器/配置/令牌环境变量）
 ├── web/                          # Flask Web 管理台（后端 + 静态前端）
 ├── DEPLOY.md                     # 多服务器部署文档
-├── config.json                   # 智能体配置（模板、数据、图表、调度）
+├── config/                       # 各桥智能体配置（config.json / config_<桥>.json）
 ├── requirements.txt              # Python 依赖
 ├── report_agent/                 # 核心代码
 │   ├── agent.py                  # 主流程编排
@@ -86,7 +86,7 @@ python run_agent.py --mode weekly
 
 ## 使用真实监测数据（桥模式）
 
-把“桥数据预处理”的产物放好后，在 `config_chishi.json` 的 `bridge_data` 里配置路径并启用：
+把“桥数据预处理”的产物放好后，在 `config/config_chishi.json` 的 `bridge_data` 里配置路径并启用：
 
 ```bash
 python run_agent.py --bridge chishi --mode quarterly --date 2026-03-31
@@ -159,7 +159,7 @@ python preprocess/pipeline.py --raw D:/数据 --daily D:/日级 --charts D:/图�
 ```
 
 Web 管理台的“数据处理”页可配置四个路径并一键运行，实时显示步骤状态和日志。
-`config_chishi.json` 的 `bridge_data` 已指向 `preprocess/统计值` 与 `preprocess/图库`。
+`config/config_chishi.json` 的 `bridge_data` 已指向 `preprocess/统计值` 与 `preprocess/图库`。
 
 ## 模板里的占位符（如何告诉智能体换哪里）
 

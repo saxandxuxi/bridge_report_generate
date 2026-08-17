@@ -24,6 +24,7 @@
 """
 
 import argparse
+import datetime as dt
 import json
 import logging
 import os
@@ -45,6 +46,17 @@ def load_config(path: str) -> dict:
         return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def resolve_path(v: str) -> str:
+    """把配置/命令行里的相对路径解析为相对 preprocess/ 目录的绝对路径；
+    绝对路径保持不变。这样整个项目拷到别的机器也能直接跑。"""
+    if not v:
+        return v
+    v = os.path.expandvars(os.path.expanduser(v))
+    if os.path.isabs(v):
+        return os.path.normpath(v)
+    return os.path.normpath(os.path.join(ROOT, v))
 
 
 def save_status(status: dict) -> None:
@@ -128,6 +140,9 @@ def main() -> int:
     ap.add_argument("--skip-preprocess", action="store_true")
     ap.add_argument("--skip-charts", action="store_true")
     ap.add_argument("--skip-sensor-map", action="store_true")
+    ap.add_argument("--skip-per-sensor", action="store_true",
+                    help="生成图库/统计值时跳过逐传感器图，只生成按监测部位"
+                         "合并的图(传给 build_chart_library.py)")
     ap.add_argument("--period", choices=["quarterly", "yearly"],
                     default="quarterly",
                     help="统计周期(传给 build_quarterly_stats.py；"
@@ -135,11 +150,11 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    raw = args.raw or cfg.get("raw_data_dir", "")
-    daily = args.daily or cfg.get("daily_dir", "")
-    charts = args.charts or cfg.get("charts_dir", "")
-    stats = args.stats or cfg.get("stats_dir", "")
-    map_docx = args.sensor_map_docx or cfg.get("sensor_map_docx", "")
+    raw = resolve_path(args.raw or cfg.get("raw_data_dir", ""))
+    daily = resolve_path(args.daily or cfg.get("daily_dir", ""))
+    charts = resolve_path(args.charts or cfg.get("charts_dir", ""))
+    stats = resolve_path(args.stats or cfg.get("stats_dir", ""))
+    map_docx = resolve_path(args.sensor_map_docx or cfg.get("sensor_map_docx", ""))
     limit = args.limit_sensors or int(cfg.get("limit_sensors", 0) or 0)
     start = args.start or cfg.get("start", "")
     end = args.end or cfg.get("end", "")
@@ -207,6 +222,8 @@ def main() -> int:
         ]
         if args.bridge:
             cmd += ["--bridge", args.bridge]
+        if args.skip_per_sensor:
+            cmd += ["--skip-per-sensor"]
         # 图库/统计值目录名自动带年月范围（如 图库_2026.1~3）；
         # 仅命令行显式指定 --charts/--stats 时才用固定目录
         if args.charts:
@@ -219,8 +236,6 @@ def main() -> int:
             cmd += ["--start", start]
         if end:
             cmd += ["--end", end]
-        if not os.path.isdir(daily_data):
-            cmd += ["--rebuild-summary"]
         ok = run_step("日级数据->图库+统计值", cmd, status)
         if not ok:
             status["error"] = "图库/统计值生成步骤失败"
@@ -239,6 +254,7 @@ def main() -> int:
             "--daily-root", stats_daily_root or ".",
             "--lib-root", ROOT,
             "--period", args.period,
+            "--mode", "stats",
         ]
         if args.bridge:
             cmd_q += ["--bridge", args.bridge]

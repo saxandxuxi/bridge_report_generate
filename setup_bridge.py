@@ -70,9 +70,14 @@ def find_bridge_assets(bridge_name: str) -> dict:
     """定位 名称对照 / 编号名称表 / 统计值 / 图库。"""
     assets = {"name_dict": "", "sensor_map": "", "stats_dir": "", "charts_dir": ""}
     cands = []
+    nd_names = [f"{bridge_name}大桥.json", f"{bridge_name}.json"]
+    for suffix in ("特大桥", "大桥"):
+        if bridge_name.endswith(suffix):
+            core = bridge_name[: -len(suffix)]
+            nd_names += [f"{core}大桥.json", f"{core}.json"]
     for root in ("preprocess/传感器对照/传感器名称对照",
                  "preprocess/统计值_2026.1~3/传感器名称对照"):
-        for fn in (f"{bridge_name}大桥.json", f"{bridge_name}.json"):
+        for fn in nd_names:
             p = os.path.join(BASE, root, fn)
             if os.path.isfile(p):
                 cands.append(p)
@@ -119,12 +124,42 @@ def _bridge_id(name: str) -> str:
     return table.get(m.group(1) if m else "", (m.group(1) if m else core) or "bridge")
 
 
+def _latest_template(bridge_name: str) -> str:
+    """取 templates/ 下某桥最新的模板文件（相对路径，取不到返回基础名）。
+
+    排序规则：
+      1. 文件名里的版本号 vN 大的优先（v9 > v8 > ... > 无版本号）；
+      2. 版本号相同(含都无版本号)时，取最后修改时间最新的。
+    """
+    tpl_dir = os.path.join(BASE, "templates")
+    prefix = bridge_name + "_template"
+    hits = []
+    if os.path.isdir(tpl_dir):
+        for fn in os.listdir(tpl_dir):
+            if not fn.lower().endswith(".docx"):
+                continue
+            stem = fn[:-5]
+            if stem == prefix:
+                ver = 0
+            else:
+                m = re.match(re.escape(prefix) + r"_v(\d+)$", stem)
+                if not m:
+                    continue
+                ver = int(m.group(1))
+            p = os.path.join(tpl_dir, fn)
+            hits.append((ver, os.path.getmtime(p), fn))
+    if not hits:
+        return f"templates/{bridge_name}_template.docx"
+    _, _, best = max(hits, key=lambda h: (h[0], h[1]))
+    return "templates/" + best
+
+
 def build_config(bridge_name: str, input_path: str) -> dict:
     assets = find_bridge_assets(bridge_name)
     bid = _bridge_id(bridge_name)
     rel = lambda p: os.path.relpath(p, BASE).replace("\\", "/") if p else ""
     return {
-        "template": f"templates/{bridge_name}_template.docx",
+        "template": _latest_template(bridge_name),
         "output_dir": ".\\outputs\\reports",
         "source_report": rel(os.path.abspath(input_path)),
         "bridge_data": {
@@ -173,11 +208,11 @@ def register_bridge(bid: str, bridge_name: str, config_path: str) -> None:
     for b in bridges:
         if b.get("id") == bid:
             b["name"] = bridge_name
-            b["config"] = os.path.basename(config_path)
+            b["config"] = os.path.relpath(config_path, BASE).replace("\\", "/")
             break
     else:
         bridges.append({"id": bid, "name": bridge_name,
-                        "config": os.path.basename(config_path),
+                        "config": os.path.relpath(config_path, BASE).replace("\\", "/"),
                         "host": "", "port": 8080})
     with open(reg_path, "w", encoding="utf-8") as f:
         json.dump(reg, f, ensure_ascii=False, indent=2)
@@ -203,7 +238,9 @@ def main() -> int:
     if not cfg["bridge_data"]["name_dict"]:
         log.warning("未找到 %s 的传感器名称对照（preprocess/传感器对照/传感器名称对照/），"
                     "配置文件仍会生成，运行解析可能不完整", bridge_name)
-    cfg_path = os.path.join(BASE, f"config_{bid}.json")
+    cfg_dir = os.path.join(BASE, "config")
+    os.makedirs(cfg_dir, exist_ok=True)
+    cfg_path = os.path.join(cfg_dir, f"config_{bid}.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     register_bridge(bid, bridge_name, cfg_path)

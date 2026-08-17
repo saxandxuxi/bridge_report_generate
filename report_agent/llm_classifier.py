@@ -132,6 +132,31 @@ class LLMClassifier:
         """LLM 是否可用：启用 + 有 API Key + 有 API 地址。"""
         return self.enabled and bool(self.api_key) and bool(self.api_base)
 
+    def summarize_feature(self, digest: str, max_chars: int = 100) -> str:
+        """基于季度/年度统计摘要生成一段结论性描述（≤max_chars 字）。
+        重点：数据缺失情况、极值对应位置等特殊位置；不逐个位置罗列。
+        LLM 不可用或调用失败时返回空串（由调用方走规则化兜底）。"""
+        if not self.available():
+            return ""
+        system = (
+            "你是桥梁结构健康监测数据分析专家。"
+            "根据给定的季度/年度统计摘要，用不超过%d字的文字写一句结论性描述。"
+            "要求：只突出数据缺失情况和极值对应的特殊位置等需要关注的点；"
+            "不要逐个位置罗列；不要编造统计摘要里没有的数据；"
+            "不要出现传感器编号或任何数字编号，位置一律用监测部位名称；"
+            "不要输出“根据统计摘要”之类的转述前缀；只输出结论文本本身。"
+        ) % max_chars
+        try:
+            resp = self._chat([
+                {"role": "system", "content": system},
+                {"role": "user", "content": digest},
+            ])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("总结生成失败: %s", exc)
+            return ""
+        text = str(resp or "").strip().strip("\"'“”").strip()
+        return text[:max_chars]
+
     # ------------------------------------------------------------------
     # API 调用
     # ------------------------------------------------------------------

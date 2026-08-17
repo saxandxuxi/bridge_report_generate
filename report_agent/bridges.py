@@ -83,6 +83,7 @@ def resolve_bridge_config(bridge_id: str, registry_path: Optional[str] = None) -
     for cand in (
         os.path.join(project_root(), "bridges", bridge_id, "config.json"),
         os.path.join(project_root(), "bridges", bridge_id + ".json"),
+        os.path.join(project_root(), "config", "config_" + bridge_id + ".json"),
         os.path.join(project_root(), "config_" + bridge_id + ".json"),
     ):
         if os.path.isfile(cand):

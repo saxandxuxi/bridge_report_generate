@@ -71,6 +71,136 @@ DAILY_SUBDIR = "daily"  # daily 输出子目录（带期号时为 daily_2026.1~3
 
 logger = logging.getLogger("bridge_preprocess")
 
+# 交通荷载：周统计 HTML(xls) -> daily/交通荷载/车道N/日期.csv（与普通传感器同构）
+TRAFFIC_SENSOR = "交通荷载"
+TRAFFIC_DIR_RE = re.compile(r"(.+)_车道统计_(.+)$")
+TRAFFIC_TIME_RE = re.compile(
+    r"(\d{4})年(\d{2})月(\d{2})日\s+(\d{2}):(\d{2}):(\d{2})")
+
+
+def _html_unescape(s):
+    return (s.replace("&nbsp;", " ").replace("&amp;", "&")
+            .replace("&lt;", "<").replace("&gt;", ">").strip())
+
+
+def parse_traffic_week(path):
+    """解析每周车道统计 HTML(扩展名 .xls，实际为 UTF-8 HTML)。
+
+    表头: 时间 | 总共 | 车道1 | 车道2 | 车道3 | 车道4
+    返回 [(datetime, {车道1: n, ..., 车道4: n, 总共: n}), ...]
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    text = raw.decode("utf-8", errors="replace")
+    rows = re.findall(r"<tr>(.*?)</tr>", text, re.S)
+    out = []
+    for r in rows:
+        tds = [_html_unescape(re.sub(r"<[^>]+>", "", t))
+               for t in re.findall(r"<td[^>]*>(.*?)</td>", r, re.S)]
+        if len(tds) < 6 or not tds[0]:
+            continue
+        m = TRAFFIC_TIME_RE.search(tds[0])
+        if not m:
+            continue
+        try:
+            ts = dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                             int(m.group(4)), int(m.group(5)), int(m.group(6)))
+            # 表头: 时间 | 总共 | 车道1 | 车道2 | 车道3 | 车道4
+            vals = {}
+            for i, k in enumerate(("车道1", "车道2", "车道3", "车道4")):
+                if i + 2 < len(tds) and tds[i + 2].strip():
+                    vals[k] = int(float(tds[i + 2]))
+            vals["总共"] = int(float(tds[1])) if tds[1].strip() else None
+        except (ValueError, IndexError):
+            continue
+        if not vals or all(v is None for v in vals.values()):
+            continue
+        out.append((ts, vals))
+    return out
+
+
+def _find_traffic_dirs(traffic_root, bridge):
+    """扫描交通荷载周数据目录：<桥名>_车道统计_<期>。bridge 留空时全部。"""
+    if not traffic_root or not os.path.isdir(traffic_root):
+        return []
+    out = []
+    for d in sorted(os.listdir(traffic_root)):
+        full = os.path.join(traffic_root, d)
+        if not os.path.isdir(full) or "车道统计" not in d:
+            continue
+        m = TRAFFIC_DIR_RE.match(d)
+        if not m:
+            continue
+        if bridge and bridge not in m.group(1):
+            continue
+        out.append(full)
+    return out
+
+
+def _write_traffic_daily(out_path, date, hour_counts):
+    """把某天 24 小时的车道计数写成与传感器一致的 daily CSV。
+    hour_counts: {车道N: {小时下标: 计数}}；缺失小时写 count=0 空行。
+    """
+    out_dir = os.path.dirname(out_path)
+    os.makedirs(out_dir, exist_ok=True)
+    day_start = dt.datetime(date.year, date.month, date.day)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["bucket_start", "count", "mean", "min", "max",
+                    "sum", "std", "median"])
+        for i in range(24):
+            v = hour_counts.get(i)
+            ts = (day_start + dt.timedelta(hours=i)).isoformat()
+            if v is None or v < 0:
+                w.writerow([ts, 0, "", "", "", "", "", ""])
+            else:
+                w.writerow([ts, 3600, f"{v:.6g}", f"{v:.6g}", f"{v:.6g}",
+                            f"{v:.6g}", "0", f"{v:.6g}"])
+
+
+def process_traffic(traffic_dirs, output_root, daily_subdir,
+                    start="", end="", resume=False):
+    """把周交通统计数据预处理成 daily/交通荷载/车道N/日期.csv。
+
+    返回 (写入天数, 车道特征数, 跳过天数)。
+    """
+    start_d = dt.date.fromisoformat(start) if start else None
+    end_d = dt.date.fromisoformat(end) if end else None
+    lanes = []
+    for tdir in traffic_dirs:
+        for fn in sorted(os.listdir(tdir)):
+            if not fn.lower().startswith("车道统计_") \
+                    or not fn.lower().endswith(".xls"):
+                continue
+            rows = parse_traffic_week(os.path.join(tdir, fn))
+            if not rows:
+                continue
+            by_date = {}
+            for ts, vals in rows:
+                d = ts.date()
+                if start_d and d < start_d:
+                    continue
+                if end_d and d > end_d:
+                    continue
+                by_date.setdefault(d, {})[ts.hour] = vals
+            for date, hour_map in sorted(by_date.items()):
+                date_str = date.isoformat()
+                per_lane = {}
+                for ts_hour, vals in hour_map.items():
+                    for k, v in vals.items():
+                        per_lane.setdefault(k, {})[ts_hour] = v
+                for lane in sorted(per_lane, key=lambda x: (x == "总共", x)):
+                    if lane not in lanes:
+                        lanes.append(lane)
+                    out_path = os.path.join(
+                        output_root, daily_subdir, TRAFFIC_SENSOR, lane,
+                        date_str + ".csv")
+                    if resume and os.path.exists(out_path) \
+                            and os.path.getsize(out_path) > 0:
+                        continue
+                    _write_traffic_daily(out_path, date, per_lane[lane])
+    return len(traffic_dirs), len(lanes), 0
+
 
 def period_tag(start="", end=""):
     """由起止日期生成年月范围标签，与图库/统计值目录一致。
@@ -976,7 +1106,15 @@ def main():
                     help="每个传感器每个特征只处理前 N 天(试跑用)")
     ap.add_argument("--period-tag", default="",
                     help="daily 目录的年月标签(如 2026.1~3)；留空按 --start/--end 自动推导")
+    ap.add_argument("--traffic-root", default="",
+                    help="交通荷载周统计数据根目录(含 <桥名>_车道统计_<期> 子目录)；"
+                         "留空自动找 <cwd>/inputs。交通数据按周存，与传感器编号"
+                         "数据分开处理，输出到 daily/交通荷载/车道N/")
+    ap.add_argument("--traffic-only", action="store_true",
+                    help="只处理交通荷载周统计数据，不扫描/预处理传感器原始数据")
     args = ap.parse_args()
+    if args.traffic_only:
+        args.mode = "preprocess"
 
     DATA_ROOT = args.data_root
     OUTPUT_ROOT = args.output_root or resolve_output_root()
@@ -1011,21 +1149,41 @@ def main():
                         sensor_ids.add(s)
     sensors_arg = ",".join(sorted(sensor_ids))
 
-    scan_scope = (sensors_arg or "全部") + " / " + \
-        (args.start or "最早") + " ~ " + (args.end or "最新")
-    logger.info(f"摸底范围: 传感器 {scan_scope}")
-    info = discover(sensors=sensors_arg, start=args.start, end=args.end)
-    print_inventory(info)
-    show_sample(info)
-    write_inventory(info)
-    logger.info(f"摸底完成: 共 {sum(len(feats) for feats in info.values())} "
-                f"个传感器-特征组合")
+    if not args.traffic_only:
+        scan_scope = (sensors_arg or "全部") + " / " + \
+            (args.start or "最早") + " ~ " + (args.end or "最新")
+        logger.info(f"摸底范围: 传感器 {scan_scope}")
+        info = discover(sensors=sensors_arg, start=args.start, end=args.end)
+        print_inventory(info)
+        show_sample(info)
+        write_inventory(info)
+        logger.info(f"摸底完成: 共 {sum(len(feats) for feats in info.values())} "
+                    f"个传感器-特征组合")
+    else:
+        info = {}
 
-    if args.mode in ("preprocess", "all"):
+    if args.mode in ("preprocess", "all") and not args.traffic_only:
         tasks = build_tasks(info, sensors_arg, args.features,
                             args.start, args.end, args.limit_days)
         processed = run_preprocess(tasks)
         logger.info(f"本次运行结束: 新完成任务 {processed} 个")
+
+    # 交通荷载：周统计 HTML 数据，与传感器数据分开读取
+    traffic_root = args.traffic_root
+    if not traffic_root:
+        cand = os.path.join(os.getcwd(), "inputs")
+        if os.path.isdir(cand):
+            traffic_root = cand
+    traffic_dirs = _find_traffic_dirs(traffic_root, args.bridge)
+    if traffic_dirs:
+        _n_dir, n_lane, _n_skip = process_traffic(
+            traffic_dirs, OUTPUT_ROOT, DAILY_SUBDIR,
+            args.start, args.end, RESUME)
+        logger.info(f"交通荷载预处理完成: {len(traffic_dirs)} 个期目录, "
+                    f"{n_lane} 个车道特征 -> "
+                    f"{os.path.join(OUTPUT_ROOT, DAILY_SUBDIR, TRAFFIC_SENSOR)}")
+    else:
+        logger.info("未找到交通荷载周统计目录，跳过")
 
 
 if __name__ == "__main__":

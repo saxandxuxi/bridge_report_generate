@@ -22,6 +22,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,7 @@ PREPROCESS_CONFIG = os.path.join(PREPROCESS_DIR, "config.json")
 PREPROCESS_STATUS = os.path.join(PREPROCESS_DIR, "status.json")
 PREPROCESS_LOG = os.path.join(PREPROCESS_DIR, "pipeline.log")
 _preprocess: Dict = {}
+_parsing: Dict[str, Dict] = {}   # 模板解析状态（LLM 识别较慢，后台执行）
 
 # 每个桥的“运行中”状态
 _running: Dict[str, Dict] = {}
@@ -120,16 +122,21 @@ def _period_dir_base(cfg: Optional[Dict] = None) -> str:
 
 
 def _quarter_dirs(cfg: Optional[Dict], label: str) -> tuple:
-    """季度化输出目录：<base>/图库_<label>/<桥名>、<base>/统计值_<label>/<桥名>。"""
+    """季度化输出目录：<base>/图库_<label>/<桥名>、<base>/统计值_<label>/<桥名>；
+    桥名写法不一致时(湘江特大桥 <-> 湘江特)自动匹配实际存在的子目录。"""
     base = _period_dir_base(cfg)
     bridge = ((cfg or {}).get("bridge_data") or {}).get("bridge_name", "")
     def _with_bridge(p: str) -> str:
         return os.path.join(p, bridge) if bridge else p
+    from report_agent.config import resolve_bridge_subdir
     if not label:
-        return _with_bridge(os.path.join(base, "图库")), \
-            _with_bridge(os.path.join(base, "统计值"))
-    return (_with_bridge(os.path.join(base, f"图库_{label}")),
-            _with_bridge(os.path.join(base, f"统计值_{label}")))
+        charts = _with_bridge(os.path.join(base, "图库"))
+        stats = _with_bridge(os.path.join(base, "统计值"))
+    else:
+        charts = _with_bridge(os.path.join(base, f"图库_{label}"))
+        stats = _with_bridge(os.path.join(base, f"统计值_{label}"))
+    return (resolve_bridge_subdir(charts, bridge),
+            resolve_bridge_subdir(stats, bridge))
 
 
 def _dir_nonempty(path: str) -> bool:
@@ -163,6 +170,27 @@ def _save_config(cfg: Dict, cfg_path: str) -> None:
         pass
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _raw_config(cfg_path: str) -> Dict:
+    """直接读取配置文件原始 JSON（不做路径解析），用于局部更新时
+    保留相对路径，避免把配置全部改写成绝对路径。"""
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _repair_filename(name: str) -> str:
+    """修复 Windows 浏览器上传中文文件名时的 GBK 乱码
+    （GBK 字节被按 Latin-1 解码，如 湘江特大桥 -> Ïæ½­ÌØ´óÇÅ）。"""
+    if not name:
+        return name
+    try:
+        repaired = name.encode("latin-1").decode("gbk")
+        if any("\u4e00" <= ch <= "\u9fff" for ch in repaired):
+            return repaired
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return name
 
 
 def _mask_secrets(cfg: Dict) -> Dict:
@@ -358,7 +386,7 @@ def api_bridge_template_upload(bridge_id):
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify({"error": "未选择文件"}), 400
-    name = os.path.basename(f.filename)
+    name = _repair_filename(os.path.basename(f.filename))
     if not name.lower().endswith(".docx"):
         return jsonify({"error": "仅支持 .docx 模板"}), 400
     templates_dir = os.path.join(ROOT, "templates")
@@ -366,13 +394,386 @@ def api_bridge_template_upload(bridge_id):
     dest = os.path.join(templates_dir, name)
     f.save(dest)
     try:
-        from report_agent.config import load_config
-        cfg = load_config(cfg_path)
+        cfg = _raw_config(cfg_path)
         cfg["template"] = os.path.join("templates", name)
         _save_config(cfg, cfg_path)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"模板已上传但配置更新失败: {exc}"}), 500
     return jsonify({"ok": True, "template": os.path.join("templates", name), "size": os.path.getsize(dest)})
+
+
+def _bridge_template_files(bridge_name: str) -> list:
+    """列出 templates/ 下某桥的模板文件（含版本号），按版本号/时间倒序。"""
+    tpl_dir = os.path.join(ROOT, "templates")
+    if not os.path.isdir(tpl_dir):
+        return []
+    prefix = (bridge_name or "") + "_template"
+    files = []
+    for fn in sorted(os.listdir(tpl_dir)):
+        if not fn.lower().endswith(".docx"):
+            continue
+        if prefix and not fn.startswith(prefix):
+            continue
+        p = os.path.join(tpl_dir, fn)
+        files.append({
+            "name": fn,
+            "path": os.path.relpath(p, ROOT).replace("\\", "/"),
+            "size": os.path.getsize(p),
+            "mtime": dt.datetime.fromtimestamp(os.path.getmtime(p)).isoformat(timespec="seconds"),
+        })
+    files.sort(key=lambda x: (x["mtime"], x["name"]), reverse=True)
+    return files
+
+
+@app.route("/api/bridges/<bridge_id>/templates")
+def api_bridge_templates(bridge_id):
+    """列出该桥可选的模板（含当前配置模板标记）。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    cfg = _config_for(bridge_id)
+    if not cfg or "error" in cfg:
+        return jsonify({"error": "配置不可用"}), 404
+    bname = (cfg.get("bridge_data") or {}).get("bridge_name") or bridge_id
+    files = _bridge_template_files(bname)
+    if not files:
+        # 桥名前缀没匹配到时，退回列出全部模板
+        files = _bridge_template_files("")
+    current = os.path.basename(cfg.get("template", ""))
+    for f in files:
+        f["current"] = f["name"] == current
+    return jsonify({"templates": files, "current": current,
+                    "bridge_name": bname})
+
+
+@app.route("/api/bridges/<bridge_id>/templates/<path:filename>")
+def api_bridge_template_download(bridge_id, filename):
+    """下载某模板 .docx。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    safe = os.path.basename(filename)
+    path = os.path.join(ROOT, "templates", safe)
+    if not os.path.isfile(path) or not safe.lower().endswith(".docx"):
+        return jsonify({"error": "模板文件不存在"}), 404
+    return send_file(path, as_attachment=True, download_name=safe)
+
+
+@app.route("/api/bridges/<bridge_id>/analysis/<path:filename>")
+def api_bridge_analysis_download(bridge_id, filename):
+    """下载解析分析 JSON。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    safe = os.path.basename(filename)
+    path = os.path.join(ROOT, "outputs", "analysis", safe)
+    if not os.path.isfile(path) or not safe.lower().endswith(".json"):
+        return jsonify({"error": "分析文件不存在"}), 404
+    return send_file(path, as_attachment=True, download_name=safe)
+
+
+@app.route("/api/bridges/<bridge_id>/source-report", methods=["POST"])
+def api_bridge_source_report_upload(bridge_id):
+    """上传成品报告 .docx。
+
+    表单字段：
+      file               成品报告 .docx
+      bridge_target      same=当前桥 / new=新桥
+      new_bridge_id      新桥 ID（bridge_target=new 时必填，如 xinhe）
+      new_bridge_name    新桥名称（如 新河特大桥）
+    已有桥：保存到 inputs/ 并更新配置 source_report；
+    新桥：自动生成 config_<id>.json 并登记到 registry.json。
+    """
+    auth = _require_token()
+    if auth:
+        return auth
+    cfg_path = _config_path_for(bridge_id)
+    if not cfg_path:
+        return jsonify({"error": f"未找到桥梁 {bridge_id} 的配置"}), 404
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    name = _repair_filename(os.path.basename(f.filename))
+    if not name.lower().endswith(".docx"):
+        return jsonify({"error": "仅支持 .docx 成品报告"}), 400
+
+    inputs_dir = os.path.join(ROOT, "inputs")
+    os.makedirs(inputs_dir, exist_ok=True)
+    # 重名时加时间戳，避免覆盖旧成品报告
+    dest = os.path.join(inputs_dir, name)
+    if os.path.isfile(dest):
+        stem, ext = os.path.splitext(name)
+        dest = os.path.join(
+            inputs_dir, f"{stem}_{dt.datetime.now():%Y%m%d_%H%M%S}{ext}")
+    f.save(dest)
+    rel_report = os.path.relpath(dest, ROOT).replace("\\", "/")
+
+    bridge_target = str(request.form.get("bridge_target") or "same").strip()
+    if bridge_target == "new":
+        new_name = str(request.form.get("new_bridge_name") or "").strip()
+        new_id = str(request.form.get("new_bridge_id") or "").strip()
+        if not new_name:
+            return jsonify({"error": "新桥请填写桥名（new_bridge_name）"}), 400
+        try:
+            from setup_bridge import _bridge_id, build_config, register_bridge
+            bid = new_id or _bridge_id(new_name)
+            cfg = build_config(new_name, os.path.abspath(dest))
+            cfg_dir = os.path.join(ROOT, "config")
+            os.makedirs(cfg_dir, exist_ok=True)
+            new_cfg_path = os.path.join(cfg_dir, f"config_{bid}.json")
+            with open(new_cfg_path, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, ensure_ascii=False, indent=2)
+            register_bridge(bid, new_name, new_cfg_path)
+            log.info("新桥登记完成: id=%s name=%s config=%s",
+                     bid, new_name, new_cfg_path)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"error": f"新桥配置生成失败: {exc}"}), 500
+        return jsonify({"ok": True, "bridge_id": bid, "bridge_name": new_name,
+                        "source_report": rel_report,
+                        "config": os.path.join("config",
+                                               "config_" + bid + ".json")})
+
+    # 已有桥：更新 source_report，保留当前模板
+    try:
+        cfg = _raw_config(cfg_path)
+        cfg["source_report"] = rel_report
+        _save_config(cfg, cfg_path)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"报告已保存但配置更新失败: {exc}"}), 500
+    return jsonify({"ok": True, "bridge_id": bridge_id,
+                    "source_report": rel_report,
+                    "template": cfg.get("template", "")})
+
+
+def _next_template_version(bridge_name: str) -> str:
+    """取 templates/<桥名>_template 的下一版本号，返回文件名。"""
+    tpl_dir = os.path.join(ROOT, "templates")
+    prefix = (bridge_name or "桥") + "_template"
+    max_ver = 0
+    has_plain = False
+    if os.path.isdir(tpl_dir):
+        for fn in os.listdir(tpl_dir):
+            if not fn.lower().endswith(".docx"):
+                continue
+            stem = fn[:-5]
+            if stem == prefix:
+                has_plain = True
+            else:
+                m = re.match(re.escape(prefix) + r"_v(\d+)$", stem)
+                if m:
+                    max_ver = max(max_ver, int(m.group(1)))
+    if not has_plain and max_ver == 0:
+        return f"{prefix}.docx"
+    return f"{prefix}_v{max_ver + 1}.docx"
+
+
+def _parse_template_worker(bridge_id: str, cfg_path: str,
+                           source_report: str) -> None:
+    """后台执行 analyze_report.py，把成品报告重新解析成模板。"""
+    st = _parsing.setdefault(bridge_id, {"running": False})
+    try:
+        cfg = _raw_config(cfg_path)
+        b = get_bridge(bridge_id, REGISTRY) or {}
+        bname = ((cfg.get("bridge_data") or {}).get("bridge_name")
+                 or b.get("name") or bridge_id)
+        tpl_name = _next_template_version(bname)
+        tpl_path = os.path.join(ROOT, "templates", tpl_name)
+        analysis_path = os.path.join(
+            ROOT, "outputs", "analysis",
+            "analysis_" + os.path.splitext(os.path.basename(source_report))[0]
+            + ".json")
+        cmd = [sys.executable, os.path.join(ROOT, "analyze_report.py"),
+               "--input", os.path.abspath(source_report),
+               "--config", cfg_path,
+               "--annotate", tpl_path,
+               "--log", os.path.join(ROOT, "outputs", "logs",
+                                     f"analyze_report_{bridge_id}.log")]
+        st["cmd"] = " ".join(cmd)
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=_subprocess_env(),
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        st["pid"] = proc.pid
+        out, _ = proc.communicate(timeout=7200)
+        st["returncode"] = proc.returncode
+        st["log_tail"] = out.decode("utf-8", errors="replace")[-3000:]
+        if proc.returncode == 0 and os.path.isfile(tpl_path):
+            cfg = _raw_config(cfg_path)
+            cfg["template"] = os.path.relpath(tpl_path, ROOT).replace("\\", "/")
+            if os.path.isfile(analysis_path):
+                cfg["analysis_file"] = os.path.relpath(
+                    analysis_path, ROOT).replace("\\", "/")
+            _save_config(cfg, cfg_path)
+            st["template"] = cfg["template"]
+        else:
+            st["error"] = "模板解析失败，详见日志尾部"
+        st["finished_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    except Exception as exc:  # noqa: BLE001
+        st["error"] = str(exc)
+        st["finished_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        log.exception("桥梁 %s 模板解析异常", bridge_id)
+    finally:
+        st["running"] = False
+
+
+@app.route("/api/bridges/<bridge_id>/template/parse", methods=["POST"])
+def api_bridge_template_parse(bridge_id):
+    """重新解析成品报告 -> 生成新模板（后台执行，LLM 识别较慢）。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    cfg_path = _config_path_for(bridge_id)
+    if not cfg_path:
+        return jsonify({"error": f"未找到桥梁 {bridge_id} 的配置"}), 404
+    from report_agent.config import load_config
+    cfg = load_config(cfg_path)
+    source_report = cfg.get("source_report", "")
+    if not source_report or not os.path.isfile(source_report):
+        return jsonify({"error": "尚未上传成品报告（source_report 为空或文件不存在）"}), 400
+    st = _parsing.get(bridge_id)
+    if st and st.get("running"):
+        return jsonify({"error": "模板解析已在运行", "started_at": st.get("started_at")}), 409
+    _parsing[bridge_id] = {
+        "running": True,
+        "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    t = threading.Thread(target=_parse_template_worker,
+                         args=(bridge_id, cfg_path, source_report),
+                         daemon=True)
+    t.start()
+    return jsonify({"ok": True, "started": True,
+                    "source_report": source_report,
+                    "started_at": _parsing[bridge_id]["started_at"]})
+
+
+@app.route("/api/bridges/<bridge_id>/parse/status")
+def api_bridge_parse_status(bridge_id):
+    """模板解析状态。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    return jsonify(_parsing.get(bridge_id, {"running": False}))
+
+
+@app.route("/api/bridges/<bridge_id>/parse/result")
+def api_bridge_parse_result(bridge_id):
+    """模板解析结果摘要：新模板 + 分析统计（数字/图片/图表占位/数据占位）。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    st = _parsing.get(bridge_id, {})
+    cfg = _config_for(bridge_id)
+    out = {"status": st, "template": None, "analysis": None,
+           "analysis_download": ""}
+    if not cfg or "error" in cfg:
+        return jsonify(out)
+    tpl = st.get("template") or cfg.get("template", "")
+    if tpl and os.path.isfile(tpl):
+        out["template"] = {
+            "name": os.path.basename(tpl),
+            "path": os.path.relpath(tpl, ROOT).replace("\\", "/"),
+            "size": os.path.getsize(tpl),
+            "mtime": dt.datetime.fromtimestamp(os.path.getmtime(tpl)).isoformat(timespec="seconds"),
+            "download": "/api/bridges/%s/templates/%s" % (
+                bridge_id, os.path.basename(tpl)),
+        }
+    src = cfg.get("source_report", "")
+    if src:
+        base = os.path.splitext(os.path.basename(src))[0]
+        apath = os.path.join(ROOT, "outputs", "analysis",
+                             f"analysis_{base}.json")
+        if not os.path.isfile(apath):
+            # 兼容带时间戳/版本的 analysis 文件，取最新一份
+            adir = os.path.join(ROOT, "outputs", "analysis")
+            hits = [f for f in os.listdir(adir)
+                    if f.startswith(f"analysis_{base}") and f.endswith(".json")]
+            if hits:
+                apath = os.path.join(adir, sorted(hits,
+                                                  key=lambda f: os.path.getmtime(
+                                                      os.path.join(adir, f)))[-1])
+        if os.path.isfile(apath):
+            try:
+                with open(apath, "r", encoding="utf-8") as fh:
+                    a = json.load(fh)
+                out["analysis"] = {
+                    "path": os.path.relpath(apath, ROOT).replace("\\", "/"),
+                    "summary": a.get("summary", {}),
+                    "numbers": len(a.get("numbers", [])),
+                    "images": len(a.get("images", [])),
+                    "chart_texts": len(a.get("chart_texts", [])),
+                    "data_values": len(a.get("data_values", {})),
+                    "texts": len(a.get("texts", [])),
+                }
+                out["analysis_download"] = (
+                    "/api/bridges/%s/analysis/%s" % (
+                        bridge_id, os.path.basename(apath)))
+            except Exception as exc:  # noqa: BLE001
+                out["analysis_error"] = str(exc)
+    return jsonify(out)
+
+
+@app.route("/api/bridges/<bridge_id>/sensor-map-docx", methods=["POST"])
+def api_bridge_sensor_map_docx_upload(bridge_id):
+    """上传传感器测点编号表格 .docx 并重新生成传感器对照表。
+
+    表单字段：
+      file   测点编号表格 .docx（可含一座或多座桥）
+      mode   full=完整覆盖（默认）/ merge=合并补充到现有对照表
+    """
+    auth = _require_token()
+    if auth:
+        return auth
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "未选择文件"}), 400
+    name = _repair_filename(os.path.basename(f.filename))
+    if not name.lower().endswith(".docx"):
+        return jsonify({"error": "仅支持 .docx 测点编号表格"}), 400
+    mode = str(request.form.get("mode") or "full").strip()
+    if mode not in ("full", "merge"):
+        mode = "full"
+
+    inputs_dir = os.path.join(ROOT, "inputs")
+    os.makedirs(inputs_dir, exist_ok=True)
+    stem, ext = os.path.splitext(name)
+    dest = os.path.join(inputs_dir, f"{stem}_{dt.datetime.now():%Y%m%d_%H%M%S}{ext}")
+    f.save(dest)
+
+    stats_dir = os.path.join(ROOT, "preprocess", "统计值_2026.1~3")
+    if not os.path.isdir(stats_dir):
+        stats_dir = os.path.join(ROOT, "preprocess", "统计值")
+    out_map = os.path.join(ROOT, "preprocess", "传感器对照",
+                           "传感器编号名称.json")
+    cmd = [sys.executable,
+           os.path.join(ROOT, "preprocess", "scripts", "parse_sensor_map.py"),
+           dest, out_map, stats_dir]
+    if mode == "merge":
+        cmd.append("--merge")
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, env=_subprocess_env(),
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=600)
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"对照表生成异常: {exc}"}), 500
+    if proc.returncode != 0:
+        return jsonify({"error": "对照表生成失败",
+                        "log": (proc.stdout or "") + (proc.stderr or "")}), 500
+
+    # 更新预处理配置里的测点编号表格路径
+    try:
+        with open(PREPROCESS_CONFIG, "r", encoding="utf-8") as fh:
+            pcfg = json.load(fh)
+        pcfg["sensor_map_docx"] = os.path.relpath(dest, ROOT).replace("\\", "/")
+        with open(PREPROCESS_CONFIG, "w", encoding="utf-8") as fh:
+            json.dump(pcfg, fh, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        pass
+    return jsonify({
+        "ok": True,
+        "mode": mode,
+        "saved": os.path.relpath(dest, ROOT).replace("\\", "/"),
+        "log": (proc.stdout or "")[-2000:],
+        "sensor_map": os.path.relpath(out_map, ROOT).replace("\\", "/"),
+    })
 
 
 @app.route("/api/bridges/<bridge_id>/data")
@@ -569,8 +970,17 @@ def _update_bridge_data_dirs(bridge_id: str, stats_dir: str,
     bd["sensor_map"] = os.path.join(map_dir, "传感器编号名称.json")
     bd["overview"] = os.path.join(stats_dir, "总览.json")
     bridge = bd.get("bridge_name", "") or ""
-    bd["name_dict"] = os.path.join(map_dir, "传感器名称对照",
-                                   f"{bridge}大桥.json")
+    from report_agent.config import name_dict_candidates
+    nd_dir = os.path.join(map_dir, "传感器名称对照")
+    bd["name_dict"] = ""
+    for fn in name_dict_candidates(bridge):
+        cand = os.path.join(nd_dir, fn)
+        if os.path.isfile(cand):
+            bd["name_dict"] = cand
+            break
+    if not bd["name_dict"]:
+        bd["name_dict"] = os.path.join(nd_dir,
+                                       f"{bridge}大桥.json")
     _save_config(cfg, cfg_path)
 
 
@@ -621,6 +1031,7 @@ def api_bridge_run(bridge_id):
     start = str(data.get("start") or "").strip()
     end = str(data.get("end") or "").strip()
     auto_preprocess = bool(data.get("auto_preprocess"))
+    template = str(data.get("template") or "").strip() or None
 
     if start and end:
         period = {"start": start, "end": end,
@@ -667,6 +1078,11 @@ def api_bridge_run(bridge_id):
                 cmd += ["--date", date]
             if engine:
                 cmd += ["--engine", engine]
+            if template:
+                tpl_path = (template if os.path.isabs(template)
+                            else os.path.join(ROOT, template))
+                cmd += ["--template", tpl_path]
+                st["template"] = template
             st["cmd"] = " ".join(cmd)
             proc = subprocess.Popen(
                 cmd, cwd=ROOT, env=_subprocess_env(),

@@ -76,6 +76,7 @@
   <button data-tab="download" onclick="showTab('download')">下载报告</button>
   <button data-tab="coverage" onclick="showTab('coverage')">数据覆盖</button>
   <button data-tab="pending" onclick="showTab('pending')">待补清单</button>
+  <button data-tab="upload" onclick="showTab('upload')">上传数据</button>
   <button data-tab="preprocess" onclick="showTab('preprocess')">数据处理</button>
   <button data-tab="config" onclick="showTab('config')">配置管理</button>
   <button data-tab="scheduler" onclick="showTab('scheduler')">调度器</button>
@@ -91,6 +92,9 @@
       <h3>手动生成报告</h3>
       <div class="row">
         <select id="runBridge" style="min-width:180px"></select>
+        <select id="runTemplate" style="min-width:220px">
+          <option value="">默认模板（当前配置）</option>
+        </select>
         <select id="runMode">
           <option value="quarterly">季度报告</option>
           <option value="yearly">年度报告</option>
@@ -133,6 +137,54 @@
       <h3>待完善清单</h3>
       <div class="row"><select id="pendBridge"></select><button class="ghost" onclick="loadPending()">刷新</button></div>
       <div id="pendBody"></div>
+    </div>
+  </section>
+
+  <section id="tab-upload" style="display:none">
+    <div class="panel">
+      <h3>上传成品报告（.docx）</h3>
+      <div class="row">
+        <select id="srBridge" style="min-width:180px"></select>
+        <select id="srTarget">
+          <option value="same">已有桥</option>
+          <option value="new">新桥</option>
+        </select>
+        <span id="srNewFields" style="display:none">
+          <input type="text" id="srNewId" placeholder="新桥ID（如 xinhe）" style="width:140px">
+          <input type="text" id="srNewName" placeholder="新桥名称（如 新河特大桥）" style="width:170px">
+        </span>
+      </div>
+      <div class="row">
+        <input type="file" id="srFile" accept=".docx">
+        <button onclick="uploadSourceReport()">上传成品报告</button>
+        <span id="srStatus" class="muted"></span>
+      </div>
+      <div id="srActions" style="display:none;margin-top:10px">
+        <p class="muted" id="srSaved"></p>
+        <div class="row">
+          <button onclick="useExistingTemplate()">① 用已有模版生成报告</button>
+          <button class="ghost" onclick="parseNewTemplate()">② 重新解析生成新模版</button>
+          <input type="file" id="tplFile2" accept=".docx" style="max-width:260px">
+          <button class="ghost" onclick="uploadTemplateLocal()">③ 上传本地解析模版</button>
+        </div>
+        <div id="parseStatus" class="muted"></div>
+        <div id="parseResult" style="display:none;margin-top:10px"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>上传传感器测点编号表格（.docx）</h3>
+      <p class="muted">表格可含一座或多座桥；补充模式下新解析的编号会合并进现有对照表（按编号覆盖，其余保留）。</p>
+      <div class="row">
+        <input type="file" id="smapFile" accept=".docx">
+        <select id="smapMode">
+          <option value="full">完整覆盖（多桥表格）</option>
+          <option value="merge">合并补充（补充已有桥/新桥测点）</option>
+        </select>
+        <button onclick="uploadSensorMapDocx()">上传并生成对照表</button>
+        <span id="smapStatus" class="muted"></span>
+      </div>
+      <pre id="smapLog" style="margin-top:8px">—</pre>
     </div>
   </section>
 
@@ -273,10 +325,11 @@ function showTab(name) {
   for (var j = 0; j < secs.length; j++) secs[j].style.display = "none";
   var el = $("tab-" + name);
   if (el) el.style.display = "block";
-  if (name === "run") fillBridgeSelect("runBridge");
+  if (name === "run") { fillBridgeSelect("runBridge"); loadRunTemplates(); }
   if (name === "download") { fillBridgeSelect("dlBridge"); loadReports(); }
   if (name === "coverage") { fillBridgeSelect("covBridge"); loadCoverage(); }
   if (name === "pending") { fillBridgeSelect("pendBridge"); loadPending(); }
+  if (name === "upload") { fillBridgeSelect("srBridge"); resetUploadPanel(); }
   if (name === "preprocess") loadPreprocessConfig();
   if (name === "config") fillBridgeSelect("cfgBridge");
   if (name === "scheduler") { fillBridgeSelect("schBridge"); loadScheduler(); }
@@ -295,6 +348,24 @@ function fillBridgeSelect(id) {
     sel.appendChild(o);
   });
   if (cur) sel.value = cur;
+}
+
+function loadRunTemplates() {
+  var bridgeId = $("runBridge").value;
+  if (!bridgeId) return;
+  api("/api/bridges/" + bridgeId + "/templates").then(function (d) {
+    var sel = $("runTemplate");
+    var cur = sel.value;
+    sel.innerHTML = '<option value="">默认模板（当前配置' +
+      (d.current ? "：" + esc(d.current) : "") + "）</option>";
+    (d.templates || []).forEach(function (t) {
+      var o = document.createElement("option");
+      o.value = t.path;
+      o.textContent = t.name + (t.current ? "（当前）" : "");
+      sel.appendChild(o);
+    });
+    if (cur) sel.value = cur;
+  }).catch(function () {});
 }
 
 function bridgeCardHtml(b) {
@@ -339,6 +410,10 @@ function onModeChange() {
 }
 $("runMode").addEventListener("change", onModeChange);
 $("runEnd").addEventListener("change", checkPeriod);
+$("runBridge").addEventListener("change", function () {
+  loadRunTemplates();
+  checkPeriod();
+});
 
 function checkPeriod() {
   var bridgeId = $("runBridge").value;
@@ -362,7 +437,11 @@ function checkPeriod() {
 
 function startRun() {
   var bridgeId = $("runBridge").value;
-  var body = { mode: $("runMode").value, date: $("runEnd").value || "" };
+  var body = {
+    mode: $("runMode").value,
+    date: $("runEnd").value || "",
+    template: $("runTemplate").value || ""
+  };
   if (body.mode === "manual") body.start = $("runStart").value || "";
   body.auto_preprocess = $("runAutoPre").checked;
   $("runResult").innerHTML = "";
@@ -611,6 +690,187 @@ function uploadTemplate() {
       loadConfig();
     })
     .catch(function (e) { showMsg(String(e), "err"); });
+}
+
+function resetUploadPanel() {
+  $("srActions").style.display = "none";
+  $("parseStatus").textContent = "";
+  $("srStatus").textContent = "";
+}
+
+$("srTarget").addEventListener("change", function () {
+  $("srNewFields").style.display = $("srTarget").value === "new" ? "" : "none";
+});
+
+function uploadSourceReport() {
+  var bridgeId = $("srBridge").value;
+  var f = $("srFile").files[0];
+  if (!bridgeId || !f) { showMsg("请选择桥和成品报告文件", "err"); return; }
+  var target = $("srTarget").value;
+  var fd = new FormData();
+  fd.append("file", f);
+  fd.append("bridge_target", target);
+  if (target === "new") {
+    fd.append("new_bridge_id", $("srNewId").value.trim());
+    fd.append("new_bridge_name", $("srNewName").value.trim());
+    if (!$("srNewName").value.trim()) { showMsg("新桥请填写桥名", "err"); return; }
+  }
+  var headers = {};
+  var t = token();
+  if (t) headers["X-Auth-Token"] = t;
+  $("srStatus").textContent = "上传中…";
+  fetch("/api/bridges/" + bridgeId + "/source-report", { method: "POST", body: fd, headers: headers })
+    .then(function (res) { return res.json(); })
+    .then(function (d) {
+      if (d.error) throw new Error(d.error);
+      if (target === "new") {
+        showMsg("新桥已登记：" + d.bridge_name + "（" + d.bridge_id + "）", "ok");
+        loadBridges();
+        setTimeout(function () {
+          if (d.bridge_id) {
+            $("srBridge").value = d.bridge_id;
+            fillBridgeSelect("srBridge");
+          }
+        }, 300);
+      } else {
+        showMsg("成品报告已上传", "ok");
+      }
+      $("srSaved").textContent = "已保存：" + d.source_report +
+        (d.template ? "　当前模版：" + d.template : "（新桥尚无模版，可②重新解析或③上传模版）");
+      $("srActions").style.display = "";
+      $("srStatus").textContent = "完成";
+    })
+    .catch(function (e) { showMsg(String(e), "err"); $("srStatus").textContent = ""; });
+}
+
+function currentUploadBridge() {
+  return $("srBridge").value;
+}
+
+function useExistingTemplate() {
+  var bridgeId = currentUploadBridge();
+  if (!bridgeId) return;
+  showTab("run");
+  $("runBridge").value = bridgeId;
+  startRun();
+}
+
+function parseNewTemplate() {
+  var bridgeId = currentUploadBridge();
+  if (!bridgeId) return;
+  $("parseStatus").textContent = "正在解析成品报告生成新模版（LLM 识别，可能需要几分钟）…";
+  api("/api/bridges/" + bridgeId + "/template/parse", { method: "POST", body: "{}" })
+    .then(function (r) {
+      showMsg("模板解析已启动", "ok");
+      pollParse(bridgeId);
+    })
+    .catch(function (e) { showMsg(String(e), "err"); $("parseStatus").textContent = ""; });
+}
+
+function pollParse(bridgeId) {
+  var timer = setInterval(function () {
+    api("/api/bridges/" + bridgeId + "/parse/status").then(function (s) {
+      if (s.running) {
+        $("parseStatus").textContent = "解析中…（PID " + (s.pid || "?") + "）";
+        return;
+      }
+      clearInterval(timer);
+      if (s.error) {
+        $("parseStatus").innerHTML = '<span class="red">' + esc(s.error) + "</span>";
+        if (s.log_tail) $("parseStatus").innerHTML += "<pre>" + esc(s.log_tail.slice(-1500)) + "</pre>";
+      } else {
+        $("parseStatus").innerHTML = '<span class="green">解析完成，详见下方结果</span>';
+        loadParseResult(bridgeId);
+        loadConfig();
+        loadRunTemplates();
+      }
+    }).catch(function () { clearInterval(timer); });
+  }, 5000);
+}
+
+function loadParseResult(bridgeId) {
+  api("/api/bridges/" + bridgeId + "/parse/result").then(function (r) {
+    if (!r.template && !r.analysis) {
+      $("parseResult").style.display = "none";
+      return;
+    }
+    var h = '<div class="panel" style="margin:0"><h3>解析结果</h3><div class="kv">';
+    if (r.template) {
+      h += '<b>新模版</b><span>' + esc(r.template.name) +
+        '　<a href="' + r.template.download + '" target="_blank">下载</a></span>';
+    }
+    if (r.analysis) {
+      var s = r.analysis.summary || {};
+      var num = s.numbers || {};
+      var img = s.images || {};
+      h += '<b>数字</b><span>替换 ' + (num.replace || 0) + ' / 保留 ' + (num.keep || 0) +
+        (num.review ? ' / 待确认 ' + num.review : '') + '</span>';
+      h += '<b>图片</b><span>替换 ' + (img.replace || 0) + ' / 保留 ' + (img.keep || 0) + '</span>';
+      h += '<b>图表占位</b><span>' + (r.analysis.chart_texts || 0) + ' 处</span>';
+      h += '<b>data 占位</b><span>' + (r.analysis.data_values || 0) + ' 个</span>';
+      if (s.chart_texts != null) h += '<b>图表文本</b><span>' + s.chart_texts + ' 处</span>';
+      if (s.llm) {
+        h += '<b>LLM</b><span>missed ' + (s.llm.missed || 0) + ' / wrong ' +
+          (s.llm.wrong || 0) + (s.llm.complete ? ' / 完整' : ' / 不完整') + '</span>';
+      }
+      h += '<b>分析JSON</b><span><a href="' + r.analysis_download + '" target="_blank">下载</a></span>';
+    }
+    if (r.status && r.status.log_tail) {
+      h += '<b>日志尾部</b><span><pre style="max-height:180px">' +
+        esc(r.status.log_tail.slice(-1200)) + "</pre></span>";
+    }
+    h += "</div></div>";
+    $("parseResult").innerHTML = h;
+    $("parseResult").style.display = "";
+  }).catch(function () {});
+}
+
+function uploadTemplateLocal() {
+  var bridgeId = currentUploadBridge();
+  var f = $("tplFile2").files[0];
+  if (!bridgeId || !f) { showMsg("请选择本地解析模版文件", "err"); return; }
+  var fd = new FormData();
+  fd.append("file", f);
+  var headers = {};
+  var t = token();
+  if (t) headers["X-Auth-Token"] = t;
+  fetch("/api/bridges/" + bridgeId + "/template", { method: "POST", body: fd, headers: headers })
+    .then(function (res) { return res.json(); })
+    .then(function (d) {
+      if (d.error) throw new Error(d.error);
+      showMsg("本地模版已上传：" + d.template, "ok");
+      $("parseStatus").innerHTML = '<span class="green">当前模版：' + esc(d.template) + "</span>";
+      loadConfig();
+    })
+    .catch(function (e) { showMsg(String(e), "err"); });
+}
+
+function uploadSensorMapDocx() {
+  var bridgeId = $("srBridge").value;
+  var f = $("smapFile").files[0];
+  if (!f) { showMsg("请选择测点编号表格文件", "err"); return; }
+  var fd = new FormData();
+  fd.append("file", f);
+  fd.append("mode", $("smapMode").value);
+  var headers = {};
+  var t = token();
+  if (t) headers["X-Auth-Token"] = t;
+  $("smapStatus").textContent = "解析中…";
+  $("smapLog").textContent = "—";
+  fetch("/api/bridges/" + (bridgeId || "chishi") + "/sensor-map-docx", { method: "POST", body: fd, headers: headers })
+    .then(function (res) { return res.json(); })
+    .then(function (d) {
+      if (d.error) {
+        showMsg(d.error, "err");
+        $("smapStatus").textContent = "失败";
+        if (d.log) $("smapLog").textContent = d.log;
+        return;
+      }
+      showMsg("对照表已生成（" + d.mode + "）", "ok");
+      $("smapStatus").textContent = "完成";
+      $("smapLog").textContent = d.log || "";
+    })
+    .catch(function (e) { showMsg(String(e), "err"); $("smapStatus").textContent = ""; });
 }
 
 function loadScheduler() {

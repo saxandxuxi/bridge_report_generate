@@ -91,6 +91,7 @@ def build_value_resolver(stats: Dict, period: Dict,
                          bridge=None, missing_sink: Optional[list] = None,
                          lineage: Optional[list] = None,
                          data_meta: Optional[Dict] = None,
+                         llm_cfg: Optional[Dict] = None,
                          missing_marker: str = "—") -> Callable[[str], str]:
     """根据统计结果和报告期构建占位符解析函数。
 
@@ -100,6 +101,7 @@ def build_value_resolver(stats: Dict, period: Dict,
       expr:<表达式>           — 简单算术表达式
       cell.<metric>.<column>.<stat>  — 表格单元格（多数据源 + 测点级查询）
       data.N                 — 通用数据占位符（回填原始值）
+      summary.<metric>       — 按季度/年度统计生成的结论性总结（LLM 或规则兜底）
 
     bridge: 可选的真实监测数据适配器（report_agent.bridge_source.BridgeData），
             优先于 data_registry / stats 解析 cell 与 stats 占位符。
@@ -180,6 +182,7 @@ def build_value_resolver(stats: Dict, period: Dict,
                 _value, _detail = bridge.resolve_metric_stat_detail(_metric, _stat, period)
                 if _detail and _detail.get("位置"):
                     _log({"占位符": key, "类型": "stats最值位置", "值": _detail["位置"],
+                          "输出": _detail["位置"],
                           "关联": f"stats.{_metric}.{_stat}",
                           "说明": "取达到最值/最大差值的传感器监测部位"})
                     return str(_detail["位置"])
@@ -190,6 +193,11 @@ def build_value_resolver(stats: Dict, period: Dict,
                 return missing_marker
             if len(parts) == 3 and bridge is not None:
                 _, metric, stat = parts
+                # 总结段落状态句（缺失数据位置自动生成）
+                if stat == "data_status":
+                    return bridge.resolve_data_status(metric, period)
+                if stat == "abnormal_clause":
+                    return bridge.resolve_abnormal_clause(metric, period)
                 value = None
                 try:
                     value, detail = bridge.resolve_metric_stat_detail(metric, stat, period)
@@ -262,6 +270,25 @@ def build_value_resolver(stats: Dict, period: Dict,
             if isinstance(value, dt.datetime):
                 return value.strftime("%Y-%m-%d %H:%M")
             return str(value)
+        # 结论性总结：{{summary.<metric>}} —— 基于季度/年度统计生成
+        if key.startswith("summary."):
+            metric = key.split(".", 1)[1] if "." in key else ""
+            if bridge is not None and metric and metric in bridge.metrics:
+                text = bridge.build_feature_summary(metric, period,
+                                                    llm_cfg=llm_cfg)
+                if text:
+                    _log({
+                        "占位符": key,
+                        "类型": "特征总结",
+                        "指标": metric,
+                        "输出": text,
+                        "说明": "基于季度/年度统计的极值位置与缺失情况生成",
+                    })
+                    return text
+                if missing_sink is not None:
+                    missing_sink.append(key)
+                return missing_marker
+            raise KeyError(f"不支持的总结占位符: {key}")
         # 通用数据占位符：回填 annotate_docx 阶段保存的原始值
         if key.startswith("data."):
             if data_values and key in data_values:
@@ -297,6 +324,13 @@ def _format_cell_value(stat: str, value: float) -> str:
         # 整数化的值（如 0.0）显示为整数
         if value == int(value) and abs(value) < 1e9:
             return str(int(value))
+        # 只有真正极小（绝对值 < 1e-4，如 9.7e-05）才用科学计数法；
+        # 0.0001~0.1 之间的小量（如 -2.810e-04、1.357e-03）用普通小数
+        # 展示，避免表格里 0.000281 这类数据写成科学计数。
+        if abs(value) < 1e-4 and value != 0.0:
+            return f"{value:.3e}"
+        if abs(value) < 0.1:
+            return f"{value:.4g}"
         # 标准差用 2 位小数
         if stat in ("std", "均方根", "rms"):
             return f"{value:.2f}"
@@ -314,6 +348,10 @@ def _format_stat_value(key: str, value) -> str:
     if isinstance(value, float):
         if key.endswith(".std"):
             return f"{value:.2f}"
+        if abs(value) < 1e-4 and value != 0.0:
+            return f"{value:.3e}"
+        if abs(value) < 0.1:
+            return f"{value:.4g}"
         return f"{value:.1f}"
     return str(value)
 
@@ -1130,6 +1168,105 @@ def _write_data_lineage(lineage: List[Dict], logs_dir: str, period: Dict) -> str
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     return log_path
+
+
+def verify_table_columns(output_path: str, lineage: Optional[List[Dict]] = None,
+                         logs_dir: str = "", label: str = "report") -> List[Dict]:
+    """填表后校验：找出“整列未解析”或“整列同值”的表格列。
+
+    - 整列都是 “—”：该列所有单元格都没解析到传感器（应检查占位符/统计值）。
+    - 整列数值完全相同：结合血缘里这些测点对应的传感器判断——
+      若不同测点解析到了不同传感器却填成同值，说明是填充错误；
+      若传感器本就相同，则提示“数据本身如此”。
+    """
+    doc = Document(output_path)
+    warnings = []
+
+    def _num(v: str):
+        t = v.replace("−", "-").replace("—", "").strip()
+        if not t:
+            return None
+        try:
+            return float(t)
+        except ValueError:
+            return None
+
+    # 血缘里 指标/测点 -> 解析到的传感器集合
+    sensor_by_cell = {}
+    for e in (lineage or []):
+        ph = str(e.get("占位符") or "")
+        if not ph.startswith("cell."):
+            continue
+        sid = None
+        s = e.get("传感器")
+        if isinstance(s, dict):
+            sid = s.get("传感器编号")
+        if sid is None:
+            sid = e.get("sensor_id")
+        sensor_by_cell.setdefault(ph, set())
+        if sid:
+            sensor_by_cell[ph].add(str(sid))
+
+    for t_idx, table in enumerate(doc.tables):
+        if not table.rows or len(table.rows) < 2:
+            continue
+        n_cols = max(len(r.cells) for r in table.rows)
+        for c_idx in range(n_cols):
+            vals = []
+            markers = []
+            for row in table.rows[1:]:
+                if c_idx >= len(row.cells):
+                    continue
+                txt = row.cells[c_idx].text.strip()
+                vals.append(txt)
+                markers.append(txt)
+            nums = [_num(v) for v in vals]
+            filled = [n for n in nums if n is not None]
+            missing = sum(1 for i, n in enumerate(nums) if n is None and vals[i] in ("—", ""))
+            if not filled and missing >= 2:
+                warnings.append({
+                    "表序号": t_idx, "列序号": c_idx, "问题": "整列未解析",
+                    "说明": f"{missing} 个数据行全部为 “—”（未找到传感器/统计值）",
+                    "表头": str(table.rows[0].cells[c_idx].text.strip())[:40],
+                })
+                continue
+            # 整列同值：用绝对容差判断（避免 1e-4 量级的小数被
+            # round(n, 4) 误判为相同，如 0.00016 vs 0.000151）。
+            if len(filled) >= 2 and max(filled) - min(filled) < 1e-9:
+                same = filled[0]
+                # 用血缘判断：这些行解析到的传感器是否不同
+                sensors = set()
+                for e in (lineage or []):
+                    ph = str(e.get("占位符") or "")
+                    if not ph.startswith("cell."):
+                        continue
+                    if abs(float(e.get("输出") or 0)) == abs(same) and "值" in e:
+                        pass
+                # 简化：统计该列占位符涉及的传感器数（通过血缘中 cell 条目）
+                col_sensors = set()
+                for e in (lineage or []):
+                    ph = str(e.get("占位符") or "")
+                    s = e.get("传感器")
+                    sid = s.get("传感器编号") if isinstance(s, dict) else None
+                    if sid and str(e.get("输出") or "") == f"{same:.1f}":
+                        col_sensors.add(str(sid))
+                warnings.append({
+                    "表序号": t_idx, "列序号": c_idx,
+                    "问题": "整列同值",
+                    "值": same,
+                    "行数": len(filled),
+                    "血缘命中传感器数": len(col_sensors) if col_sensors else "未知",
+                    "说明": (f"整列数值相同（{same:.2f}）。若不同测点对应不同传感器则为填充错误；"
+                             "若传感器本就相同则属数据本身。")
+                })
+    if warnings and logs_dir:
+        os.makedirs(logs_dir, exist_ok=True)
+        with open(os.path.join(logs_dir, f"verify_tables_{label}.log"),
+                  "w", encoding="utf-8") as f:
+            f.write(f"填表校验 {label}：发现问题 {len(warnings)} 处\n")
+            for w in warnings:
+                f.write(json.dumps(w, ensure_ascii=False) + "\n")
+    return warnings
 
 
 def _apply_text_replacements(doc: Document, replacements: Dict[str, str]) -> int:

@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""常驻调度服务：按 config.json 中的 schedule 配置，每周/每月自动生成报告。
+"""常驻调度服务：按 config/config.json 中的 schedule 配置，每周/每月自动生成报告。
 
 用法：
   python serve_scheduler.py
-  python serve_scheduler.py --config /path/to/config.json
+  python serve_scheduler.py --config /path/to/config/config.json
   python serve_scheduler.py --bridge chishi
 """
 

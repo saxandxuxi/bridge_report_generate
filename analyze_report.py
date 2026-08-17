@@ -84,7 +84,7 @@ def _ensure_bridge_config(config_path: str, input_path: str) -> str:
     nd = bd.get("name_dict", "")
     if bd.get("enabled") and nd:
         nd_abs = nd if os.path.isabs(nd) else os.path.join(
-            os.path.dirname(os.path.abspath(config_path)), nd)
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), nd)
         if os.path.isfile(nd_abs):
             return config_path
     try:
@@ -139,7 +139,7 @@ def main() -> int:
     parser.add_argument("--out", default=None, help="识别结果 JSON 输出路径")
     parser.add_argument("--annotate", default=None,
                         help="(DOCX) 生成标注草稿 .docx 的路径")
-    parser.add_argument("--config", default="config.json",
+    parser.add_argument("--config", default="config/config.json",
                         help="配置文件路径（若 llm.enabled=true 则启用 LLM 辅助识别）")
     parser.add_argument("--llm", action="store_true",
                         help="强制启用 LLM 辅助识别（忽略 config 中的 llm.enabled 设置）")
@@ -169,7 +169,31 @@ def main() -> int:
             log.warning("配置文件未找到: %s（不使用 LLM）", args.config)
 
     log.info("开始解析报告: %s", args.input)
-    analysis = recognize(args.input, llm_cfg=llm_cfg)
+    # 加载传感器对照表（用于“编号(特征)_图型”行反查监测部位，
+    # 生成位置化图表占位符，避免 chart_sensor_<编号>_<图型> 难匹配）
+    sensor_map = {}
+    try:
+        cfg_for_map = load_config(args.config)
+        sm_path = (cfg_for_map.get("bridge_data") or {}).get("sensor_map", "")
+        if not sm_path:
+            # 默认固定产物位置: preprocess/传感器对照/传感器编号名称.json
+            cand = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "preprocess", "传感器对照",
+                                "传感器编号名称.json")
+            if os.path.isfile(cand):
+                sm_path = cand
+        if sm_path:
+            if not os.path.isabs(sm_path):
+                sm_path = os.path.join(
+                    os.path.dirname(os.path.abspath(args.config)), sm_path)
+            if os.path.isfile(sm_path):
+                with open(sm_path, encoding="utf-8") as f:
+                    sensor_map = (json.load(f) or {}).get("传感器", {}) or {}
+                log.info("传感器对照表已加载: %s（%d 个）",
+                         sm_path, len(sensor_map))
+    except Exception:  # noqa: BLE001
+        sensor_map = {}
+    analysis = recognize(args.input, llm_cfg=llm_cfg, sensor_map=sensor_map)
     log.info("解析完成: 图片 %d 张，数字 %d 个，图表占位 %d 处",
              len(analysis["images"]), len(analysis["numbers"]),
              len(analysis.get("chart_texts", [])))
@@ -186,7 +210,7 @@ def main() -> int:
         else:
             log.info("生成标注草稿: %s", args.annotate)
             result = annotate_docx(args.input, args.annotate, llm_cfg=llm_cfg,
-                                   analysis=analysis)
+                                   analysis=analysis, sensor_map=sensor_map)
             log.info("标注草稿已生成: %s", result["output"])
             log.info("替换数字 %d 个（跨格式跳过 %d 个），替换图片 %d 张，"
                      "图表文本 %d 处，文本 %d 处，data 占位符 %d 个",

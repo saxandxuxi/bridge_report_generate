@@ -391,6 +391,7 @@ class ReportAgent:
             missing_sink=missing_sinks,
             lineage=lineage,
             data_meta=self.cfg.get("_data_number_meta", {}),
+            llm_cfg=self.cfg.get("llm"),
         )
 
         # 输出文件名：优先使用 config.report_name_prefix；
@@ -406,6 +407,13 @@ class ReportAgent:
                 name_prefix = os.path.splitext(os.path.basename(self.cfg.get("template", "")))[0]
             # 去掉 _template / _模板 等后缀
             name_prefix = re.sub(r"[_-]template$|[_-]模板$", "", name_prefix, flags=re.IGNORECASE)
+
+        # 报告名带上模板版本（如 _template_v17），便于区分不同模板生成的报告
+        if "_template_v" not in name_prefix:
+            m = re.search(r"_v(\d+)(?:\.docx)?$",
+                          os.path.basename(self.cfg.get("template", "")))
+            if m:
+                name_prefix = f"{name_prefix}_template_v{m.group(1)}"
 
         with_ts = name_cfg.get("with_timestamp", True)
         if mode == "quarterly":
@@ -451,6 +459,16 @@ class ReportAgent:
             log.info("数据链路日志已写出: %s（%d 条，未找到 %d 条）",
                      lineage_path, len(lineage),
                      sum(1 for e in lineage if e.get("结果") == "未找到"))
+            # 填表校验：整列未解析 / 整列同值 告警
+            try:
+                verify_warns = report_builder.verify_table_columns(
+                    out_path, lineage=lineage, logs_dir=logs_dir,
+                    label=period.get("label") or "report")
+                if verify_warns:
+                    log.warning("填表校验发现问题 %d 处（详见 verify_tables_%s.log）",
+                                len(verify_warns), period.get("label"))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("填表校验失败: %s", exc)
         else:
             lineage_path = ""
 
@@ -765,8 +783,21 @@ def run_once(
     report_date: str = None,
     engine: str = None,
     inspect_only: bool = False,
+    template_override: str = None,
 ) -> Dict:
     cfg = load_config(config_path)
+    if template_override:
+        tpl = template_override
+        if not os.path.isabs(tpl):
+            # 相对路径统一相对项目根目录解析（config 文件已移到 config/ 下）
+            base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            tpl = os.path.normpath(os.path.join(base, tpl))
+        if os.path.isfile(tpl):
+            cfg["template"] = tpl
+        else:
+            import logging as _lg
+            _lg.getLogger("report-agent.agent").warning(
+                "指定的模板不存在，继续使用配置模板: %s", tpl)
 
     # 统一日志：与 scheduler 一致的 handler 风格
     output_dir = cfg.get("output_dir", "outputs")

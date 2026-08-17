@@ -93,12 +93,26 @@ def _setup_logging(output_dir: str) -> None:
 def _run_report_generation(cwd: str, mode: str) -> None:
     """调用 run_agent.py 生成报告。"""
     log.info("触发报告生成（模式=%s）", mode)
+    cmd = [sys.executable, "run_agent.py", "--mode", mode]
+    if mode == "quarterly":
+        # 季度首月(1/4/7/10月)触发时，报告上一个完整季度：
+        # 4/1 跑 1~3 月、7/1 跑 4~6 月、10/1 跑 7~9 月、1/1 跑去年 10~12 月
+        today = dt.date.today()
+        q = (today.month - 1) // 3          # 当前季度 0 基
+        first = dt.date(today.year, q * 3 + 1, 1)
+        end = first - dt.timedelta(days=1)  # 上一季度最后一天
+        cmd += ["--date", end.isoformat()]
+        log.info("季度报告期截止: %s（覆盖 %s ~ %s）",
+                 end.isoformat(),
+                 dt.date(end.year, ((end.month - 1) // 3) * 3 + 1, 1).isoformat(),
+                 end.isoformat())
+    elif mode == "yearly":
+        # 年度任务在次年 1 月触发时，报告上一年全年
+        end = dt.date(dt.date.today().year - 1, 12, 31)
+        cmd += ["--date", end.isoformat()]
+        log.info("年度报告期截止: %s", end.isoformat())
     try:
-        proc = subprocess.run(
-            [sys.executable, "run_agent.py", "--mode", mode],
-            cwd=cwd,
-            timeout=1800,
-        )
+        proc = subprocess.run(cmd, cwd=cwd, timeout=1800)
         if proc.returncode != 0:
             log.error("报告生成失败，返回码 %s", proc.returncode)
         else:

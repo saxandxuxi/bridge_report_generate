@@ -1,11 +1,11 @@
 {
-  "说明": "六座桥部署注册表。每个条目对应一台独立服务器上的报告智能体实例。config 相对项目根目录解析。",
+  "说明": "六座桥部署注册表。每个条目对应一台独立服务器上的报告智能体实例。config 统一放在项目根目录 config/ 下，相对项目根目录解析。",
   "更新日期": "2026-08-06",
   "bridges": [
     {
       "id": "chishi",
       "name": "赤石大桥",
-      "config": "config_chishi.json",
+      "config": "config/config_chishi.json",
       "host": "222.242.152.65",
       "port": 8080,
       "token_env": "BRIDGE_CHISHI_TOKEN",
@@ -14,7 +14,7 @@
     {
       "id": "dongtinghu",
       "name": "洞庭湖大桥",
-      "config": "config.json",
+      "config": "config/config.json",
       "host": "222.242.220.14",
       "port": 8080,
       "token_env": "BRIDGE_DONGTINGHU_TOKEN",
@@ -32,7 +32,7 @@
     {
       "id": "xiangjiang",
       "name": "湘江特大桥",
-      "config": "",
+      "config": "config/config_xiangjiang.json",
       "host": "222.247.255.109",
       "port": 8080,
       "token_env": "BRIDGE_XIANGJIANG_TOKEN",
@@ -41,7 +41,7 @@
     {
       "id": "aizhai",
       "name": "矮寨大桥",
-      "config": "config_aizhai.json",
+      "config": "config/config_aizhai.json",
       "host": "218.76.92.189",
       "port": 8080,
       "token_env": "BRIDGE_AIZHAI_TOKEN",
@@ -59,7 +59,7 @@
     {
       "id": "矮寨大桥",
       "name": "矮寨大桥",
-      "config": "config_矮寨大桥.json",
+      "config": "config/config_矮寨大桥.json",
       "host": "",
       "port": 8080
     }
