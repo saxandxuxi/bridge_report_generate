@@ -57,6 +57,20 @@
   .muted { color: var(--dim); font-size: 12px; }
   .right { margin-left: auto; }
   .green { color: var(--ok); } .red { color: var(--bad); } .yellow { color: var(--warn); }
+  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; z-index: 50; }
+  .modal-mask.show { display: flex; align-items: stretch; justify-content: center; }
+  .modal { background: var(--card); border: 1px solid var(--line); border-radius: 12px; width: min(1100px, 96vw); height: 92vh; margin: 2vh auto; display: flex; flex-direction: column; }
+  .modal-head { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  .modal-body { flex: 1; display: flex; overflow: hidden; }
+  .pv-side { width: 300px; border-right: 1px solid var(--line); overflow: auto; padding: 12px; }
+  .pv-doc { flex: 1; overflow: auto; background: #fff; color: #111; padding: 24px 34px; }
+  .pv-doc p { margin: 6px 0; line-height: 1.6; }
+  .pv-doc p.h { font-weight: 700; margin-top: 14px; }
+  .pv-doc table { border-collapse: collapse; width: 100%; margin: 8px 0; color: #111; }
+  .pv-doc td, .pv-doc th { border: 1px solid #cbd5e1; padding: 4px 8px; font-size: 12px; }
+  .pv-doc p.needs-human { background: #fff7d6; border-left: 4px solid #f59e0b; padding-left: 8px; cursor: help; }
+  .issue-item { background: var(--card2); border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin-bottom: 8px; font-size: 12px; }
+  .issue-item .t { color: var(--warn); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -74,12 +88,11 @@
   <button class="active" data-tab="overview" onclick="showTab('overview')">总览</button>
   <button data-tab="run" onclick="showTab('run')">生成报告</button>
   <button data-tab="download" onclick="showTab('download')">下载报告</button>
-  <button data-tab="coverage" onclick="showTab('coverage')">数据覆盖</button>
-  <button data-tab="pending" onclick="showTab('pending')">待补清单</button>
   <button data-tab="upload" onclick="showTab('upload')">上传数据</button>
   <button data-tab="preprocess" onclick="showTab('preprocess')">数据处理</button>
   <button data-tab="config" onclick="showTab('config')">配置管理</button>
   <button data-tab="scheduler" onclick="showTab('scheduler')">调度器</button>
+  <button data-tab="review" onclick="showTab('review')">审查问题</button>
   <button data-tab="log" onclick="showTab('log')">日志</button>
 </nav>
 <main>
@@ -102,6 +115,14 @@
           <option value="weekly">周报</option>
           <option value="manual">手动区间</option>
         </select>
+        <select id="runQuarter" title="季度号 1~4（季度过完才能生成）">
+          <option value="1">第1季度</option>
+          <option value="2">第2季度</option>
+          <option value="3">第3季度</option>
+          <option value="4">第4季度</option>
+        </select>
+        <input type="number" id="runYear" min="2020" max="2100" step="1"
+               title="年份（默认最近一个已结束的年份/季度，年度和季度模式用）" style="width:90px">
         <input type="date" id="runEnd" title="报告期结束日（留空=今天）">
         <input type="date" id="runStart" title="手动区间开始日（仅手动区间用）" style="display:none">
         <button onclick="startRun()">开始生成</button>
@@ -121,22 +142,6 @@
       <h3>已生成报告</h3>
       <div class="row"><select id="dlBridge"></select><button class="ghost" onclick="loadReports()">刷新</button></div>
       <table id="reportTable"><thead><tr><th>文件名</th><th>大小</th><th>生成时间</th><th></th></tr></thead><tbody></tbody></table>
-    </div>
-  </section>
-
-  <section id="tab-coverage" style="display:none">
-    <div class="panel">
-      <h3>真实数据覆盖度</h3>
-      <div class="row"><select id="covBridge"></select><button class="ghost" onclick="loadCoverage()">刷新</button></div>
-      <div id="covBody"></div>
-    </div>
-  </section>
-
-  <section id="tab-pending" style="display:none">
-    <div class="panel">
-      <h3>待完善清单</h3>
-      <div class="row"><select id="pendBridge"></select><button class="ghost" onclick="loadPending()">刷新</button></div>
-      <div id="pendBody"></div>
     </div>
   </section>
 
@@ -191,12 +196,12 @@
   <section id="tab-preprocess" style="display:none">
     <div class="panel">
       <h3>数据处理管道（秒级原始数据 → 日级 → 图库/统计值）</h3>
-      <div class="field"><label>秒级数据目录</label><input id="ppRaw" placeholder="如 D:/信科采集软件解析数据"></div>
-      <div class="field"><label>日级数据目录</label><input id="ppDaily" placeholder="预处理输出的日级/小时级数据根目录"></div>
-      <div class="field"><label>图库目录</label><input id="ppCharts" placeholder="如 D:/.../图库"></div>
-      <div class="field"><label>统计值目录</label><input id="ppStats" placeholder="如 D:/.../统计值"></div>
+      <div class="field"><label style="color:var(--bad)">秒级数据目录 *</label><input id="ppRaw" placeholder="必填，如 E:/信科采集软件解析数据"></div>
+      <div class="field"><label style="color:var(--bad)">日级数据目录 *</label><input id="ppDaily" placeholder="必填，预处理输出的日级/小时级数据根目录，如 E:/preprocess_sensor_data"></div>
+      <div class="field"><label>图库目录（可留空自动生成）</label><input id="ppCharts" placeholder="留空=按桥名自动生成 preprocess/图库_<期>/<桥名>"></div>
+      <div class="field"><label>统计值目录（可留空自动生成）</label><input id="ppStats" placeholder="留空=按桥名自动生成 preprocess/统计值_<期>/<桥名>"></div>
       <div class="field"><label>测点编号表格</label><input id="ppMapDocx" placeholder="五座桥测点编号表格.docx 路径（可留空）"></div>
-      <div class="field"><label>桥名</label><input id="ppBridge" placeholder="如 赤石"></div>
+      <div class="field"><label style="color:var(--bad)">桥名 *</label><input id="ppBridge" placeholder="必填，如 洣水河特大桥 / 洣水 / 赤石（自动匹配 config/ 下对应桥配置）"></div>
       <div class="field"><label>起始日期</label><input type="date" id="ppStart" title="只处理该日期之后的秒级数据（可留空=全部）"></div>
       <div class="field"><label>结束日期</label><input type="date" id="ppEnd" title="只处理该日期之前的秒级数据（可留空=全部）"></div>
       <div class="row">
@@ -233,6 +238,22 @@
 
       <h3 style="font-size:14px">报告命名 / 其他</h3>
       <div class="field"><label>文件名前缀</label><input id="cfgNamePrefix" placeholder="如 赤石大桥"></div>
+
+      <h3 style="font-size:14px">大模型（LLM 审查 / 识别）</h3>
+      <div class="field"><label>模型供应商</label>
+        <select id="cfgLlmProvider">
+          <option value="">请选择供应商</option>
+        </select>
+      </div>
+      <div class="field"><label>API Key</label>
+        <input type="password" id="cfgLlmKey" placeholder="填供应商 API Key（只写入本机配置，接口返回时打码）">
+      </div>
+      <div class="field"><label>模型名称</label><input id="cfgLlmModel" placeholder="选供应商后自动带出，可改"></div>
+      <div class="row">
+        <button class="ghost" onclick="testLlm()">测试连接</button>
+        <span id="llmTestResult" class="muted"></span>
+      </div>
+
       <div class="row"><button onclick="saveConfig()">保存配置</button></div>
     </div>
   </section>
@@ -245,7 +266,7 @@
       <h3 style="font-size:14px">调度设置</h3>
       <div class="field"><label>周期</label>
         <select id="schMode">
-          <option value="quarterly">每季度（季度首月）</option>
+          <option value="quarterly">每季度（季度过完）</option>
           <option value="yearly">每年（1月）</option>
           <option value="monthly">每月</option>
           <option value="weekly">每周</option>
@@ -253,11 +274,24 @@
       </div>
       <div class="field"><label>触发日期</label><input id="schDay" type="number" min="1" max="31" value="1"></div>
       <div class="field"><label>触发时间</label><input id="schHour" type="number" min="0" max="23" value="8"> 时 <input id="schMinute" type="number" min="0" max="59" value="0"> 分</div>
+      <div class="field"><label>起始日期</label><input id="schStart" type="date"
+        title="调度从这天开始：启动时会先补跑“从这天到今天的已结束季度”，再按周期等待下一个季度过完"></div>
       <div class="row">
         <button onclick="saveSchedule()">保存调度设置</button>
         <button class="ghost" onclick="startScheduler()">启动调度器</button>
         <button class="ghost danger" onclick="stopScheduler()" style="color:var(--bad)">停止调度器</button>
       </div>
+    </div>
+  </section>
+
+  <section id="tab-review" style="display:none">
+    <div class="panel">
+      <h3>审查问题</h3>
+      <div class="row">
+        <select id="revBridge"></select>
+        <button class="ghost" onclick="loadReview()">刷新</button>
+      </div>
+      <div id="revBody">—</div>
     </div>
   </section>
 
@@ -327,12 +361,11 @@ function showTab(name) {
   if (el) el.style.display = "block";
   if (name === "run") { fillBridgeSelect("runBridge"); loadRunTemplates(); }
   if (name === "download") { fillBridgeSelect("dlBridge"); loadReports(); }
-  if (name === "coverage") { fillBridgeSelect("covBridge"); loadCoverage(); }
-  if (name === "pending") { fillBridgeSelect("pendBridge"); loadPending(); }
   if (name === "upload") { fillBridgeSelect("srBridge"); resetUploadPanel(); }
   if (name === "preprocess") loadPreprocessConfig();
-  if (name === "config") fillBridgeSelect("cfgBridge");
+  if (name === "config") { fillBridgeSelect("cfgBridge"); loadConfig(); }
   if (name === "scheduler") { fillBridgeSelect("schBridge"); loadScheduler(); }
+  if (name === "review") { fillBridgeSelect("revBridge"); loadReview(); }
   if (name === "log") fillBridgeSelect("logBridge");
 }
 
@@ -373,7 +406,7 @@ function bridgeCardHtml(b) {
   var last = "尚无运行记录";
   if (b.last_run) {
     last = (b.last_run.period && b.last_run.period.label ? b.last_run.period.label : "—") +
-      " · 待补图 " + (b.last_run.pending_charts || 0) + " · 缺失值 " + (b.last_run.missing_cells || 0);
+      " · 未填充单元格 " + (b.last_run.missing_cells || 0);
   }
   var h = '<div class="card"><h3><span class="dot ' + dot + '"></span>' + esc(b.name);
   if (b.running) h += ' <span class="badge" style="color:var(--warn)">运行中</span>';
@@ -404,9 +437,35 @@ function openBridge(id) { showTab("run"); $("runBridge").value = id; }
 function quickRun(id) { showTab("run"); $("runBridge").value = id; startRun(); }
 
 function onModeChange() {
-  var manual = $("runMode").value === "manual";
+  var mode = $("runMode").value;
+  var quarterly = mode === "quarterly";
+  var yearly = mode === "yearly";
+  var manual = mode === "manual";
+  $("runQuarter").style.display = quarterly ? "" : "none";
+  $("runYear").style.display = (quarterly || yearly) ? "" : "none";
+  $("runEnd").style.display = (quarterly || yearly) ? "none" : "";
   $("runStart").style.display = manual ? "" : "none";
+  if (yearly) {
+    $("runYear").value = defaultYear();
+  } else if (quarterly) {
+    var _dq = defaultQuarter();
+    $("runQuarter").value = _dq.quarter;
+    $("runYear").value = _dq.year;
+  }
   checkPeriod();
+}
+function defaultQuarter() {
+  // 默认取最近一个已完整结束的季度（如 8 月默认第 2 季度、1 月默认去年第 4 季度）
+  var now = new Date();
+  var y = now.getFullYear();
+  var cur = Math.floor(now.getMonth() / 3);   // 0 基当前季度
+  var q = cur === 0 ? 4 : cur;                 // 已结束的季度号
+  if (cur === 0) y -= 1;
+  return { quarter: String(q), year: String(y) };
+}
+function defaultYear() {
+  // 最近一个已完整结束的年份（如 2026 年 8 月 -> 2025）
+  return String(new Date().getFullYear() - 1);
 }
 $("runMode").addEventListener("change", onModeChange);
 $("runEnd").addEventListener("change", checkPeriod);
@@ -414,13 +473,21 @@ $("runBridge").addEventListener("change", function () {
   loadRunTemplates();
   checkPeriod();
 });
+$("runQuarter").value = defaultQuarter().quarter;
+$("runYear").value = defaultYear();
+onModeChange();
 
 function checkPeriod() {
   var bridgeId = $("runBridge").value;
   if (!bridgeId) return;
   var mode = $("runMode").value;
   var url = "/api/bridges/" + bridgeId + "/period?mode=" + encodeURIComponent(mode);
-  if (mode === "manual" && $("runStart").value && $("runEnd").value) {
+  if (mode === "quarterly") {
+    url += "&quarter=" + encodeURIComponent($("runQuarter").value || "1") +
+           "&year=" + encodeURIComponent($("runYear").value || String(new Date().getFullYear()));
+  } else if (mode === "yearly") {
+    url += "&year=" + encodeURIComponent($("runYear").value || defaultYear());
+  } else if (mode === "manual" && $("runStart").value && $("runEnd").value) {
     url += "&start=" + $("runStart").value + "&end=" + $("runEnd").value;
   } else if ($("runEnd").value) {
     url += "&date=" + $("runEnd").value;
@@ -432,7 +499,9 @@ function checkPeriod() {
       "统计值: " + esc(p.stats_dir) + "　" + (p.stats_exists ? "✔ 已存在" : "✘ 缺失") + "<br>" +
       (p.data_ready ? '<span class="green">数据就绪，将跳过预处理直接生成报告</span>'
                     : '<span class="yellow">该周期图库/统计值缺失，勾选“自动预处理”会先跑数据处理</span>');
-  }).catch(function () {});
+  }).catch(function (e) {
+    $("periodInfo").innerHTML = '<span class="err">' + esc(String(e)) + "</span>";
+  });
 }
 
 function startRun() {
@@ -442,6 +511,12 @@ function startRun() {
     date: $("runEnd").value || "",
     template: $("runTemplate").value || ""
   };
+  if (body.mode === "quarterly") {
+    body.quarter = $("runQuarter").value || "1";
+    body.year = $("runYear").value || String(new Date().getFullYear());
+  } else if (body.mode === "yearly") {
+    body.year = $("runYear").value || defaultYear();
+  }
   if (body.mode === "manual") body.start = $("runStart").value || "";
   body.auto_preprocess = $("runAutoPre").checked;
   $("runResult").innerHTML = "";
@@ -475,6 +550,10 @@ function pollRun(bridgeId) {
           }, null, 2)) + "</pre>";
         } else {
           $("runStatus").textContent = "完成";
+          if (st.running && st.running.period_mismatch) {
+            $("runStatus").textContent = "完成（⚠ 报告期不一致）";
+            showMsg(st.running.period_mismatch, "err");
+          }
         }
         if (st.last_run && !(st.running && st.running.error)) {
           var s = {
@@ -508,45 +587,39 @@ function loadReports() {
     r.reports.forEach(function (f) {
       var tr = document.createElement("tr");
       tr.innerHTML = "<td>" + esc(f.name) + "</td><td>" + Math.round(f.size / 1024) + " KB</td><td>" + esc(f.mtime) + "</td>" +
-        '<td><a href="/api/bridges/' + bridgeId + '/reports/' + encodeURIComponent(f.name) + q + '">下载</a></td>';
+        '<td><button class="ghost" style="padding:3px 9px" onclick="previewReport(\'' + bridgeId + '\',\'' + esc(f.name).replace(/'/g, "\\'") + '\')">预览</button> ' +
+        '<a href="/api/bridges/' + bridgeId + '/reports/' + encodeURIComponent(f.name) + q + '">下载</a></td>';
       tbody.appendChild(tr);
     });
   }).catch(function (e) { showMsg(String(e), "err"); });
 }
 
-function loadCoverage() {
-  var bridgeId = $("covBridge").value;
-  if (!bridgeId) return;
-  $("covBody").innerHTML = "加载中…";
-  api("/api/bridges/" + bridgeId + "/coverage").then(function (c) {
-    if (c.enabled === false) { $("covBody").innerHTML = '<p class="muted">' + esc(c.message || "未启用真实数据") + '</p>'; return; }
-    var h = '<table><thead><tr><th>指标</th><th>特征</th><th>传感器数</th><th>有数据</th><th>最早</th><th>最晚</th></tr></thead><tbody>';
-    (c.metrics || []).forEach(function (m) {
-      h += "<tr><td>" + esc(m.label || m.metric) + "</td><td>" + esc(m.feature || "—") + "</td><td>" + m.sensor_count + "</td><td>" + m.with_data + "</td><td>" + esc(m.first_day || "—") + "</td><td>" + esc(m.last_day || "—") + "</td></tr>";
+function previewReport(bridgeId, name) {
+  $("pvMask").classList.add("show");
+  $("pvTitle").textContent = name;
+  $("pvCount").textContent = "";
+  $("pvDoc").innerHTML = '<p class="muted">加载中…</p>';
+  $("pvSide").innerHTML = "";
+  api("/api/bridges/" + bridgeId + "/reports/" + encodeURIComponent(name) + "/preview")
+    .then(function (r) {
+      $("pvDoc").innerHTML = r.html || '<p class="muted">（无内容）</p>';
+      $("pvCount").textContent = r.needs_human_count ? "需人工处理 " + r.needs_human_count + " 处" : "无人工待办";
+      var side = "";
+      (r.issues || []).forEach(function (i, idx) {
+        side += '<div class="issue-item"><span class="t">[' + esc(i.type) + ']</span> ' +
+          esc(i.detail || "") + "</div>";
+      });
+      $("pvSide").innerHTML = side || '<p class="muted">无人工待办问题</p>';
+    })
+    .catch(function (e) {
+      $("pvDoc").innerHTML = '<p class="muted">预览失败：' + esc(String(e)) + "</p>";
     });
-    h += "</tbody></table><p class='muted'>传感器总数：" + c.sensor_count + "</p>";
-    $("covBody").innerHTML = h;
-  }).catch(function (e) { showMsg(String(e), "err"); $("covBody").innerHTML = ""; });
 }
 
-function loadPending() {
-  var bridgeId = $("pendBridge").value;
-  if (!bridgeId) return;
-  api("/api/bridges/" + bridgeId + "/run/status").then(function (st) {
-    var lr = st.last_run || {};
-    var pending = lr.pending_charts || [];
-    var missing = lr.missing_cells || [];
-    var h = '<h3 style="font-size:14px;margin:8px 0">图表待补（' + pending.length + '）</h3>';
-    if (!pending.length) h += '<p class="muted">上次运行没有待补图表</p>';
-    h += '<table><thead><tr><th>占位符</th><th>图注</th><th>原因</th></tr></thead><tbody>';
-    pending.forEach(function (p) {
-      h += "<tr><td><code>" + esc(p.chart_id) + "</code></td><td>" + esc(p.caption || "—") + "</td><td>" + esc(p.reason || "") + "</td></tr>";
-    });
-    h += "</tbody></table>";
-    h += '<h3 style="font-size:14px;margin:8px 0">未解析单元格（前 100，共 ' + missing.length + '）</h3>';
-    h += "<pre>" + esc(missing.slice(0, 100).join("\n")) + "</pre>";
-    $("pendBody").innerHTML = h;
-  }).catch(function (e) { showMsg(String(e), "err"); });
+function closePreview() {
+  $("pvMask").classList.remove("show");
+  $("pvDoc").innerHTML = "";
+  $("pvSide").innerHTML = "";
 }
 
 function loadPreprocessConfig() {
@@ -564,6 +637,11 @@ function loadPreprocessConfig() {
 }
 
 function savePreprocessConfig() {
+  if (!$("ppRaw").value.trim() || !$("ppDaily").value.trim()
+      || !$("ppBridge").value.trim()) {
+    showMsg("秒级数据目录、日级数据目录、桥名为必填项", "err");
+    return false;
+  }
   var body = {
     raw_data_dir: $("ppRaw").value.trim(),
     daily_dir: $("ppDaily").value.trim(),
@@ -573,18 +651,25 @@ function savePreprocessConfig() {
     bridge_name: $("ppBridge").value.trim()
   };
   api("/api/preprocess/config", { method: "POST", body: JSON.stringify(body) })
-    .then(function () { showMsg("预处理配置已保存", "ok"); })
+    .then(function (r) {
+      var msg = "预处理配置已保存";
+      if (r.bridge_name) msg += "，已自动更新桥配置：" + r.bridge_name;
+      if (r.bridge_config) msg += "（" + r.bridge_config + "）";
+      showMsg(msg, "ok");
+    })
     .catch(function (e) { showMsg(String(e), "err"); });
+  return true;
 }
 
 function runPreprocess() {
-  savePreprocessConfig();
+  if (!savePreprocessConfig()) return;
   var body = {
     raw_data_dir: $("ppRaw").value.trim(),
     daily_dir: $("ppDaily").value.trim(),
     charts_dir: $("ppCharts").value.trim(),
     stats_dir: $("ppStats").value.trim(),
     sensor_map_docx: $("ppMapDocx").value.trim(),
+    bridge_name: $("ppBridge").value.trim(),
     start: $("ppStart").value || "",
     end: $("ppEnd").value || ""
   };
@@ -632,8 +717,71 @@ function loadConfig() {
     $("cfgNameDict").value = bd.name_dict || "";
     $("cfgTemplate").value = c.template || "";
     $("cfgNamePrefix").value = (c.report || {}).name_prefix || "";
+    var llm = c.llm || {};
+    $("cfgLlmKey").value = "";
+    $("cfgLlmProvider").value = llm.provider || "";
+    $("cfgLlmModel").value = llm.model || "";
+    loadLlmProviders(llm.provider || "");
+    if (llm.provider && !llm.model) applyLlmProvider(llm.provider);
     showMsg("配置已加载", "ok");
   }).catch(function (e) { showMsg(String(e), "err"); });
+}
+
+var LLM_PROVIDERS = {
+  qwen: { label: "通义千问 QWEN", model: "qwen-plus" },
+  zhipu: { label: "智谱 GLM", model: "glm-4-flash" },
+  deepseek: { label: "DeepSeek", model: "deepseek-chat" },
+  moonshot: { label: "Kimi / Moonshot", model: "moonshot-v1-8k" }
+};
+
+function loadLlmProviders(current) {
+  var sel = $("cfgLlmProvider");
+  sel.innerHTML = '<option value="">请选择供应商</option>';
+  Object.keys(LLM_PROVIDERS).forEach(function (k) {
+    var p = LLM_PROVIDERS[k];
+    var opt = document.createElement("option");
+    opt.value = k;
+    opt.textContent = p.label + "（" + p.model + "）";
+    sel.appendChild(opt);
+  });
+  if (current) sel.value = current;
+}
+
+function applyLlmProvider(prov) {
+  var p = LLM_PROVIDERS[prov];
+  if (p) $("cfgLlmModel").value = p.model;
+}
+$("cfgLlmProvider").addEventListener("change", function () {
+  applyLlmProvider($("cfgLlmProvider").value);
+});
+
+function testLlm() {
+  var bridgeId = $("cfgBridge").value;
+  if (!bridgeId) return;
+  $("llmTestResult").textContent = "测试中…";
+  api("/api/bridges/" + bridgeId + "/llm/test", {
+    method: "POST",
+    body: JSON.stringify({
+      provider: $("cfgLlmProvider").value,
+      api_key: $("cfgLlmKey").value.trim(),
+      model: $("cfgLlmModel").value.trim()
+    })
+  }).then(function (r) {
+    if (r && r.ok) {
+      $("llmTestResult").textContent = "连接成功：模型回复 " + esc(r.reply || "OK");
+      $("llmTestResult").className = "muted green";
+    } else if (r && r.error) {
+      $("llmTestResult").textContent = "连接失败：" + esc(r.error);
+      $("llmTestResult").className = "muted red";
+    } else {
+      $("llmTestResult").textContent =
+        "服务器返回异常（多半是 web/app.py 版本过旧、缺少 llm/test 接口，请同步并重启 web）";
+      $("llmTestResult").className = "muted red";
+    }
+  }).catch(function (e) {
+    $("llmTestResult").textContent = "连接失败：" + String((e && e.message) || e);
+    $("llmTestResult").className = "muted red";
+  });
 }
 
 function testDataPaths() {
@@ -659,6 +807,13 @@ function testDataPaths() {
 function saveConfig() {
   var bridgeId = $("cfgBridge").value;
   if (!bridgeId) return;
+  var _llm = {
+    provider: $("cfgLlmProvider").value,
+    model: $("cfgLlmModel").value.trim(),
+    enabled: true
+  };
+  var _k = $("cfgLlmKey").value.trim();
+  if (_k) _llm.api_key = _k;   // 只有填了才写，避免空框覆盖已保存的 Key
   var body = {
     paths: {
       stats_dir: $("cfgStatsDir").value.trim(),
@@ -666,7 +821,8 @@ function saveConfig() {
       sensor_map: $("cfgSensorMap").value.trim(),
       name_dict: $("cfgNameDict").value.trim()
     },
-    report: { name_prefix: $("cfgNamePrefix").value.trim() }
+    report: { name_prefix: $("cfgNamePrefix").value.trim() },
+    llm: _llm
   };
   api("/api/bridges/" + bridgeId + "/config", { method: "POST", body: JSON.stringify(body) })
     .then(function () { showMsg("配置已保存", "ok"); })
@@ -884,6 +1040,7 @@ function loadScheduler() {
     $("schDay").value = s.schedule.day_of_month || 1;
     $("schHour").value = s.schedule.hour || 8;
     $("schMinute").value = s.schedule.minute || 0;
+    $("schStart").value = s.schedule.start_date || "";
   }).catch(function (e) { showMsg(String(e), "err"); });
 }
 
@@ -895,7 +1052,8 @@ function saveSchedule() {
       mode: $("schMode").value,
       day_of_month: parseInt($("schDay").value, 10) || 1,
       hour: parseInt($("schHour").value, 10) || 8,
-      minute: parseInt($("schMinute").value, 10) || 0
+      minute: parseInt($("schMinute").value, 10) || 0,
+      start_date: $("schStart").value || ""
     }
   };
   api("/api/bridges/" + bridgeId + "/config", { method: "POST", body: JSON.stringify(body) })
@@ -927,12 +1085,109 @@ function loadLog() {
     .catch(function (e) { showMsg(String(e), "err"); });
 }
 
+function loadReview() {
+  var bridgeId = $("revBridge").value;
+  if (!bridgeId) return;
+  api("/api/bridges/" + bridgeId + "/review").then(function (r) {
+    var h = "";
+    h += "<p><b>LLM 审查：</b>" +
+      (r.llm_available
+        ? '<span class="green">已启用（审查时调用大模型）</span>'
+        : '<span class="yellow">未启用（未配置 API Key，审查跳过）</span>') + "</p>";
+    var lr = r.last_run || {};
+    var rep = lr.repair || {};
+    h += "<p>最近一次生成：<b>" + esc((lr.period && lr.period.label) || "—") + "</b>　" +
+      "自动纠正 <b>" + (rep.auto_fixed || 0) + "</b> 处　" +
+      "需人工处理 <b>" + (rep.manual_needed || 0) + "</b> 处　" +
+      "大模型审查 " +
+      (rep.llm_called ? (rep.llm_ok ? "已调用并返回结果" : "已调用但无返回") : "未调用") + "</p>";
+
+    h += '<h3 style="font-size:14px;margin:8px 0">报告审查（LLM）</h3>';
+    var rv = lr.review;
+    if (!rv) {
+      h += '<p class="muted">暂无（未生成报告或 LLM 未启用）</p>';
+    } else {
+      var issues = rv.issues || [];
+      h += "<p>" + (issues.length
+        ? '<span class="yellow">发现 ' + issues.length + " 处问题</span>"
+        : '<span class="green">未发现问题</span>') + "</p>";
+      if (issues.length) {
+        h += '<table><thead><tr><th>类型</th><th>说明</th></tr></thead><tbody>' +
+          issues.map(function (i) {
+            return "<tr><td><code>" + esc(i.type || "other") + "</code></td><td>" +
+              esc(i.detail || "") + "</td></tr>";
+          }).join("") + "</tbody></table>";
+      }
+      if (rv.raw) {
+        h += "<details><summary>原始回复</summary><pre>" + esc(rv.raw) + "</pre></details>";
+      }
+    }
+
+    h += '<h3 style="font-size:14px;margin:8px 0">确定性体检（self_check）</h3>';
+    var sc = lr.self_check || [];
+    h += "<p>" + (sc.length
+      ? '<span class="yellow">发现 ' + sc.length + " 处</span>"
+      : '<span class="green">未发现问题</span>') + "</p>";
+    if (sc.length) {
+      h += '<table><thead><tr><th>类型</th><th>说明</th></tr></thead><tbody>' +
+        sc.map(function (i) {
+          return "<tr><td><code>" + esc(i.type || "other") + "</code></td><td>" +
+            esc(i.detail || "") + "</td></tr>";
+        }).join("") + "</tbody></table>";
+    }
+
+    if (r.report_reviews && r.report_reviews.length) {
+      h += '<h3 style="font-size:14px;margin:8px 0">报告审查文件</h3>';
+      h += r.report_reviews.map(function (f) {
+        return '<p class="muted">' + esc(f.name) + "　" + esc(f.mtime) + "　" +
+          (f.ok ? "无问题" : "发现问题 " + (f.issues || []).length + " 处") +
+          '　<a href="/api/bridges/' + bridgeId + '/review-file?name=' +
+          encodeURIComponent(f.name) + '">下载 JSON</a></p>';
+      }).join("");
+    }
+
+    if (r.template_reviews && r.template_reviews.length) {
+      h += '<h3 style="font-size:14px;margin:8px 0">模板审查</h3>';
+      h += r.template_reviews.map(function (f) {
+        var issues = f.issues || [];
+        var body = '<p class="muted">' + esc(f.name) + "　" + esc(f.mtime) + "　" +
+          (issues.length ? "发现问题 " + issues.length + " 处" : "无问题") +
+          '　<a href="/api/bridges/' + bridgeId + '/review-file?name=' +
+          encodeURIComponent(f.name) + '">下载 JSON</a></p>';
+        if (issues.length) {
+          body += '<table><thead><tr><th>类型</th><th>说明</th></tr></thead><tbody>' +
+            issues.map(function (i) {
+              return "<tr><td><code>" + esc(i.type || "other") + "</code></td><td>" +
+                esc(i.detail || "") + "</td></tr>";
+            }).join("") + "</tbody></table>";
+        }
+        return body;
+      }).join("");
+    }
+    $("revBody").innerHTML = h || '<p class="muted">暂无审查数据</p>';
+  }).catch(function (e) { showMsg(String(e), "err"); $("revBody").innerHTML = ""; });
+}
+
 api("/api/status").then(function (st) {
-  $("modeBadge").textContent = st.mode === "hub" ? "中心汇总模式" : "单机模式";
+  $("modeBadge").textContent = "独立桥服务器模式";
   $("authBadge").textContent = st.auth_required ? "已启用令牌鉴权" : "未鉴权（本机）";
   $("tokenInput").value = token();
   loadBridges();
 }).catch(function () { loadBridges(); });
 </script>
+<div id="pvMask" class="modal-mask">
+  <div class="modal">
+    <div class="modal-head">
+      <b id="pvTitle">报告预览</b>
+      <span class="muted" id="pvCount"></span>
+      <span class="spacer"></span>
+      <button class="ghost" onclick="closePreview()">关闭</button>
+    </div>
+    <div class="modal-body">
+      <div class="pv-side" id="pvSide"></div>
+      <div class="pv-doc" id="pvDoc"></div>
+    </div>
+  </div>
+</div>
 </body>
 </html>
