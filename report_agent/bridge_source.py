@@ -36,7 +36,47 @@ import statistics
 import difflib
 from typing import Dict, List, Optional
 
+from report_agent.config import resolve_bridge_subdir
+
+# 方位词（长的在前，避免“上游侧”被“上游”先吃掉；含裸“左/右”前缀，
+# 统一规范成 L/R/U/D，使“左跨中1/2截面”≈“跨中左幅1/2截面”）
+_SIDE_RE = re.compile(r"(上游侧|下游侧|左幅|右幅|左侧|右侧|上游|下游|左|右)")
+
+
+def _side_set(s: str) -> set:
+    """返回位置名里的方位码集合：左类=L、右类=R、上游=U、下游=D。"""
+    codes = set()
+    for tok in _SIDE_RE.findall(str(s or "")):
+        if tok in ("左", "左幅", "左侧"):
+            codes.add("L")
+        elif tok in ("右", "右幅", "右侧"):
+            codes.add("R")
+        elif tok in ("上游", "上游侧"):
+            codes.add("U")
+        elif tok in ("下游", "下游侧"):
+            codes.add("D")
+    return codes
+
+
 log = logging.getLogger("report-agent.bridge")
+
+
+def _bridge_name_match(a, b):
+    """桥名兼容匹配：洣水河特大桥 <-> 洣水河、矮寨大桥 <-> 矮寨 都算同一桥。
+    传感器对照表的桥名来自原始文档（可能不带“大桥/特大桥”），
+    配置 bridge_name 用全称，二者必须兼容匹配，否则传感器会被全部过滤。"""
+    if not a or not b:
+        return False
+
+    def _strip(x):
+        x = str(x)
+        for s in ("特大桥", "大桥"):
+            if x.endswith(s):
+                return x[: -len(s)]
+        return x
+
+    x, y = _strip(a), _strip(b)
+    return x in y or y in x
 
 
 # ---------------------------------------------------------------------------
@@ -161,13 +201,24 @@ def _safe_dir(path_seg: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", str(path_seg)).strip()
 
 
+def _dun_no(text: str) -> Optional[str]:
+    """提取位置名里的墩号（如 “3#墩墩顶” -> "3"）；没有返回 None。"""
+    m = re.search(r"(\d+)\s*#\s*墩", str(text or ""))
+    return m.group(1) if m else None
+
+
 def _position_similarity(a: str, b: str) -> float:
     """位置名相似度(0~1)：归一化后按公共子序列/字符重合度评估。
 
     用于模板占位符位置与名称对照表/图库目录名的模糊匹配，
     容忍“内/侧/梁”等修饰字差异和词序不同(如
     “上游随州侧边跨跨中箱梁顶板” vs “随州侧边跨跨中箱梁内顶板上游”)。
+    硬约束：两边都含墩号且墩号不同（3#墩 vs 2#墩）直接判 0，
+    避免图/表/统计在相邻墩之间张冠李戴。
     """
+    da, db = _dun_no(a), _dun_no(b)
+    if da is not None and db is not None and da != db:
+        return 0.0
     na, nb = _norm(a), _norm(b)
     if not na or not nb:
         return 0.0
@@ -198,6 +249,27 @@ def _position_side_words(text: str) -> set:
         if w in t:
             out.add(w.replace("侧", ""))
     return out
+
+
+# 字母复合单位：数字与单位之间必须恰好一个空格（6.9m/s² -> 6.9 m/s²）。
+# 长的在前，避免 mm/s² 被 m/s 先吃掉；后缀排除字母/数字，防止命中 kNm 等。
+_UNIT_SPACE_RE = re.compile(
+    r"(?P<num>-?\d+(?:\.\d+)?)"
+    r"(?P<unit>mm/s²|mm/s2|m/s²|m/s2|mm/s|m/s|km/h|kN|MPa)(?![A-Za-z0-9])")
+_UNIT_TRAIL_RE = re.compile(
+    r"(mm/s²|mm/s2|m/s²|m/s2|mm/s|m/s|km/h|kN|MPa) +(?=[。，；、！？!?]|$)")
+
+
+def normalize_unit_spacing(text: str) -> str:
+    """规范化数值与单位之间的空格：字母复合单位前补一个空格、
+    单位后多余空格去掉、连续空格压成 1 个。℃/% 等符号单位保持中文习惯不拆。"""
+    if not text:
+        return text
+    t = re.sub(r" {2,}", " ", str(text))
+    t = _UNIT_SPACE_RE.sub(
+        lambda m: f"{m.group('num')} {m.group('unit')}", t)
+    t = _UNIT_TRAIL_RE.sub(r"\1", t)
+    return t.strip()
 
 
 def feature_group(feature: str) -> str:
@@ -262,6 +334,13 @@ class BridgeData:
 
         self.stats_dir = self._resolve(cfg.get("stats_dir", ""))
         self.charts_dir = self._resolve(cfg.get("charts_dir", ""))
+        # 目录名可能用桥名全称/简称（洣水河特大桥 <-> 洣水河），
+        # 这里再做一次模糊下钻，避免配置里的桥名写法与实际目录不一致导致加载失败
+        if self.bridge_name:
+            self.stats_dir = resolve_bridge_subdir(
+                self.stats_dir, self.bridge_name)
+            self.charts_dir = resolve_bridge_subdir(
+                self.charts_dir, self.bridge_name)
         self.sensor_map_path = self._resolve(cfg.get("sensor_map", ""))
         self.overview_path = self._resolve(cfg.get("overview", ""))
         self.name_dict_path = self._resolve(cfg.get("name_dict", ""))
@@ -314,6 +393,7 @@ class BridgeData:
         self._category_sensors: Dict[str, List[str]] = {}  # 类别 -> 编号列表（从名称对照表）
         self._stats_cache: Dict[str, Dict] = {}          # 编号 -> 统计值 JSON
         self._agg_cache: Optional[Dict] = None            # 季度/年度统计.json 缓存
+        self._summary_cache: Dict[str, str] = {}          # (指标|报告期) -> 总结句缓存
         self._sensor_features: Dict[str, List[str]] = {} # 编号 -> 特征列表
         self._match_stats = {"name_dict": 0, "alias": 0, "sensor_map": 0, "fuzzy": 0, "metric_fallback": 0}
         self._chart_seq: Dict = {}                       # (metric,位置) -> 已分配序号
@@ -392,6 +472,8 @@ class BridgeData:
             # 2c. 位置统计库：统计值_<期>/<桥名>/位置统计/<位置>.json
             # （以“位置→测点→特征→统计”为准，传感器编号 JSON 已弃用）
             self._load_position_stats()
+            if self.charts_dir and not os.path.isdir(self.charts_dir):
+                log.warning("图库目录不存在: %s", self.charts_dir)
 
             self.loaded = True
         except Exception as exc:  # noqa: BLE001
@@ -475,17 +557,37 @@ class BridgeData:
         避免同一位置混装多种传感器时取错（如 5#塔梁交接处主梁 同时有结构温度/应变/挠度）。
         """
         key = _norm(pos)
-        entries = self.name_dict.get(key) or []
-        if not entries:
-            # 兼容全角/半角数字等写法差异（如 “6号” vs “六号”）
-            merged = []
-            for k, v in self.name_dict.items():
-                kn = _norm(k)
-                # 精确/包含匹配；“4#墩墩顶主梁梁端”是“…左侧/右侧”的前缀时合并两侧
-                if kn == key or (len(key) >= 2 and key in kn) or (len(kn) >= 2 and kn in key):
-                    merged.extend(v)
-            if merged:
-                entries = merged
+        key_sides = _side_set(key)
+        # 精确键 + 模糊/方位顺序无关的候选键合并（按编号去重），
+        # 再统一按特征过滤。这样“跨中1/2截面左幅”即使精确命中的是挠度，
+        # 也能补进温度传感器“跨中左幅1/2截面”。
+        entries = list(self.name_dict.get(key) or [])
+        seen_ids = {str(e.get("编号", "")) for e in entries if e.get("编号")}
+        for k, v in self.name_dict.items():
+            kn = _norm(k)
+            ok = (kn == key
+                  or (len(key) >= 2 and key in kn)
+                  or (len(kn) >= 2 and kn in key))
+            if not ok and key_sides:
+                # 方位词顺序不同（如 跨中1/2截面左幅 vs 跨中左幅1/2截面）：
+                # 去掉方位词后相同、且双方方位一致才匹配
+                skey = _SIDE_RE.sub("", key)
+                skn = _SIDE_RE.sub("", kn)
+                if (skey and skn and skey == skn
+                        and _side_set(kn) == key_sides):
+                    ok = True
+            if ok and key_sides:
+                # 位置带方位时，候选键必须带相同方位
+                # （排除 跨中1/2截面 这类无方位键被子串误匹配）
+                if _side_set(kn) != key_sides:
+                    ok = False
+            if not ok:
+                continue
+            for e in v or []:
+                sid = str(e.get("编号", ""))
+                if sid and sid not in seen_ids:
+                    seen_ids.add(sid)
+                    entries.append(e)
         feat = self.metrics.get(metric, {}).get("feature", "")
         cat = self.metric_category.get(metric, "")
         sids = []
@@ -747,7 +849,8 @@ class BridgeData:
                     # 只取当前桥的传感器（对照表包含多座桥）
                     if self.bridge_name:
                         bname = self.sensor_map.get(sid, {}).get("桥名", "")
-                        if bname and bname != self.bridge_name:
+                        if bname and not _bridge_name_match(
+                                bname, self.bridge_name):
                             continue
                     sids.append(sid)
         if not sids:
@@ -759,7 +862,20 @@ class BridgeData:
             # 最后才退化为全部传感器
             sids = [sid for sid in self.sensor_map
                     if not self._is_excluded(sid)
-                    and (not self.bridge_name or self.sensor_map[sid].get("桥名", "") == self.bridge_name)]
+                    and (not self.bridge_name
+                         or _bridge_name_match(
+                             self.sensor_map[sid].get("桥名", ""),
+                             self.bridge_name))]
+        # 指标级排除（如 displacement 排除“边坡”测点——其 GNSS 统计是
+        # 大地坐标绝对值而非桥体位移，会把极值污染成几米/几百米）
+        _m = re.match(r"^(.*)_([xyz])$", metric)
+        mkey = _m.group(1) if _m else metric
+        excl_words = [w for w in (self.metrics.get(mkey, {}) or {}).get(
+            "exclude_position_words") or [] if w]
+        if excl_words:
+            sids = [sid for sid in sids
+                    if not any(w in self._position_for_sensor(sid)
+                               for w in excl_words)]
         return sorted(sids, key=lambda x: int(x) if x.isdigit() else x)
 
     def _is_excluded(self, sensor_id: str) -> bool:
@@ -803,7 +919,8 @@ class BridgeData:
         for sid, info in self.sensor_map.items():
             if self._is_excluded(sid):
                 continue
-            if self.bridge_name and info.get("桥名") and info.get("桥名") != self.bridge_name:
+            if self.bridge_name and info.get("桥名") and not _bridge_name_match(
+                    info.get("桥名"), self.bridge_name):
                 continue
             names = [info.get("名称", ""), info.get("监测部位", "")]
             if any(_norm(col) == _norm(n) for n in names if n):
@@ -890,6 +1007,9 @@ class BridgeData:
         """
         pos_dir = os.path.join(self.stats_dir, "位置统计")
         if not os.path.isdir(pos_dir):
+            log.warning(
+                "位置统计目录不存在: %s（请检查 config bridge_data.stats_dir "
+                "指向的目录名/结构；上一期成功时该目录应存在）", pos_dir)
             return
         def _index_pos(pos, points):
             """索引测点结构。
@@ -1105,7 +1225,8 @@ class BridgeData:
                 sid = str(e.get("编号", ""))
                 info = self.sensor_map.get(sid, {}) or {}
                 if self.bridge_name and info.get("桥名") \
-                        and info.get("桥名") != self.bridge_name:
+                        and not _bridge_name_match(
+                            info.get("桥名"), self.bridge_name):
                     continue
                 if key not in with_data and key not in out:
                     out.append(str(key))
@@ -1139,6 +1260,10 @@ class BridgeData:
         全桥统计（极值 + 对应位置）+ 各位置缺失/持续为 0 情况。
         LLM 可用时由 LLM 生成（重点突出缺失与极值特殊位置），
         否则用规则化兜底文本。
+
+        同一（指标, 报告期）只生成一次并缓存——模板里 3.3.5 小结和
+        4.1 结论等多次出现的 {{summary.<metric>}} 拿到的是同一句话，
+        避免同一指标前后数值不一致。
         """
         mcfg = self.metrics.get(metric) or {}
         feat = mcfg.get("feature", "")
@@ -1146,25 +1271,67 @@ class BridgeData:
         unit = mcfg.get("unit", "")
         if not feat:
             return ""
+        cache_key = f"{metric}|{period.get('start')}|{period.get('end')}"
+        if cache_key in self._summary_cache:
+            return self._summary_cache[cache_key]
         digest = self._feature_summary_digest(feat, label, unit, period, metric)
         if not digest:
             return ""
         from .llm_classifier import LLMClassifier
-        text = LLMClassifier(llm_cfg or {}).summarize_feature(
-            digest["prompt"], max_chars=100)
-        if text:
-            return text
-        return digest["fallback"]
+        text = ""
+        classifier = LLMClassifier(llm_cfg or {})
+        if classifier.available():
+            text = classifier.summarize_feature(
+                digest["prompt"], max_chars=100)
+            if text and not self._summary_text_valid(text, digest):
+                log.warning("总结数值与统计摘要不一致，降级为规则化兜底: %s",
+                            text)
+                text = ""
+        if not text:
+            text = digest["fallback"]
+        text = normalize_unit_spacing(text)
+        self._summary_cache[cache_key] = text
+        return text
+
+    @staticmethod
+    def _summary_text_valid(text: str, digest: Dict) -> bool:
+        """校验 LLM 总结里的数值都来自摘要给定值集合（防止 LLM 自行编造
+        差值/极值，如把 581.8 写成 232.2）。位置/测点里的数字（58#墩、测点2）
+        不算数值声明，跳过。"""
+        if not text or not digest:
+            return True
+        refs = []
+        for v in digest.get("values") or []:
+            try:
+                refs.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        if not refs:
+            return True
+        for m in re.finditer(r"-?\d+(?:\.\d+)?", text):
+            after = text[m.end():m.end() + 1]
+            if after and after[0] in "#号点跨墩":
+                continue
+            try:
+                num = float(m.group(0))
+            except ValueError:
+                continue
+            if any(abs(num - r) <= max(abs(r) * 0.005, 0.05) for r in refs):
+                continue
+            return False
+        return True
 
     def _feature_summary_digest(self, feature: str, label: str, unit: str,
                                 period: Dict, metric: str = "") -> Optional[Dict]:
         """组装特征统计摘要（给 LLM）与规则化兜底句。"""
         agg = self._load_aggregate_stats()
         fe = None
+        bridge_feats = None
         for data in agg.values():
             for b in (data.get("桥") or {}).values():
                 if isinstance(b, dict) and feature in b:
                     fe = b.get(feature)
+                    bridge_feats = b
                     break
             if fe is not None:
                 break
@@ -1175,6 +1342,16 @@ class BridgeData:
         if not isinstance(pos_entries, dict):
             pos_entries = {}
 
+        zero_pos, abnormal = self._fault_positions(
+            gs, pos_entries, feature, metric, period)
+        # 方向化指标（GNSS(Δx/Δy/Δz)、SZJSD(xJsd/yJsd/zJsd) 等）：
+        # 按方向分别给极值，避免总结把 Y 方向位置串给 Z 方向。
+        axes = self._summary_axes(bridge_feats, feature)
+        if len(axes) >= 2:
+            return self._direction_summary_digest(
+                metric, label, unit, period, axes, bridge_feats,
+                pos_entries, zero_pos, abnormal)
+
         def _f(key):
             try:
                 v = float(gs.get(key))
@@ -1182,13 +1359,300 @@ class BridgeData:
             except (TypeError, ValueError):
                 return None
 
-        max_v, min_v = _f("最大值"), _f("最小值")
         avg = _f("平均值")
         miss_h = _f("缺失小时数")
-        max_loc = str(gs.get("最大值位置") or "")
-        min_loc = str(gs.get("最小值位置") or "")
         days = gs.get("覆盖天数") or ""
+        # 极值/位置与 {{stats.<metric>.max|min[.loc]}} 同一口径（逐传感器聚合 +
+        # 季度统计位置键），保证总结句与正文统计占位符一致；
+        # 解析不到时回退到 全桥统计 的极值与位置键
+        max_v, max_loc = self._metric_extreme(metric, "max", "最大值",
+                                              "最大值位置", period, gs)
+        min_v, min_loc = self._metric_extreme(metric, "min", "最小值",
+                                              "最小值位置", period, gs)
+        range_v, range_loc = self._metric_extreme(metric, "range", "差值",
+                                                  "差值位置", period, gs)
+        abs_v, abs_loc = self._metric_extreme(metric, "abs_max", "绝对最大值",
+                                              "绝对最大值位置", period, gs)
+        trm_v, trm_loc = self._metric_extreme(
+            metric, "temp_rm_range", "剔除温度差值",
+            "剔除温度差值位置", period, gs)
 
+        # 最小值==0 且存在恒0故障位置：0 极可能来自故障测点（如结构温度 0℃），
+        # 用位置统计清洗值重算真实最小值（跳过恒值/恒0测点），
+        # 避免把故障 0 当真实极值、位置还取错。
+        if min_v is not None and min_v == 0.0 and zero_pos:
+            cv, cloc = self._clean_extreme_from_positions(
+                pos_entries, feature, "最小值", exclude_zero=True)
+            if cv is not None and abs(cv) > 1e-9:
+                min_v, min_loc = cv, cloc
+        # 重算后仍为 0 且存在恒0位置：位置强制指向故障位置
+        if min_v is not None and min_v == 0.0 and zero_pos and not min_loc:
+            min_loc = zero_pos[0]
+
+        prompts = [f"指标：{label}；报告期：{period.get('start')} ~ {period.get('end')}"]
+        values = []
+        if days:
+            try:
+                days_txt = str(int(float(days)))
+            except (TypeError, ValueError):
+                days_txt = str(days)
+            prompts.append(f"覆盖{days_txt}天")
+            try:
+                values.append(float(days))
+            except (TypeError, ValueError):
+                pass
+        if avg is not None:
+            prompts.append(f"平均值{avg:g}{unit}")
+            values.append(avg)
+        if max_v is not None:
+            prompts.append(f"最大值{max_v:g}{unit}" + (f"（位置：{max_loc}）" if max_loc else ""))
+            values.append(max_v)
+        if min_v is not None:
+            prompts.append(f"最小值{min_v:g}{unit}" + (f"（位置：{min_loc}）" if min_loc else ""))
+            values.append(min_v)
+        for v, loc, name in ((range_v, range_loc, "最大差值"),
+                             (abs_v, abs_loc, "绝对最大值"),
+                             (trm_v, trm_loc, "剔除温度效应后最大差值")):
+            if v is not None:
+                prompts.append(f"{name}{v:g}{unit}" + (f"（位置：{loc}）" if loc else ""))
+                values.append(v)
+        if miss_h and miss_h >= self._summary_miss_threshold():
+            prompts.append(f"全桥缺失小时数合计{miss_h:g}")
+        if abnormal:
+            prompts.append("数据缺失位置：" + "、".join(abnormal))
+        if zero_pos:
+            prompts.append("持续为0疑似故障位置：" + "、".join(zero_pos))
+        if min_v is not None and min_v == 0.0 and zero_pos:
+            prompts.append(
+                "注意：最低值0来自持续为0疑似故障位置，属传感器故障，"
+                "总结时必须写明“传感器故障”，位置使用故障位置"
+                f"{min_loc or zero_pos[0]}，不得把0当作真实极值。")
+        prompts.append(
+            "只能引用上面给出的数值，禁止自行计算或编造新的数值；"
+            "摘要中没有出现的数值（尤其差值/极值）一律不要写。")
+        digest_text = "；".join(prompts) + "。"
+
+        # 规则化兜底句（≤100字；恒0与缺失分开表述，避免把“0℃故障”当真实极值）
+        parts = []
+        if max_v is not None:
+            parts.append(f"最高{max_v:g}{unit}" + (f"（{max_loc}）" if max_loc else ""))
+        if min_v is not None:
+            parts.append(f"最低{min_v:g}{unit}" + (f"（{min_loc}）" if min_loc else ""))
+        if not parts:
+            parts.append("整体正常")
+        head = "、".join(parts)
+        special = []
+        if zero_pos:
+            special.append("恒0疑似故障位置：" + "、".join(zero_pos[:2])
+                           + ("等" if len(zero_pos) > 2 else ""))
+        if abnormal:
+            special.append("数据缺失位置：" + "、".join(abnormal[:2])
+                           + ("等" if len(abnormal) > 2 else ""))
+        if not special:
+            fallback = f"{label}监测数据整体正常，{head}。"
+        else:
+            fallback = f"{head}；{'；'.join(special)}，其余测点正常，需关注。"
+        if len(fallback) > 100:
+            # 超长时去掉尾句，仍超长则按分号边界截断，不切断词
+            fallback = f"{head}；{'；'.join(special)}。"
+        if len(fallback) > 100:
+            cut = fallback[:100].rfind("；")
+            fallback = (fallback[:cut] if cut > 20 else fallback[:100]) + "。"
+        return {"prompt": digest_text, "fallback": fallback, "values": values}
+
+    def _summary_miss_threshold(self) -> float:
+        try:
+            return float(self.cfg.get("summary_miss_hours", 72) or 72)
+        except (TypeError, ValueError):
+            return 72.0
+
+    def _fault_positions(self, gs: Dict, pos_entries: Dict, feature: str,
+                         metric: str, period: Dict):
+        """返回 (持续为0疑似故障位置, 数据缺失位置)。"""
+        # 持续为 0（疑似故障）位置：优先用预处理统计已写好的“持续为0位置”，
+        # 再补扫位置统计里 最大值==最小值==0 且非“0为正常值”特征的测点
+        zero_pos = [str(p) for p in (gs.get("持续为0位置") or []) if p]
+        for pos, points in pos_entries.items():
+            if not isinstance(points, dict):
+                continue
+            for _pt, rec in points.items():
+                st = (rec.get("统计") or {}) if isinstance(rec, dict) else {}
+                try:
+                    mx = float(st.get("最大值"))
+                    mn = float(st.get("最小值"))
+                except (TypeError, ValueError):
+                    continue
+                if mx == 0.0 and mn == 0.0 \
+                        and self._constant_faulty(st, feature) \
+                        and str(pos) not in zero_pos:
+                    zero_pos.append(str(pos))
+                    break
+        # 缺失位置：缺失天数 > 0（整日缺失必报），或缺失小时数达到阈值
+        # （默认 72h，bridge_data.summary_miss_hours 可调），或完全无数据
+        miss_hours_thr = self._summary_miss_threshold()
+        miss_pos = []
+        for pos, points in pos_entries.items():
+            if not isinstance(points, dict):
+                continue
+            for _pt, rec in points.items():
+                st = (rec.get("统计") or {}) if isinstance(rec, dict) else {}
+                try:
+                    mh = float(st.get("缺失小时数") or 0)
+                    md = float(st.get("缺失天数") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if md > 0 or mh >= miss_hours_thr:
+                    miss_pos.append(str(pos))
+                    break
+        # 补充完全无数据的监测部位（名称对照里属于该特征但统计库无记录）
+        for p in (self.abnormal_positions(metric, period) if metric else []):
+            if p not in miss_pos:
+                miss_pos.append(p)
+        return zero_pos, miss_pos
+
+    def _metric_extreme(self, metric: str, stat: str, gs_key: str,
+                        gs_loc_key: str, period: Dict, gs: Dict):
+        """按“逐传感器聚合（已排除恒值故障）”取极值+位置，回退 全桥统计。"""
+        v, loc = None, ""
+        if metric:
+            val, detail = self.resolve_metric_stat_detail(metric, stat, period)
+            if val is not None:
+                v = float(val)
+                loc = str((detail or {}).get("位置") or "")
+        if v is None:
+            try:
+                v = float(gs.get(gs_key))
+            except (TypeError, ValueError):
+                v = None
+            loc = str(gs.get(gs_loc_key) or "")
+        return v, loc
+
+    def _clean_extreme_from_positions(self, pos_entries: Dict, feature: str,
+                                      stat_key: str,
+                                      exclude_zero: bool = False):
+        """从位置统计逐测点扫描极值，跳过恒值/恒0故障测点。返回 (值, 位置)。"""
+        best_v, best_loc = None, ""
+        for pos, points in pos_entries.items():
+            if not isinstance(points, dict):
+                continue
+            for _pt, rec in points.items():
+                st = (rec.get("统计") or {}) if isinstance(rec, dict) else {}
+                try:
+                    v = float(st.get(stat_key))
+                except (TypeError, ValueError):
+                    continue
+                if self._constant_faulty(st, feature):
+                    continue
+                if exclude_zero and abs(v) <= 1e-9:
+                    continue
+                if best_v is None:
+                    best_v, best_loc = v, str(pos)
+                elif stat_key == "最小值" and v < best_v:
+                    best_v, best_loc = v, str(pos)
+                elif stat_key != "最小值" and v > best_v:
+                    best_v, best_loc = v, str(pos)
+        return best_v, best_loc
+
+    def _summary_axes(self, bridge_feats: Optional[Dict],
+                      feature: str) -> Dict[str, str]:
+        """检测特征是否有 X/Y/Z 方向分量，返回 {轴: 特征键}（如
+        {"X": "GNSS(Δx)", "Y": "GNSS(Δy)", "Z": "GNSS(Δz)"}）。"""
+        if not isinstance(bridge_feats, dict):
+            return {}
+        m = re.match(r"^([A-Za-z0-9]+)\(", feature or "")
+        base = m.group(1) if m else ""
+        if not base:
+            return {}
+        keys = [str(k) for k in bridge_feats.keys()]
+        axis_pat = {
+            "X": (rf"^{base}\(Δx\)$", rf"^{base}\([xX]Jsd?\)$",
+                  rf"^{base}\([xX]Jd\)$"),
+            "Y": (rf"^{base}\(Δy\)$", rf"^{base}\([yY]Jsd?\)$",
+                  rf"^{base}\([yY]Jd\)$"),
+            "Z": (rf"^{base}\(Δz\)$", rf"^{base}\([zZ]Jsd?\)$"),
+        }
+        out = {}
+        for ax, pats in axis_pat.items():
+            hit = next((k for k in keys
+                        if any(re.search(p, k) for p in pats)), "")
+            if hit:
+                out[ax] = hit
+        return out
+
+    def _direction_summary_digest(self, metric: str, label: str, unit: str,
+                                  period: Dict, axes: Dict[str, str],
+                                  bridge_feats: Dict, pos_entries: Dict,
+                                  zero_pos: List[str],
+                                  abnormal: List[str]) -> Optional[Dict]:
+        """方向化指标（GNSS X/Y/Z 等）摘要：每个方向单独给极值与位置，
+        避免总结把 Y 方向位置串给 Z 方向。"""
+        axis_labels = {"X": "X方向", "Y": "Y方向", "Z": "Z方向"}
+        prompts = [
+            f"指标：{label}（分方向统计）；"
+            f"报告期：{period.get('start')} ~ {period.get('end')}"
+        ]
+        fallback_parts = []
+        values = []
+        for ax in axes:
+            feat_key = axes[ax]
+            fe_ax = bridge_feats.get(feat_key) or {}
+            gs_ax = fe_ax.get("全桥统计") or {}
+            am = f"{metric}_{ax.lower()}" if metric else ""
+            lines = []
+            for stat, gs_key, gs_loc_key, cn in (
+                    ("max", "最大值", "最大值位置", "最大"),
+                    ("min", "最小值", "最小值位置", "最小"),
+                    ("range", "差值", "差值位置", "差值")):
+                v, loc = None, ""
+                if am:
+                    val, detail = self.resolve_metric_stat_detail(
+                        am, stat, period)
+                    if val is not None:
+                        v = float(val)
+                        loc = str((detail or {}).get("位置") or "")
+                if v is None:
+                    try:
+                        v = float(gs_ax.get(gs_key))
+                    except (TypeError, ValueError):
+                        v = None
+                    loc = str(gs_ax.get(gs_loc_key) or "")
+                if v is None:
+                    continue
+                values.append(v)
+                lines.append(f"{cn}值{v:g}{unit}"
+                             + (f"（位置：{loc}）" if loc else ""))
+                fallback_parts.append(
+                    f"{axis_labels[ax]}{cn}{v:g}{unit}"
+                    + (f"（{loc}）" if loc else ""))
+            if lines:
+                prompts.append(f"{axis_labels[ax]}：" + "、".join(lines))
+        if abnormal:
+            prompts.append("数据缺失位置：" + "、".join(abnormal))
+        if zero_pos:
+            prompts.append("持续为0疑似故障位置：" + "、".join(zero_pos))
+        prompts.append(
+            "X/Y/Z 各方向的数值与对应测点位置必须按上面逐一对应，"
+            "不得把某一方向的位置串用到其他方向；"
+            "只能引用上面给出的数值，禁止编造新的数值。")
+        digest_text = "；".join(prompts) + "。"
+        special = []
+        if zero_pos:
+            special.append("恒0疑似故障位置：" + "、".join(zero_pos[:2])
+                           + ("等" if len(zero_pos) > 2 else ""))
+        if abnormal:
+            special.append("数据缺失位置：" + "、".join(abnormal[:2])
+                           + ("等" if len(abnormal) > 2 else ""))
+        head = "、".join(fallback_parts) if fallback_parts else "整体正常"
+        if not special:
+            fallback = f"{label}监测数据整体正常，{head}。"
+        else:
+            fallback = f"{head}；{'；'.join(special)}，其余测点正常，需关注。"
+        if len(fallback) > 100:
+            fallback = f"{head}；{'；'.join(special)}。"
+        if len(fallback) > 100:
+            cut = fallback[:100].rfind("；")
+            fallback = (fallback[:cut] if cut > 20 else fallback[:100]) + "。"
+        return {"prompt": digest_text, "fallback": fallback, "values": values}
         # 缺失位置：缺失天数 > 0（整日缺失必报），或缺失小时数达到阈值
         # （默认 72h，bridge_data.summary_miss_hours 可调），或完全无数据
         try:
@@ -1251,7 +1715,7 @@ class BridgeData:
             prompts.append("持续为0疑似故障位置：" + "、".join(zero_pos))
         digest_text = "；".join(prompts) + "。"
 
-        # 规则化兜底句
+        # 规则化兜底句（≤100字；恒0与缺失分开表述，避免把“0℃故障”当真实极值）
         parts = []
         if max_v is not None:
             parts.append(f"最高{max_v:g}{unit}" + (f"（{max_loc}）" if max_loc else ""))
@@ -1259,13 +1723,48 @@ class BridgeData:
             parts.append(f"最低{min_v:g}{unit}" + (f"（{min_loc}）" if min_loc else ""))
         if not parts:
             parts.append("整体正常")
-        head = "" if (abnormal or zero_pos) else f"{label}监测数据整体正常，"
-        tail = ""
-        if abnormal or zero_pos:
-            tail = ("；" + "、".join((abnormal or []) + (zero_pos or []))
-                    + "位置存在数据缺失或异常，其余测点正常，需关注。")
-        fallback = (head + "、".join(parts) + tail)[:100]
+        head = "、".join(parts)
+        special = []
+        if zero_pos:
+            special.append("恒0疑似故障位置：" + "、".join(zero_pos[:2])
+                           + ("等" if len(zero_pos) > 2 else ""))
+        if abnormal:
+            special.append("数据缺失位置：" + "、".join(abnormal[:2])
+                           + ("等" if len(abnormal) > 2 else ""))
+        if not special:
+            fallback = f"{label}监测数据整体正常，{head}。"
+        else:
+            fallback = f"{head}；{'；'.join(special)}，其余测点正常，需关注。"
+        if len(fallback) > 100:
+            # 超长时去掉尾句，仍超长则按分号边界截断，不切断词
+            fallback = f"{head}；{'；'.join(special)}。"
+        if len(fallback) > 100:
+            cut = fallback[:100].rfind("；")
+            fallback = (fallback[:cut] if cut > 20 else fallback[:100]) + "。"
         return {"prompt": digest_text, "fallback": fallback}
+
+    @staticmethod
+    def _constant_faulty(fstats: Dict, feature: str) -> bool:
+        """恒值传感器判定：整季 最大值==最小值（如一直为0/恒值）视为故障或
+        无效数据，对应表格行应填“—”，且不参与 stats.* 聚合。
+        例外：裂缝(LF)/挠度(ND)/风速(spfs,szfs) 等“0为正常值”的特征，
+        恒为 0 属正常状态，不算故障。"""
+        if not isinstance(fstats, dict):
+            return False
+        try:
+            mx = float(fstats.get("最大值"))
+            mn = float(fstats.get("最小值"))
+        except (TypeError, ValueError):
+            return False
+        if abs(mx - mn) > 1e-9:
+            return False
+        m = re.search(r"\(([^)]+)\)$", str(feature or ""))
+        code = (m.group(1) if m else "").lower()
+        zero_ok = (code in ("nd", "spfs", "szfs")
+                   or str(feature or "").upper().startswith("LF"))
+        if zero_ok and mx == 0.0:
+            return False
+        return True
 
     def _feature_stats(self, sensor_id: str, metric: str, feature: str = "") -> Optional[Dict]:
         data = self._load_sensor_stats(sensor_id)
@@ -1350,6 +1849,10 @@ class BridgeData:
                      feature: str = "") -> Optional[float]:
         """读取单个传感器（可指定特征）在报告期内的统计值。"""
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
+        if fstats and self._constant_faulty(
+                fstats, feature or self.metrics.get(metric, {}).get("feature", "")):
+            # 恒值传感器视为故障/无效：整行填“—”，不参与聚合
+            return None
         if not fstats:
             return self._aggregate_sensor_stat(sensor_id, metric, stat,
                                                feature=feature)
@@ -1381,6 +1884,10 @@ class BridgeData:
                      feature: str = "") -> Optional[Dict]:
         """单个传感器统计 + 数据来源明细；读不到返回 None。"""
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
+        if fstats and self._constant_faulty(
+                fstats, feature or self.metrics.get(metric, {}).get("feature", "")):
+            # 恒值传感器视为故障/无效：整行填“—”，不参与聚合
+            return None
         if not fstats:
             v = self._aggregate_sensor_stat(sensor_id, metric, stat,
                                             feature=feature)
@@ -1981,6 +2488,30 @@ class BridgeData:
                         # 逐传感器统计（跳过“季度/年度聚合”回退值，回退值会
                         # 把全桥聚合复制到每个缺失传感器上，导致多行同值）。
                         order = sids[row_index % len(sids):] + sids[:row_index % len(sids)]
+                        # 恒值传感器（整季恒0/恒值）：该测点整行填“—”，
+                        # 不“顺延”到同位置其他传感器，避免坏测点串成好测点值
+                        if order:
+                            _primary = str(order[0])
+                            _feat = self.metrics.get(metric, {}).get("feature", "")
+                            _pf = self._feature_stats(_primary, metric,
+                                                      feature=_feat)
+                            if _pf and self._constant_faulty(_pf, _feat):
+                                return None, {
+                                    "占位符": f"cell.{metric}.{column}.{stat}",
+                                    "结果": "未找到",
+                                    "原因": f"测点 {column} 对应传感器恒值"
+                                            f"(疑似故障)，整行填“—”",
+                                    "分支": "名称对照位置-按行取传感器",
+                                    "监测部位": pos,
+                                    "表格标题": table_title,
+                                    "表格行号": row_index + 1,
+                                    "传感器": {
+                                        "传感器编号": _primary,
+                                        "监测部位": self._position_for_sensor(
+                                            _primary),
+                                        "特征": _feat,
+                                    },
+                                }
                         if val is None:
                             for sid in order:
                                 d_try = self._stat_detail(sid, metric, actual, period)
@@ -2134,21 +2665,23 @@ class BridgeData:
             "最终值": value,
         }
         # 最值/差值对应的监测部位（供 {{stats.<metric>.<stat>.loc}} 使用）
-        # 优先读季度/年度统计 全桥统计 里的“<统计量>位置”键（build_quarterly_stats
-        # 生成，与总结段落“对应测点为…”一致）；读不到再按逐传感器数据反推，
+        # 优先按“值 == 最终极值”的逐传感器定位（数值与位置必然对应），
         # 且跳过“季度/年度聚合统计”回退项——回退项会把聚合值复制到每个缺失
-        # 传感器的头上，导致多个传感器同值、最值位置取到第一个而失真。
+        # 传感器的头上，导致多个传感器同值、最值位置取到第一个而失真；
+        # 逐传感器匹配不到时（如聚合来自季度统计回退）再回退 全桥统计 位置键，
+        # 避免出现“值来自某传感器、位置却取到另一测点”的错位。
         feat_for_loc = (dir_feat if metric_dir
                         else self.metrics.get(metric, {}).get("feature", ""))
-        loc = self._agg_feature_location(feat_for_loc, actual)
+        loc = ""
+        real = [d for d in per_sensor
+                if d.get("数据来源") != "季度/年度聚合统计"]
+        pool = real or per_sensor
+        for d in pool:
+            if abs(d["值"] - value) < 1e-9:
+                loc = d.get("监测部位") or ""
+                break
         if not loc:
-            real = [d for d in per_sensor
-                    if d.get("数据来源") != "季度/年度聚合统计"]
-            pool = real or per_sensor
-            for d in pool:
-                if abs(d["值"] - value) < 1e-9:
-                    loc = d.get("监测部位") or ""
-                    break
+            loc = self._agg_feature_location(feat_for_loc, actual)
         if loc:
             detail["位置"] = loc
         return value, detail
@@ -2290,6 +2823,10 @@ class BridgeData:
         if chart_id in self.chart_map:
             return str(self.chart_map[chart_id])
 
+        ctx_texts = context if isinstance(context, (list, tuple)) else (
+            [context] if context else [])
+        side = self._context_side(ctx_texts, caption)
+
         # 0) 精确传感器占位符：chart_sensor_<编号>_<图型>
         #    （如 chart_sensor_304_trend / chart_sensor_184_histogram，
         #      由“304(xJsd)_时程曲线”等行识别生成）
@@ -2305,9 +2842,15 @@ class BridgeData:
             metric, pos, _kind, n = pp
             sids = self._sensors_at_position(pos, metric)
             if sids:
+                if side:
+                    # 同一位置分左右幅/上下游时，按节上下文定向，
+                    # 避免“右幅”节取到“左幅”传感器
+                    sided = [s for s in sids
+                             if side in (self._position_for_sensor(s) or "")]
+                    if sided:
+                        sids = sided
                 return sids[(n - 1) % len(sids)]
 
-        ctx_texts = context if isinstance(context, (list, tuple)) else ([context] if context else [])
         text = " ".join([caption] + [str(x) for x in ctx_texts if x]).strip()
         parsed = self._parse_chart_id(chart_id)
         metric_from_id = parsed[0] if parsed else None
@@ -2333,6 +2876,11 @@ class BridgeData:
         if location:
             loc_sids = self._location_sensors(found_metric or "temperature", location)
             if loc_sids:
+                if side:
+                    sided = [s for s in loc_sids
+                             if side in (self._position_for_sensor(s) or "")]
+                    if sided:
+                        loc_sids = sided
                 # 按 (指标, 位置, 图型) 分别计数：
                 # 时程图 1/2 -> 传感器 1/2，直方图 3/4 -> 传感器 1/2
                 kind = parsed[1] if parsed else "trend"
@@ -2356,6 +2904,37 @@ class BridgeData:
                 return sids[parsed[2] - 1]
 
         # 3) 泛型序号 + 指标回退（如 chart_trend_35 + 倾角 -> rotation 第35个，越界则失败）
+
+    @staticmethod
+    def _context_side(context, caption=""):
+        """从最近的上下文/图注里找明确方位词（右幅/左幅/下游/上游/右侧/左侧）。
+
+        同一句同时出现左右（如“左幅、右幅”）视为无明确方向，继续往前找。
+        用于“炎陵侧边跨跨中截面”这类同时存在左/右幅同名位置时按节定向。
+        """
+        texts = [str(x) for x in (context or []) if x]
+        if caption:
+            texts.append(str(caption))
+        for t in reversed(texts):
+            if "左幅" in t and "右幅" in t:
+                continue
+            if "左幅" in t:
+                return "左幅"
+            if "右幅" in t:
+                return "右幅"
+            if "上游" in t and "下游" in t:
+                continue
+            if "上游" in t:
+                return "上游"
+            if "下游" in t:
+                return "下游"
+            if "左侧" in t and "右侧" in t:
+                continue
+            if "左侧" in t:
+                return "左侧"
+            if "右侧" in t:
+                return "右侧"
+        return ""
         if parsed and parsed[0] is None and found_metric:
             sids = self.sensors_for_metric(found_metric)
             # 按监测部位分组，先位置后传感器（避免同位置多传感器重复占用前几个序号）

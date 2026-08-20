@@ -15,6 +15,8 @@ from .bridge_source import _norm
 
 log = logging.getLogger("report-agent.agent")
 
+from .period_utils import last_completed_quarter, quarter_range  # noqa: E402
+
 
 def resolve_period(
     mode: str,
@@ -89,6 +91,32 @@ def build_daily_records(records: List[Dict], value_column: str) -> List[Dict]:
             }
         )
     return rows
+
+
+def _bridge_key(s) -> str:
+    """桥名归一化：去空白、去“大桥/特大桥”后缀、转小写（与 bridges 一致）。"""
+    s = str(s or "").strip().lower().replace(" ", "")
+    for suffix in ("特大桥", "大桥"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    return s
+
+
+def _is_other_registered_bridge_name(name: str, current: str) -> bool:
+    """name_prefix 是否属于“其他已注册桥”的桥名（如配置残留 赤石大桥，
+    但当前桥是 洣水河特大桥）。是则报告名必须跟随当前桥。"""
+    if not name:
+        return False
+    try:
+        from .bridges import list_bridges
+        bridges = list_bridges()
+    except Exception:  # noqa: BLE001
+        return False
+    nk = _bridge_key(name)
+    ck = _bridge_key(current)
+    if not nk or nk == ck:
+        return False
+    return any(_bridge_key(b.get("name")) == nk for b in bridges)
 
 
 class ReportAgent:
@@ -324,17 +352,34 @@ class ReportAgent:
                 from .report_builder import _paragraph_text, _walk_paragraphs
                 tpl_doc = _Doc(self.cfg.get("template", ""))
                 extra_ids = []
+                recent = []  # 图表占位符前面的最近正文（用于左右幅等方位定向）
                 for para in _walk_paragraphs(tpl_doc):
                     t = _paragraph_text(para).strip()
                     m = re.fullmatch(r"\{\{chart\.([^}]+)\}\}", t)
                     if not m:
+                        if t:
+                            recent.append(t)
+                            if len(recent) > 8:
+                                recent = recent[-8:]
                         continue
                     cid = m.group(1)
                     if cid not in chart_images:
-                        extra_ids.append(cid)
-                for cid in extra_ids:
-                    info = bridge.resolve_chart_info(cid, cid)
+                        extra_ids.append((cid, list(recent)))
+                for cid, ctx in extra_ids:
+                    # 传最近正文作上下文，让“右幅”节能定向到右幅传感器
+                    info = bridge.resolve_chart_info(cid, cid, context=ctx)
                     if not info:
+                        # 匹配不到也生成占位图并记入待补清单，避免整个报告
+                        # 因个别图表占位符匹配失败而中断（报告仍可正常生成）
+                        reason = f"未匹配到图库图片（模板占位符: {cid}）"
+                        placeholder = bridge.make_placeholder_chart(
+                            cid, reason, out_dir)
+                        if placeholder:
+                            chart_images[cid] = placeholder
+                        chart_captions[cid] = cid
+                        pending_charts.append({
+                            "chart_id": cid, "caption": cid, "reason": reason,
+                        })
                         continue
                     chart_images[cid] = info["path"]
                     chart_captions[cid] = info["display"]
@@ -399,6 +444,14 @@ class ReportAgent:
         # 最终兜底用模板文件名。始终附加日期+时间后缀。
         name_cfg = self.cfg.get("report", {})
         name_prefix = name_cfg.get("name_prefix", "")
+        # 桥模式下报告名必须跟随当前桥：若配置里的 name_prefix 是其他已注册
+        # 桥的桥名（历史模板/源报告上传残留，如 赤石大桥），自动纠正为当前桥，
+        # 避免“生成洣水河却输出 赤石大桥.docx”。
+        if bridge is not None and bridge.bridge_name:
+            bn = bridge.bridge_name
+            if (not name_prefix
+                    or _is_other_registered_bridge_name(name_prefix, bn)):
+                name_prefix = bn
         if not name_prefix:
             source_report = self.cfg.get("source_report", "")
             if source_report:
@@ -433,6 +486,7 @@ class ReportAgent:
                 f"{period['end'].strftime('%Y%m%d')}.docx"
             )
         out_path = os.path.join(self.cfg.get("output_dir", "outputs"), out_name)
+        repair_stats = {}
         unfilled = report_builder.build_report(
             template_path=self.cfg.get("template", ""),
             output_path=out_path,
@@ -445,9 +499,11 @@ class ReportAgent:
             chart_captions=chart_captions,
             extra_charts=extra_charts,
             text_replace=bridge_cfg.get("text_replace") or None,
+            repair_stats=repair_stats,
         )
 
         # 数据链路日志：每个填入数值的来源与计算链（找不到的会标“未找到”）
+        verify_warns = []
         if lineage:
             out_dir_abs = os.path.abspath(self.cfg.get("output_dir", "outputs"))
             logs_dir = os.path.join(
@@ -472,6 +528,65 @@ class ReportAgent:
         else:
             lineage_path = ""
 
+        # LLM 报告审查：对照成品原文，检查表格/索引/图片/统计逻辑/总结段落
+        report_review = None
+        try:
+            from .reviewer import ReportReviewer, _read_docx_text
+            reviewer = ReportReviewer(self.cfg.get("llm"))
+            if reviewer.available():
+                # 数据链路摘要：只给“未找到/回退”项，避免把整份链路塞给 LLM
+                missed = [e for e in lineage if e.get("结果") in ("未找到", "回退")]
+                lineage_digest = json.dumps(
+                    missed[:200], ensure_ascii=False, default=str)
+                table_warnings = json.dumps(
+                    verify_warns[:100], ensure_ascii=False, default=str)
+                report_review = reviewer.review_report(
+                    _read_docx_text(self.cfg.get("source_report", "")),
+                    _read_docx_text(out_path),
+                    lineage_digest=lineage_digest,
+                    table_warnings=table_warnings,
+                )
+                n_issues = len(report_review.get("issues", []))
+                if n_issues:
+                    log.warning("报告审查发现 %d 处问题", n_issues)
+                    for iss in report_review.get("issues", []):
+                        log.warning("  - [%s] %s",
+                                    iss.get("type", "other"),
+                                    iss.get("detail", ""))
+                else:
+                    log.info("报告审查完成：未发现问题")
+                out_dir_abs = os.path.abspath(self.cfg.get("output_dir", "outputs"))
+                logs_dir = os.path.join(os.path.dirname(out_dir_abs), "logs")
+                os.makedirs(logs_dir, exist_ok=True)
+                review_path = os.path.join(
+                    logs_dir, f"review_report_{period.get('label') or 'report'}.json")
+                with open(review_path, "w", encoding="utf-8") as f:
+                    json.dump(report_review, f, ensure_ascii=False, indent=2)
+                log.info("报告审查结果已保存: %s", review_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("报告审查异常（不影响报告生成）: %s", exc)
+
+        # 确定性体检（不依赖 LLM，兜住数值逻辑/重复行/单位空格等硬错误）
+        self_check = []
+        try:
+            from .reviewer import self_check_report
+            self_check = self_check_report(out_path)
+            if self_check:
+                log.warning("确定性体检发现 %d 处问题", len(self_check))
+                for iss in self_check:
+                    log.warning("  - [%s] %s",
+                                iss.get("type", "other"), iss.get("detail", ""))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("确定性体检失败: %s", exc)
+
+        repair = {
+            "auto_fixed": repair_stats.get("spaces_collapsed", 0),
+            "manual_needed": ((len(report_review.get("issues", []))
+                               if report_review else 0) + len(self_check)),
+            "llm_called": report_review is not None,
+            "llm_ok": bool(report_review and report_review.get("raw")),
+        }
+
         summary = {
             "output": out_path,
             "period": {
@@ -490,6 +605,9 @@ class ReportAgent:
             "pending_charts": pending_charts,
             "missing_cells": missing_sinks[:500],
             "chart_gaps": chart_gaps if bridge is not None else [],
+            "review": report_review,
+            "self_check": self_check,
+            "repair": repair,
         }
         # 生成结束后刷新桥数据状态，让 match_stats 反映本次运行的实际命中情况
         if bridge is not None:

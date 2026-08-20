@@ -1,21 +1,19 @@
 # -*- coding: utf-8 -*-
 """报告智能体 Web 管理台。
 
-两种运行模式：
-  bridge（默认）：本服务管理本机的一个/多个桥配置，提供运行、下载、覆盖度等接口。
-  hub：部署在中心服务器（如 222.242.152.65），汇总各桥服务器的状态并提供跳转。
+没有中心服务器：本服务只管理本机部署的桥配置（通常一台独立服务器对应一座桥），
+提供运行、下载、覆盖度、模板解析、调度器控制等接口。
+原始监测数据只存储在各桥自己的服务器上，本服务不跨服务器传输数据。
 
 环境变量：
   REPORT_WEB_HOST        监听地址（默认 127.0.0.1，公网请用 nginx 反代 + HTTPS）
-  REPORT_WEB_PORT        端口（默认 8080）
+  REPORT_WEB_PORT        端口（默认 8456）
   REPORT_WEB_TOKEN       访问令牌；为空时不鉴权（仅建议本机调试）
-  REPORT_WEB_MODE        bridge | hub（默认 bridge）
   REPORT_WEB_REGISTRY    桥梁注册表路径（默认 bridges/registry.json）
   REPORT_PROJECT_ROOT    项目根目录（默认自动推断）
 
 启动：
-  python web/app.py
-  REPORT_WEB_TOKEN=xxx python web/app.py
+  set REPORT_WEB_TOKEN=xxx && python web/app.py
 """
 
 import datetime as dt
@@ -46,8 +44,31 @@ logging.basicConfig(
 )
 
 WEB_TOKEN = os.environ.get("REPORT_WEB_TOKEN", "")
-WEB_MODE = os.environ.get("REPORT_WEB_MODE", "bridge")
 REGISTRY = os.environ.get("REPORT_WEB_REGISTRY", os.path.join(ROOT, "bridges", "registry.json"))
+
+# LLM 供应商：后端统一配置 API 地址，前端只需选供应商 + 填 API Key
+LLM_PROVIDERS = {
+    "qwen": {
+        "label": "通义千问 QWEN",
+        "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-plus",
+    },
+    "zhipu": {
+        "label": "智谱 GLM",
+        "api_base": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-4-flash",
+    },
+    "deepseek": {
+        "label": "DeepSeek",
+        "api_base": "https://api.deepseek.com/v1",
+        "model": "deepseek-chat",
+    },
+    "moonshot": {
+        "label": "Kimi / Moonshot",
+        "api_base": "https://api.moonshot.cn/v1",
+        "model": "moonshot-v1-8k",
+    },
+}
 
 PREPROCESS_DIR = os.path.join(ROOT, "preprocess")
 PREPROCESS_CONFIG = os.path.join(PREPROCESS_DIR, "config.json")
@@ -66,22 +87,70 @@ _schedulers: Dict[str, Dict] = {}
 # 周期 / 季度工具
 # ---------------------------------------------------------------------------
 
-def _period_from_mode(mode: str, date_str: str = "") -> Dict:
+def _period_from_mode(mode: str, date_str: str = "",
+                      quarter: str = "", year: str = "") -> Dict:
     """按报告模式计算周期，返回 {start, end, label}。
-    label 示例: quarterly -> 2026.1~3 / 2026.4~6；monthly -> 2026.07。"""
+    label 示例: quarterly -> 2026.1~3 / 2026.4~6；monthly -> 2026.07。
+
+    quarterly 模式优先用季度号（quarter=1~4，year 默认今年）定位，
+    不再需要具体日期；季度尚未结束时抛出 ValueError（由调用方转成报错）。
+    未给季度号也未给日期时，默认取最近一个已完整结束的季度。
+    """
     import calendar
+    from report_agent.period_utils import (
+        last_completed_quarter, last_completed_year, quarter_range)
+    if mode == "quarterly":
+        if str(quarter).strip():
+            try:
+                q = int(quarter)
+                y = int(year) if str(year).strip() else dt.date.today().year
+            except (TypeError, ValueError):
+                raise ValueError(f"季度/年份无效: quarter={quarter}, year={year}")
+            start, end = quarter_range(y, q)
+            if end > dt.date.today():
+                raise ValueError(
+                    f"第{q}季度（{start.isoformat()} ~ {end.isoformat()}）尚未结束，"
+                    f"请等该季度过完后再生成。")
+        elif not date_str:
+            y, q = last_completed_quarter()
+            start, end = quarter_range(y, q)
+        else:
+            start = end = dt.date.fromisoformat(date_str)
+            q = (end.month - 1) // 3 + 1
+            y = end.year
+            ms = (q - 1) * 3 + 1
+            me = q * 3
+            start = dt.date(y, ms, 1)
+            end = dt.date(y, me, calendar.monthrange(y, me)[1])
+        label = f"{y}.{start.month}~{end.month}"
+        return {"start": start.isoformat(), "end": end.isoformat(),
+                "label": label}
+
     end = dt.date.fromisoformat(date_str) if date_str else dt.date.today()
     mode = mode or "quarterly"
     if mode == "yearly":
-        start = dt.date(end.year, 1, 1)
-        end = dt.date(end.year, 12, 31)
-        label = f"{end.year}年"
-    elif mode == "quarterly":
-        q = (end.month - 1) // 3 + 1
-        ms, me = (q - 1) * 3 + 1, q * 3
-        start = dt.date(end.year, ms, 1)
-        end = dt.date(end.year, me, calendar.monthrange(end.year, me)[1])
-        label = f"{end.year}.{ms}~{me}"
+        if str(year).strip():
+            try:
+                y = int(year)
+            except (TypeError, ValueError):
+                raise ValueError(f"年份无效: year={year}")
+            if y >= dt.date.today().year:
+                raise ValueError(f"{y}年尚未结束，请等该年度过完后再生成。")
+            start, end = dt.date(y, 1, 1), dt.date(y, 12, 31)
+            label = f"{y}年"
+            return {"start": start.isoformat(), "end": end.isoformat(),
+                    "label": label}
+        if not date_str:
+            y = last_completed_year()
+            start, end = dt.date(y, 1, 1), dt.date(y, 12, 31)
+            label = f"{y}年"
+            return {"start": start.isoformat(), "end": end.isoformat(),
+                    "label": label}
+        y = end.year
+        if y >= dt.date.today().year:
+            raise ValueError(f"{y}年尚未结束，请等该年度过完后再生成。")
+        start, end = dt.date(y, 1, 1), dt.date(y, 12, 31)
+        label = f"{y}年"
     elif mode == "monthly":
         start = dt.date(end.year, end.month, 1)
         end = dt.date(end.year, end.month,
@@ -114,7 +183,7 @@ def _period_dir_base(cfg: Optional[Dict] = None) -> str:
     cd = str(bd.get("charts_dir", "") or "").replace("\\", "/")
     for marker in ("图库_", "图库"):
         idx = cd.find(marker)
-        if idx > 0:
+        if idx >= 0:
             base = cd[:idx].rstrip("/")
             return base if os.path.isabs(base) else os.path.normpath(
                 os.path.join(ROOT, base))
@@ -129,18 +198,48 @@ def _quarter_dirs(cfg: Optional[Dict], label: str) -> tuple:
     def _with_bridge(p: str) -> str:
         return os.path.join(p, bridge) if bridge else p
     from report_agent.config import resolve_bridge_subdir
+    # 年度显示标签(2026年)与数据目录标签(2026.1~12)统一
+    dir_label = re.sub(r"^(\d{4})年$", r"\1.1~12", label or "") or label
     if not label:
         charts = _with_bridge(os.path.join(base, "图库"))
         stats = _with_bridge(os.path.join(base, "统计值"))
     else:
-        charts = _with_bridge(os.path.join(base, f"图库_{label}"))
-        stats = _with_bridge(os.path.join(base, f"统计值_{label}"))
+        charts = _with_bridge(os.path.join(base, f"图库_{dir_label}"))
+        stats = _with_bridge(os.path.join(base, f"统计值_{dir_label}"))
     return (resolve_bridge_subdir(charts, bridge),
             resolve_bridge_subdir(stats, bridge))
 
 
 def _dir_nonempty(path: str) -> bool:
-    return bool(os.path.isdir(path) and any(True for _ in os.scandir(path)))
+    """判断目录是否已有实际数据产物（图：png/jpg；统计：json/csv/xlsx）。
+    忽略纯记录文件（生成失败记录.txt 等）与空子目录，避免“空目录/失败残留”
+    被误判为数据就绪。"""
+    if not os.path.isdir(path):
+        return False
+    try:
+        for _root, _dirs, files in os.walk(path):
+            for fn in files:
+                low = fn.lower()
+                if low.endswith((".png", ".jpg", ".jpeg", ".csv", ".xlsx")):
+                    return True
+                if low.endswith(".json") and fn != "总览.json":
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _stats_ready(stats_dir: str) -> bool:
+    """统计值就绪 = 目录非空且存在“位置统计”子目录（含 json）。
+
+    防止错误的双层桥名目录（如 …/洣水河特大桥/洣水河特大桥/位置统计）
+    让单层目录看起来“已存在”，从而跳过真正的预处理（导致季度总结等
+    没生成、报告取不到数据）。
+    """
+    if not _dir_nonempty(stats_dir):
+        return False
+    pos_dir = os.path.join(stats_dir, "位置统计")
+    return os.path.isdir(pos_dir) and _dir_nonempty(pos_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +292,21 @@ def _repair_filename(name: str) -> str:
     return name
 
 
+def _portable_path(path: str) -> str:
+    """保存路径时尽量用相对项目根目录的写法；项目外的绝对路径（原始数据、
+    外部预处理产物等）保持绝对路径不变。统一用 / 分隔。"""
+    path = os.path.normpath(str(path or ""))
+    if not path:
+        return ""
+    try:
+        rel = os.path.relpath(path, ROOT)
+        if rel != ".." and not rel.startswith(".." + os.sep):
+            return rel.replace("\\", "/")
+    except ValueError:
+        pass
+    return path.replace("\\", "/")
+
+
 def _mask_secrets(cfg: Dict) -> Dict:
     out = dict(cfg)
     llm = out.get("llm")
@@ -210,7 +324,7 @@ def _bridge_snapshot(bridge: Dict) -> Dict:
         "id": bid,
         "name": bridge.get("name", bid),
         "host": bridge.get("host", ""),
-        "port": bridge.get("port", 8080),
+        "port": bridge.get("port", 8456),
         "token_env": bridge.get("token_env", ""),
         "description": bridge.get("description", ""),
         "config": bridge.get("config", ""),
@@ -286,7 +400,6 @@ def api_status():
         return auth
     return jsonify({
         "ok": True,
-        "mode": WEB_MODE,
         "project_root": ROOT,
         "time": dt.datetime.now().isoformat(timespec="seconds"),
         "registry": REGISTRY,
@@ -335,8 +448,7 @@ def api_bridge_config_update(bridge_id):
     if not cfg_path:
         return jsonify({"error": f"未找到桥梁 {bridge_id} 的配置"}), 404
     try:
-        from report_agent.config import load_config
-        cfg = load_config(cfg_path)
+        cfg = _raw_config(cfg_path)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"配置不可用: {exc}"}), 400
 
@@ -345,7 +457,7 @@ def api_bridge_config_update(bridge_id):
     if isinstance(data.get("paths"), dict):
         for k in ("stats_dir", "charts_dir", "sensor_map", "name_dict", "overview"):
             if k in data["paths"] and data["paths"][k] is not None:
-                bd[k] = str(data["paths"][k]).strip()
+                bd[k] = _portable_path(str(data["paths"][k]))
     for k in ("sensor_exclude", "auto_fill_missing_charts", "fuzzy_threshold", "period_aggregate"):
         if k in data:
             bd[k] = data[k]
@@ -361,14 +473,30 @@ def api_bridge_config_update(bridge_id):
         sch = data["schedule"]
         if sch.get("mode") in ("weekly", "monthly", "quarterly", "yearly"):
             cfg.setdefault("schedule", {})["mode"] = sch["mode"]
-        for k in ("weekday", "day_of_month", "hour", "minute"):
+        for k in ("weekday", "day_of_month", "hour", "minute", "start_date"):
             if k in sch and sch[k] is not None:
+                if k == "start_date":
+                    cfg.setdefault("schedule", {})[k] = str(sch[k]).strip()
+                    continue
                 try:
                     cfg.setdefault("schedule", {})[k] = int(sch[k])
                 except (TypeError, ValueError):
                     pass
     if isinstance(data.get("report"), dict) and data["report"].get("name_prefix") is not None:
         cfg.setdefault("report", {})["name_prefix"] = str(data["report"]["name_prefix"])
+    # LLM：供应商/API Key/模型。选择供应商时后端自动配 API 地址
+    if isinstance(data.get("llm"), dict):
+        llm_in = data["llm"]
+        llm_cfg = cfg.setdefault("llm", {})
+        for k in ("provider", "api_key", "model", "api_base", "enabled"):
+            if k in llm_in and llm_in[k] is not None:
+                llm_cfg[k] = llm_in[k]
+        prov = str(llm_cfg.get("provider") or "").strip()
+        if prov in LLM_PROVIDERS:
+            if not str(llm_in.get("api_base") or "").strip():
+                llm_cfg["api_base"] = LLM_PROVIDERS[prov]["api_base"]
+            if not str(llm_cfg.get("model") or "").strip():
+                llm_cfg["model"] = LLM_PROVIDERS[prov]["model"]
 
     _save_config(cfg, cfg_path)
     return jsonify({"ok": True, "config_path": cfg_path})
@@ -807,23 +935,6 @@ def api_bridge_data_check(bridge_id):
     })
 
 
-@app.route("/api/bridges/<bridge_id>/coverage")
-def api_bridge_coverage(bridge_id):
-    auth = _require_token()
-    if auth:
-        return auth
-    cfg = _config_for(bridge_id)
-    if not cfg or "error" in cfg:
-        return jsonify({"error": "配置不可用"}), 404
-    bcfg = cfg.get("bridge_data") or {}
-    if not bcfg.get("enabled", False):
-        return jsonify({"enabled": False, "message": "该桥未启用真实数据（bridge_data.enabled=false）"})
-    from report_agent.bridge_source import BridgeData
-    bridge = BridgeData(bcfg, base_dir=os.path.dirname(cfg.get("_config_path", ROOT)))
-    bridge.load()
-    return jsonify(bridge.coverage())
-
-
 @app.route("/api/bridges/<bridge_id>/analysis")
 def api_bridge_analysis(bridge_id):
     auth = _require_token()
@@ -917,8 +1028,27 @@ def api_bridge_chart(bridge_id, filename):
     return jsonify({"error": "图片不存在"}), 404
 
 
+def _canon_bridge_name(name: str) -> str:
+    """把用户填的桥名(洣水/洣水河/洣水河特大桥)规范为 config 里的全名。"""
+    from report_agent.config import bridge_dir_match
+    cfg_dir = os.path.join(ROOT, "config")
+    if os.path.isdir(cfg_dir):
+        for fn in sorted(os.listdir(cfg_dir)):
+            if not (fn.startswith("config_") and fn.endswith(".json")):
+                continue
+            try:
+                with open(os.path.join(cfg_dir, fn), encoding="utf-8") as f:
+                    bname = ((json.load(f).get("bridge_data") or {})
+                             .get("bridge_name", "") or "")
+            except Exception:
+                continue
+            if bname and bridge_dir_match(name, bname):
+                return bname
+    return name
+
+
 def _run_pipeline(period: Dict, charts_dir: str, stats_dir: str,
-                  st: Dict) -> int:
+                  st: Dict, bridge: str = "") -> int:
     """调用 pipeline.py 完成 秒级->日级->图库/统计值->对照表。
     返回子进程退出码。"""
     pcfg = {}
@@ -935,58 +1065,131 @@ def _run_pipeline(period: Dict, charts_dir: str, stats_dir: str,
            "--raw", raw, "--daily", daily,
            "--charts", charts_dir, "--stats", stats_dir,
            "--start", period["start"], "--end", period["end"]]
+    if bridge:
+        cmd += ["--bridge", bridge]
     if map_docx:
         cmd += ["--sensor-map-docx", map_docx]
     st["pipeline_cmd"] = " ".join(cmd)
+    # 输出实时写入日志文件，超时被杀时也能看到卡在哪一步
+    logs_dir = os.path.join(ROOT, "outputs", "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    log_path = os.path.join(logs_dir, "web_pipeline.log")
+    try:
+        timeout = int(os.environ.get("REPORT_WEB_PIPELINE_TIMEOUT", 43200))
+    except (TypeError, ValueError):
+        timeout = 43200
+    log_fh = open(log_path, "wb")
     proc = subprocess.Popen(cmd, cwd=ROOT, env=_subprocess_env(),
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                            stdout=log_fh, stderr=subprocess.STDOUT)
     st["pipeline_pid"] = proc.pid
     try:
-        out, _ = proc.communicate(timeout=7200)
+        proc.wait(timeout=timeout)
+        rc = proc.returncode
     except Exception as exc:  # noqa: BLE001
         proc.kill()
-        st["pipeline_error"] = str(exc)
-        return 1
-    st["pipeline_log_tail"] = out.decode("utf-8", errors="replace")[-4000:]
-    return proc.returncode
+        st["pipeline_error"] = (f"数据处理超过 {timeout // 3600} 小时被终止，"
+                                f"详见日志尾部: {exc}")
+        rc = 1
+    finally:
+        log_fh.close()
+    try:
+        with open(log_path, "rb") as f:
+            st["pipeline_log_tail"] = f.read()[-4000:].decode(
+                "utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        st["pipeline_log_tail"] = ""
+    return rc
+
+
+def _bridge_key(s) -> str:
+    """桥名归一化：去空白、去“大桥/特大桥”后缀、转小写。"""
+    s = str(s or "").strip().lower().replace(" ", "")
+    for suffix in ("特大桥", "大桥"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    return s
+
+
+def _is_other_bridge_prefix(name: str, current: str) -> bool:
+    """name_prefix 是否属于其他已注册桥的桥名（用于纠正配置残留）。"""
+    if not name:
+        return False
+    nk = _bridge_key(name)
+    ck = _bridge_key(current)
+    if not nk or nk == ck:
+        return False
+    return any(_bridge_key(b.get("name")) == nk
+               for b in list_bridges(REGISTRY))
 
 
 def _update_bridge_data_dirs(bridge_id: str, stats_dir: str,
                              charts_dir: str) -> None:
-    """把桥配置的 bridge_data 路径切到季度目录。"""
+    """把桥配置的 bridge_data 路径切到季度目录。
+
+    项目内的路径一律保存为相对项目根目录的写法（便于换机器部署），
+    项目外（原始数据/外部预处理产物）保持绝对路径。
+    """
     cfg_path = _config_path_for(bridge_id)
     if not cfg_path:
         return
     try:
-        from report_agent.config import load_config
-        cfg = load_config(cfg_path)
-    except Exception:  # noqa: BLE001
+        cfg = _raw_config(cfg_path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("读取桥配置失败 %s: %s", cfg_path, exc)
         return
     bd = cfg.setdefault("bridge_data", {})
-    bd["stats_dir"] = stats_dir
-    bd["charts_dir"] = charts_dir
+    bd["stats_dir"] = _portable_path(stats_dir)
+    bd["charts_dir"] = _portable_path(charts_dir)
     # 传感器对照表是固定产物，统一放 preprocess/传感器对照/，不随季度变化
     map_dir = os.path.join(PREPROCESS_DIR, "传感器对照")
-    bd["sensor_map"] = os.path.join(map_dir, "传感器编号名称.json")
-    bd["overview"] = os.path.join(stats_dir, "总览.json")
+    bd["sensor_map"] = _portable_path(
+        os.path.join(map_dir, "传感器编号名称.json"))
+    bd["overview"] = _portable_path(os.path.join(stats_dir, "总览.json"))
     bridge = bd.get("bridge_name", "") or ""
+    # 报告名跟随当前桥：name_prefix 为空或残留其他已注册桥名（如配置里还写着
+    # 赤石大桥，但当前桥是洣水河特大桥）时自动纠正，避免“选洣水出赤石”。
+    rep = cfg.setdefault("report", {})
+    cur_prefix = str(rep.get("name_prefix") or "").strip()
+    if bridge and (not cur_prefix or _is_other_bridge_prefix(cur_prefix, bridge)):
+        rep["name_prefix"] = bridge
     from report_agent.config import name_dict_candidates
     nd_dir = os.path.join(map_dir, "传感器名称对照")
     bd["name_dict"] = ""
     for fn in name_dict_candidates(bridge):
         cand = os.path.join(nd_dir, fn)
         if os.path.isfile(cand):
-            bd["name_dict"] = cand
+            bd["name_dict"] = _portable_path(cand)
             break
     if not bd["name_dict"]:
-        bd["name_dict"] = os.path.join(nd_dir,
-                                       f"{bridge}大桥.json")
+        bd["name_dict"] = _portable_path(
+            os.path.join(nd_dir, f"{bridge}大桥.json"))
     _save_config(cfg, cfg_path)
+
+
+def _check_period_match(bridge_id: str, period: Dict, st: Dict) -> None:
+    """报告生成后核对 last_run.json 的实际报告期，防止“请求 4~6、生成 1~3”。"""
+    cfg = _config_for(bridge_id)
+    if not cfg or "error" in cfg:
+        return
+    lr_path = os.path.join(cfg.get("output_dir", ""), "last_run.json")
+    if not os.path.isfile(lr_path):
+        return
+    try:
+        with open(lr_path, "r", encoding="utf-8") as f:
+            lr = json.load(f)
+    except Exception:  # noqa: BLE001
+        return
+    lp = lr.get("period") or {}
+    if lp.get("label") and lp.get("label") != period.get("label"):
+        msg = (f"报告期不一致：请求 {period.get('label')}，实际生成 "
+               f"{lp.get('label')}（{lp.get('start')} ~ {lp.get('end')}）")
+        st["period_mismatch"] = msg
+        log.error("桥梁 %s %s", bridge_id, msg)
 
 
 @app.route("/api/bridges/<bridge_id>/period")
 def api_bridge_period(bridge_id):
-    """按模式/日期计算周期，返回季度目录及数据是否就绪。"""
+    """按模式/季度号计算周期，返回季度目录及数据是否就绪。"""
     auth = _require_token()
     if auth:
         return auth
@@ -994,21 +1197,28 @@ def api_bridge_period(bridge_id):
     if not cfg or "error" in cfg:
         return jsonify({"error": "配置不可用"}), 404
     mode = request.args.get("mode", "quarterly")
+    if mode not in ("weekly", "monthly", "quarterly", "yearly", "manual"):
+        return jsonify({"error": f"无效模式: {mode}"}), 400
     date = request.args.get("date", "")
+    quarter = request.args.get("quarter", "")
+    year = request.args.get("year", "")
     start = request.args.get("start", "")
     end = request.args.get("end", "")
     if start and end:
         period = {"start": start, "end": end, "label": _label_from_range(start, end)}
     else:
-        period = _period_from_mode(mode, date)
+        try:
+            period = _period_from_mode(mode, date, quarter, year)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
     charts_dir, stats_dir = _quarter_dirs(cfg, period["label"])
     return jsonify({
         **period,
         "charts_dir": charts_dir,
         "stats_dir": stats_dir,
         "charts_exists": _dir_nonempty(charts_dir),
-        "stats_exists": _dir_nonempty(stats_dir),
-        "data_ready": _dir_nonempty(charts_dir) and _dir_nonempty(stats_dir),
+        "stats_exists": _stats_ready(stats_dir),
+        "data_ready": _dir_nonempty(charts_dir) and _stats_ready(stats_dir),
     })
 
 
@@ -1027,6 +1237,8 @@ def api_bridge_run(bridge_id):
     if mode not in ("weekly", "monthly", "quarterly", "yearly", "manual"):
         return jsonify({"error": f"无效模式: {mode}"}), 400
     date = str(data.get("date") or "").strip()
+    quarter = str(data.get("quarter") or "").strip()
+    year = str(data.get("year") or "").strip()
     engine = str(data.get("engine") or "").strip() or None
     start = str(data.get("start") or "").strip()
     end = str(data.get("end") or "").strip()
@@ -1037,7 +1249,10 @@ def api_bridge_run(bridge_id):
         period = {"start": start, "end": end,
                   "label": _label_from_range(start, end)}
     else:
-        period = _period_from_mode(mode, date)
+        try:
+            period = _period_from_mode(mode, date, quarter, year)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
         start, end = period["start"], period["end"]
 
     with _run_lock:
@@ -1052,14 +1267,18 @@ def api_bridge_run(bridge_id):
             st["period"] = period
             cfg = _config_for(bridge_id)
             charts_dir, stats_dir = _quarter_dirs(cfg, period["label"])
-            data_ready = _dir_nonempty(charts_dir) and _dir_nonempty(stats_dir)
+            data_ready = (_dir_nonempty(charts_dir)
+                          and _stats_ready(stats_dir))
             st["charts_dir"] = charts_dir
             st["stats_dir"] = stats_dir
             st["data_ready"] = data_ready
             if auto_preprocess:
                 if not data_ready:
                     st["preprocess"] = "running"
-                    rc = _run_pipeline(period, charts_dir, stats_dir, st)
+                    rc = _run_pipeline(
+                        period, charts_dir, stats_dir, st,
+                        bridge=((cfg.get("bridge_data") or {})
+                                .get("bridge_name") or ""))
                     st["preprocess"] = "done" if rc == 0 else "failed"
                     if rc != 0:
                         st["error"] = ("数据预处理失败，详见 pipeline 日志。"
@@ -1068,14 +1287,21 @@ def api_bridge_run(bridge_id):
                         return
                 else:
                     st["preprocess"] = "skipped"
-                _update_bridge_data_dirs(bridge_id, stats_dir, charts_dir)
             else:
                 st["preprocess"] = "manual"
+            # 无论是否跑了预处理，都把配置切到本次报告期对应的图库/统计值目录，
+            # 避免数据就绪跳过预处理时配置仍指向上一期（如 1~3）导致图表匹配失败
+            _update_bridge_data_dirs(bridge_id, stats_dir, charts_dir)
 
             cmd = [sys.executable, os.path.join(ROOT, "run_agent.py"),
                    "--config", cfg_path, "--mode", mode]
-            if date:
-                cmd += ["--date", date]
+            if mode in ("quarterly", "yearly"):
+                # 以 web 算好的报告期结束日为准传给 run_agent，避免两边
+                # 各自推导季度/年份导致报告期不一致（如选 2025 却生成 2026）
+                cmd += ["--date", period["end"]]
+            elif date or (mode == "manual" and end):
+                # manual 区间：把结束日传给 run_agent（否则它会按今天推导）
+                cmd += ["--date", date or end]
             if engine:
                 cmd += ["--engine", engine]
             if template:
@@ -1094,6 +1320,13 @@ def api_bridge_run(bridge_id):
             st["log_tail"] = out.decode("utf-8", errors="replace")[-4000:]
             st["finished_at"] = dt.datetime.now().isoformat(timespec="seconds")
             log.info("桥梁 %s 报告生成完成，返回码 %s", bridge_id, proc.returncode)
+            if proc.returncode != 0:
+                # 失败必须明确报出来，否则页面会显示“完成”和旧的 last_run，
+                # 让人误以为生成了别的报告期
+                st["error"] = (f"报告生成失败（返回码 {proc.returncode}），"
+                               f"详见下方日志尾部或 outputs/logs/agent.log")
+            else:
+                _check_period_match(bridge_id, period, st)
         except Exception as exc:  # noqa: BLE001
             st["error"] = str(exc)
             st["finished_at"] = dt.datetime.now().isoformat(timespec="seconds")
@@ -1140,10 +1373,14 @@ def api_bridge_scheduler_start(bridge_id):
     st = _schedulers.get(bridge_id)
     if st and st.get("proc") and st["proc"].poll() is None:
         return jsonify({"error": "调度器已在运行", "pid": st["proc"].pid}), 409
+    logs_dir = os.path.join(ROOT, "outputs", "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    log_path = os.path.join(logs_dir, f"scheduler_{bridge_id}.log")
+    log_fh = open(log_path, "ab")
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "serve_scheduler.py"), "--bridge", bridge_id],
         cwd=ROOT, env=_subprocess_env(),
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=log_fh, stderr=subprocess.STDOUT,
     )
     _schedulers[bridge_id] = {"proc": proc, "started_at": dt.datetime.now().isoformat(timespec="seconds")}
     return jsonify({"ok": True, "pid": proc.pid})
@@ -1185,6 +1422,175 @@ def api_bridge_run_status(bridge_id):
     return jsonify({"running": st, "last_run": last_run})
 
 
+@app.route("/api/bridges/<bridge_id>/review")
+def api_bridge_review(bridge_id):
+    """审查问题面板数据：LLM 报告审查 + 确定性体检 + 模板审查。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    cfg = _config_for(bridge_id)
+    if not cfg or "error" in cfg:
+        return jsonify({"error": "配置不可用"}), 404
+    out_dir = cfg.get("output_dir", "")
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(out_dir or ".")),
+                            "logs")
+    analysis_dir = os.path.join(ROOT, "outputs", "analysis")
+
+    # 1) 最近一次报告运行：review / self_check / repair
+    last_run = {}
+    lr_path = os.path.join(out_dir, "last_run.json")
+    if os.path.isfile(lr_path):
+        try:
+            with open(lr_path, "r", encoding="utf-8") as f:
+                last_run = json.load(f)
+        except Exception:  # noqa: BLE001
+            last_run = {}
+
+    # 2) 报告审查独立 JSON（outputs/logs/review_report_<期>.json，取最新）
+    report_reviews = []
+    if os.path.isdir(logs_dir):
+        for fn in sorted(os.listdir(logs_dir)):
+            if not (fn.startswith("review_report_") and fn.endswith(".json")):
+                continue
+            p = os.path.join(logs_dir, fn)
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                report_reviews.append({
+                    "file": os.path.relpath(p, ROOT).replace("\\", "/"),
+                    "name": fn,
+                    "mtime": dt.datetime.fromtimestamp(
+                        os.path.getmtime(p)).isoformat(timespec="seconds"),
+                    "ok": data.get("ok", True),
+                    "issues": data.get("issues", []),
+                    "raw": (data.get("raw") or "")[:2000],
+                })
+            except Exception:  # noqa: BLE001
+                continue
+    report_reviews.sort(key=lambda x: x["mtime"], reverse=True)
+
+    # 3) 模板审查 JSON（outputs/analysis/review_template_<报告名>.json，
+    #    优先匹配本桥 source_report 文件名，否则取最新）
+    template_reviews = []
+    if os.path.isdir(analysis_dir):
+        stem = ""
+        src = cfg.get("source_report", "")
+        if src:
+            stem = os.path.splitext(os.path.basename(src))[0]
+        for fn in sorted(os.listdir(analysis_dir)):
+            if not (fn.startswith("review_template_") and fn.endswith(".json")):
+                continue
+            if stem and not fn.startswith(f"review_template_{stem}"):
+                continue
+            p = os.path.join(analysis_dir, fn)
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                template_reviews.append({
+                    "file": os.path.relpath(p, ROOT).replace("\\", "/"),
+                    "name": fn,
+                    "mtime": dt.datetime.fromtimestamp(
+                        os.path.getmtime(p)).isoformat(timespec="seconds"),
+                    "ok": data.get("ok", True),
+                    "issues": data.get("issues", []),
+                    "raw": (data.get("raw") or "")[:2000],
+                })
+            except Exception:  # noqa: BLE001
+                continue
+    template_reviews.sort(key=lambda x: x["mtime"], reverse=True)
+
+    # 4) LLM 是否可用（决定审查是否真的调用了大模型）
+    llm = cfg.get("llm", {}) or {}
+    llm_available = bool(llm.get("enabled")) and bool(
+        llm.get("api_key") or os.environ.get("QWEN_API_KEY")
+        or os.environ.get("DASHSCOPE_API_KEY"))
+
+    return jsonify({
+        "bridge_id": bridge_id,
+        "llm_available": llm_available,
+        "last_run": {
+            "period": last_run.get("period"),
+            "output": last_run.get("output"),
+            "review": last_run.get("review"),
+            "self_check": last_run.get("self_check"),
+            "repair": last_run.get("repair"),
+        },
+        "report_reviews": report_reviews,
+        "template_reviews": template_reviews,
+        "logs_dir": os.path.relpath(logs_dir, ROOT).replace("\\", "/"),
+    })
+
+
+@app.route("/api/bridges/<bridge_id>/review-file")
+def api_bridge_review_file(bridge_id):
+    """下载审查 JSON（review_report_*.json / review_template_*.json）。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    cfg = _config_for(bridge_id)
+    if not cfg or "error" in cfg:
+        return jsonify({"error": "配置不可用"}), 404
+    name = os.path.basename(str(request.args.get("name") or ""))
+    if not (name.startswith("review_report_") or name.startswith("review_template_")):
+        return jsonify({"error": "文件名不合法"}), 400
+    out_dir = cfg.get("output_dir", "")
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(out_dir or ".")), "logs", name),
+        os.path.join(ROOT, "outputs", "analysis", name),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return send_file(p, as_attachment=True, download_name=name)
+    return jsonify({"error": "文件不存在"}), 404
+
+
+@app.route("/api/bridges/<bridge_id>/llm/providers")
+def api_bridge_llm_providers(bridge_id):
+    """返回可选 LLM 供应商（前端只需填 API Key）。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    return jsonify({"providers": LLM_PROVIDERS})
+
+
+@app.route("/api/bridges/<bridge_id>/llm/test", methods=["POST"])
+def api_bridge_llm_test(bridge_id):
+    """用当前配置（可临时覆盖 api_key/provider/model）测试 LLM 连通性。"""
+    auth = _require_token()
+    if auth:
+        return auth
+    cfg = _config_for(bridge_id)
+    if not cfg or "error" in cfg:
+        return jsonify({"error": "配置不可用"}), 404
+    data = request.get_json(silent=True) or {}
+    llm_cfg = dict(cfg.get("llm") or {})
+    # 测试只验证“填的 Key + 供应商”，不依赖配置里 enabled 开关
+    llm_cfg["enabled"] = True
+    if data.get("provider") in LLM_PROVIDERS:
+        llm_cfg["provider"] = data["provider"]
+        llm_cfg["api_base"] = LLM_PROVIDERS[data["provider"]]["api_base"]
+    if data.get("api_key"):
+        llm_cfg["api_key"] = str(data["api_key"]).strip()
+    if data.get("model"):
+        llm_cfg["model"] = str(data["model"]).strip()
+    elif not llm_cfg.get("model") and llm_cfg.get("provider") in LLM_PROVIDERS:
+        llm_cfg["model"] = LLM_PROVIDERS[llm_cfg["provider"]]["model"]
+    from report_agent.llm_classifier import LLMClassifier
+    cls = LLMClassifier(llm_cfg)
+    if not cls.available():
+        return jsonify({"ok": False,
+                        "error": "未配置 API Key 或供应商地址（请先保存配置）"})
+    try:
+        resp = cls._chat([{"role": "user", "content": "只回复 OK 两个字"}])
+        if resp and str(resp).strip():
+            return jsonify({"ok": True,
+                            "reply": str(resp).strip()[:100]})
+        return jsonify({"ok": False,
+                        "error": "模型返回为空（请检查模型名是否正确、是否已开通）"})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)})
+
+
 @app.route("/api/bridges/<bridge_id>/log")
 def api_bridge_log(bridge_id):
     auth = _require_token()
@@ -1224,11 +1630,22 @@ def api_preprocess_config():
 
 @app.route("/api/preprocess/config", methods=["POST"])
 def api_preprocess_config_save():
-    """保存数据处理管道配置。"""
+    """保存数据处理管道配置。
+
+    秒级数据目录 / 日级数据目录 / 桥名 为必填；
+    图库/统计值目录等可留空（按桥名自动匹配并更新 config/config_<桥>.json
+    的 bridge_data 路径；数据还没生成时留空，pipeline 跑完后自动写回）。
+    """
     auth = _require_token()
     if auth:
         return auth
     data = request.get_json(silent=True) or {}
+    raw = str(data.get("raw_data_dir") or "").strip()
+    daily = str(data.get("daily_dir") or "").strip()
+    bridge_name = str(data.get("bridge_name") or "").strip()
+    if not raw or not daily or not bridge_name:
+        return jsonify({
+            "error": "秒级数据目录、日级数据目录、桥名为必填项"} ), 400
     cfg = {}
     if os.path.isfile(PREPROCESS_CONFIG):
         with open(PREPROCESS_CONFIG, "r", encoding="utf-8") as f:
@@ -1240,7 +1657,59 @@ def api_preprocess_config_save():
     os.makedirs(PREPROCESS_DIR, exist_ok=True)
     with open(PREPROCESS_CONFIG, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
-    return jsonify({"ok": True, "config": cfg})
+
+    # 按桥名自动更新 config/config_<桥>.json 的 bridge_data 路径
+    from report_agent.config import bridge_dir_match
+    cfg_dir = os.path.join(ROOT, "config")
+    bridge_cfg_path, canon_name = None, bridge_name
+    assets = {}
+    if os.path.isdir(cfg_dir):
+        for fn in sorted(os.listdir(cfg_dir)):
+            if not (fn.startswith("config_") and fn.endswith(".json")):
+                continue
+            p = os.path.join(cfg_dir, fn)
+            try:
+                with open(p, encoding="utf-8") as f:
+                    bname = ((json.load(f).get("bridge_data") or {})
+                             .get("bridge_name", "") or "")
+            except Exception:
+                continue
+            if bname and bridge_dir_match(bridge_name, bname):
+                bridge_cfg_path, canon_name = p, bname
+                break
+    if bridge_cfg_path:
+        try:
+            from setup_bridge import find_bridge_assets
+            assets = find_bridge_assets(canon_name)
+            with open(bridge_cfg_path, encoding="utf-8") as f:
+                bcfg = json.load(f)
+            bd = bcfg.setdefault("bridge_data", {})
+            bd["enabled"] = True
+            bd["bridge_name"] = canon_name
+            if assets.get("stats_dir"):
+                bd["stats_dir"] = _portable_path(assets["stats_dir"])
+            if assets.get("charts_dir"):
+                bd["charts_dir"] = _portable_path(assets["charts_dir"])
+            if assets.get("sensor_map"):
+                bd["sensor_map"] = _portable_path(assets["sensor_map"])
+            if assets.get("name_dict"):
+                bd["name_dict"] = _portable_path(assets["name_dict"])
+            if assets.get("stats_dir"):
+                bd["overview"] = _portable_path(os.path.join(
+                    assets["stats_dir"], "总览.json"))
+            _save_config(bcfg, bridge_cfg_path)
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": True, "config": cfg,
+                            "bridge_config_error": str(exc)})
+
+    return jsonify({
+        "ok": True,
+        "config": cfg,
+        "bridge_config": (os.path.relpath(bridge_cfg_path, ROOT)
+                          if bridge_cfg_path else None),
+        "bridge_name": canon_name,
+        "auto_paths": assets,
+    })
 
 
 @app.route("/api/preprocess/run", methods=["POST"])
@@ -1262,6 +1731,11 @@ def api_preprocess_run():
     for k, v in flags.items():
         if v:
             cmd += [f"--{k}", str(v)]
+    # 桥名必传：daily 输出按 <桥名>/daily_<期> 分目录（用规范全名）
+    bridge_name = str(data.get("bridge_name") or "").strip()
+    if not bridge_name:
+        return jsonify({"error": "桥名为必填项（数据处理页填写桥名）"}), 400
+    cmd += ["--bridge", _canon_bridge_name(bridge_name)]
     # 时间范围（只处理该时间段数据）
     start = str(data.get("start") or "").strip()
     end = str(data.get("end") or "").strip()
@@ -1304,47 +1778,11 @@ def api_preprocess_status():
     })
 
 
-@app.route("/api/hub/bridges")
-def api_hub_bridges():
-    auth = _require_token()
-    if auth:
-        return auth
-    if WEB_MODE != "hub":
-        return jsonify({"error": "当前不是 hub 模式（设置 REPORT_WEB_MODE=hub）"}), 400
-    import requests
-    out = []
-    for b in list_bridges(REGISTRY):
-        host = b.get("host", "")
-        port = b.get("port", 8080)
-        token = os.environ.get(b.get("token_env", ""), "") or WEB_TOKEN
-        if not host:
-            out.append({
-                "id": b.get("id"),
-                "name": b.get("name"),
-                "url": "",
-                "reachable": False,
-                "error": "注册表中未配置 host",
-            })
-            continue
-        url = f"http://{host}:{port}/api/status"
-        item = {"id": b.get("id"), "name": b.get("name"), "url": url, "reachable": False}
-        try:
-            headers = {"X-Auth-Token": token} if token else {}
-            r = requests.get(url, headers=headers, timeout=5)
-            item["reachable"] = r.status_code == 200
-            if r.ok:
-                item["remote"] = r.json()
-        except Exception as exc:  # noqa: BLE001
-            item["error"] = str(exc)
-        out.append(item)
-    return jsonify({"bridges": out})
-
-
 def main():
     host = os.environ.get("REPORT_WEB_HOST", "127.0.0.1")
-    port = int(os.environ.get("REPORT_WEB_PORT", "8080"))
-    log.info("报告智能体 Web 管理台启动: http://%s:%s  mode=%s  auth=%s",
-             host, port, WEB_MODE, "on" if WEB_TOKEN else "off")
+    port = int(os.environ.get("REPORT_WEB_PORT", "8456"))
+    log.info("报告智能体 Web 管理台启动: http://%s:%s  auth=%s",
+             host, port, "on" if WEB_TOKEN else "off")
     app.run(host=host, port=port, threaded=True)
 
 

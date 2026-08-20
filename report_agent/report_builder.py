@@ -977,6 +977,7 @@ def build_report(
     chart_captions: Optional[Dict[str, str]] = None,
     extra_charts: Optional[Dict[str, List[Dict]]] = None,
     text_replace: Optional[Dict[str, str]] = None,
+    repair_stats: Optional[Dict] = None,
 ) -> List[str]:
     """基于模板生成报告，返回未替换的占位符列表（strict=True 时抛出异常）。"""
     doc = Document(template_path)
@@ -993,6 +994,25 @@ def build_report(
     current_prefix = ""          # 章节号（如 3.1.1）
     fig_counters: Dict[str, int] = {}
     global_fig_no = 0
+    # 预处理：连续同图占位符去重——合并图库“一位置一张图”，模板可能按原报告
+    # 拆出多个同位置占位符（如振动多传感器 433/436/468/469）。连续解析到同一
+    # 张图片时只保留第一个，重复图段落清空，避免一模一样的图刷屏。
+    _prev_chart_png = None
+    for _item in list(iter_block_items(doc)):
+        if not isinstance(_item, Paragraph):
+            _prev_chart_png = None
+            continue
+        _t = _paragraph_text(_item).strip()
+        _m = MARKER_RE.fullmatch(_t)
+        if _m and _m.group(1).startswith("chart."):
+            _cid = _m.group(1).split(".", 1)[1]
+            _png = chart_images.get(_cid)
+            if _png and _png == _prev_chart_png:
+                _item.clear()
+                continue
+            _prev_chart_png = _png
+        else:
+            _prev_chart_png = None
     for item in iter_block_items(doc):
         if isinstance(item, Paragraph):
             _process_conditional_blocks(item, resolver)
@@ -1090,11 +1110,64 @@ def build_report(
             _set_auto_line_spacing(pa)
     if text_replace:
         _apply_text_replacements(doc, text_replace)
+    _n_fixed = _collapse_extra_spaces(doc)
+    if repair_stats is not None:
+        repair_stats["spaces_collapsed"] = repair_stats.get(
+            "spaces_collapsed", 0) + _n_fixed
     doc.save(output_path)
     rgb_n = _flatten_rgba_in_docx(output_path)
     if rgb_n:
         log.info("输出文档 RGBA 图片转 RGB：%d 张", rgb_n)
     return unfilled
+
+
+_UNIT_SPACE_RE = re.compile(
+    r"(?P<num>-?\d+(?:\.\d+)?)"
+    r"(?P<unit>mm/s²|mm/s2|m/s²|m/s2|mm/s|m/s|km/h|kN|MPa)(?![A-Za-z0-9])")
+_UNIT_TRAIL_RE = re.compile(
+    r"(mm/s²|mm/s2|m/s²|m/s2|mm/s|m/s|km/h|kN|MPa) +(?=[。，；、！？!?]|$)")
+
+
+def _normalize_unit_spacing(text: str) -> str:
+    """数值与字母复合单位之间补一个空格（6.9m/s² -> 6.9 m/s²）、
+    去掉单位后多余空格（6.9 m/s²  -> 6.9 m/s²）。℃/% 等符号单位不动。"""
+    if not text:
+        return text
+    t = re.sub(r" {2,}", " ", text)
+    t = _UNIT_SPACE_RE.sub(
+        lambda m: f"{m.group('num')} {m.group('unit')}", t)
+    t = _UNIT_TRAIL_RE.sub(r"\1", t)
+    return t.strip()
+
+
+def _collapse_extra_spaces(doc) -> int:
+    """把段落/表格里的多余空格、数值与单位间距统一收口。
+
+    修复“5.5  m/s²”“6.9m/s² ”“6.9 m/s² ”这类数值与单位之间的空格问题；
+    只动 run 级文本，不改其它排版。返回修改的 run 数。
+    """
+    fixed = 0
+
+    def _fix_para(pa):
+        nonlocal fixed
+        for r in getattr(pa, "runs", []):
+            t = r.text or ""
+            nt = _normalize_unit_spacing(t)
+            if nt != t:
+                r.text = nt
+                fixed += 1
+
+    for pa in _walk_paragraphs(doc):
+        _fix_para(pa)
+    for tb in doc.tables:
+        for row in tb.rows:
+            for cell in row.cells:
+                # _Cell 没有 .sections，直接用它自己的 .paragraphs
+                for pa in getattr(cell, "paragraphs", []) or []:
+                    _fix_para(pa)
+    if fixed:
+        log.info("收尾修补：%d 处空格/单位间距已归一", fixed)
+    return fixed
 
 
 def _write_data_lineage(lineage: List[Dict], logs_dir: str, period: Dict) -> str:
