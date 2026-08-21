@@ -139,10 +139,18 @@ def main() -> int:
     ap.add_argument("--end", default="", help="结束日期 YYYY-MM-DD")
     ap.add_argument("--skip-preprocess", action="store_true")
     ap.add_argument("--skip-charts", action="store_true")
+    ap.add_argument("--stats-only", action="store_true",
+                    help="跳过预处理和图库，只重建统计值(逐传感器+位置统计)与"
+                         "季度/年度统计")
     ap.add_argument("--skip-sensor-map", action="store_true")
     ap.add_argument("--skip-per-sensor", action="store_true",
                     help="生成图库/统计值时跳过逐传感器图，只生成按监测部位"
                          "合并的图(传给 build_chart_library.py)")
+    ap.add_argument("--resume", action="store_true", default=True,
+                    help="预处理断点续跑(默认开启)：已生成的日级 CSV 自动跳过"
+                         "(传给 preprocess_sensor_data.py)")
+    ap.add_argument("--no-resume", action="store_false", dest="resume",
+                    help="关闭断点续跑(重新处理全部)")
     ap.add_argument("--period", choices=["quarterly", "yearly"],
                     default="quarterly",
                     help="统计周期(传给 build_quarterly_stats.py；"
@@ -177,8 +185,12 @@ def main() -> int:
     py = sys.executable
     ok = True
 
+    # --stats-only：强制跳过预处理与图库，只重建统计值
+    stats_only = args.stats_only
+    skip_pre = args.skip_preprocess or stats_only
+
     # 1) 秒级 -> 日级
-    if not args.skip_preprocess:
+    if not skip_pre:
         if not raw or not os.path.isdir(raw):
             status["error"] = f"秒级原始数据目录不存在: {raw}"
             status["running"] = False
@@ -192,6 +204,10 @@ def main() -> int:
         ]
         if args.bridge:
             cmd1 += ["--bridge", args.bridge]
+        if args.resume:
+            cmd1 += ["--resume"]
+        else:
+            cmd1 += ["--no-resume"]
         tag = period_tag(start, end)
         if tag:
             cmd1 += ["--period-tag", tag]
@@ -207,13 +223,17 @@ def main() -> int:
             return 1
 
     # 2) 日级 -> 图库 + 统计值
-    if not args.skip_charts:
+    if not args.skip_charts or stats_only:
         tag = period_tag(start, end)
         daily_base = os.path.join(daily, args.bridge) if (daily and args.bridge) \
             else daily
-        daily_data = ((os.path.join(daily_base, f"daily_{tag}") if tag
-                       else os.path.join(daily_base, "daily"))
-                      if daily_base else "")
+        if args.period == "yearly" and daily_base:
+            # 年度：daily 根目录传桥根，build_chart_library 自动汇总 daily_* 子目录
+            daily_data = daily_base
+        else:
+            daily_data = ((os.path.join(daily_base, f"daily_{tag}") if tag
+                           else os.path.join(daily_base, "daily"))
+                          if daily_base else "")
         cmd = [
             py, os.path.join(ROOT, "scripts", "build_chart_library.py"),
             "--daily-root", daily_data or ".",
@@ -222,8 +242,15 @@ def main() -> int:
         ]
         if args.bridge:
             cmd += ["--bridge", args.bridge]
-        if args.skip_per_sensor:
-            cmd += ["--skip-per-sensor"]
+        # 建图库固定跳过逐传感器图，只生成按监测部位合并的图（更省时，
+        # 报告只用合并图）
+        cmd += ["--skip-per-sensor"]
+        if stats_only:
+            # 只重建统计值，不生成任何图
+            cmd += ["--skip-charts"]
+        if args.period == "yearly" and start and len(start) >= 4:
+            # 年度：让 build_chart_library 按年份汇总桥根下所有季度 daily_* 子目录
+            cmd += ["--year", start[:4]]
         # 图库/统计值目录名自动带年月范围（如 图库_2026.1~3）；
         # 仅命令行显式指定 --charts/--stats 时才用固定目录
         if args.charts:
@@ -244,7 +271,7 @@ def main() -> int:
             return 1
 
     # 2.5) 日级 -> 季度/年度统计值(按监测部位合并多传感器)
-    if not args.skip_charts:
+    if not args.skip_charts or stats_only:
         if args.period == "yearly" and daily_base:
             stats_daily_root = daily_base      # 桥根目录, 汇总所有 daily_*
         else:
@@ -272,7 +299,8 @@ def main() -> int:
     # 3) 测点编号表格 -> 传感器对照表
     if not args.skip_sensor_map and map_docx and os.path.isfile(map_docx):
         # 传感器对照表是固定产物（不随季度变化），统一放在 preprocess/传感器对照/
-        map_dir = os.path.join(ROOT, "preprocess", "传感器对照")
+        # 注意：ROOT 本身已是 preprocess/ 目录，不能再拼一层 preprocess
+        map_dir = os.path.join(ROOT, "传感器对照")
         os.makedirs(map_dir, exist_ok=True)
         out_map = os.path.join(map_dir, "传感器编号名称.json")
         ok = run_step("测点编号表格->传感器对照表", [
