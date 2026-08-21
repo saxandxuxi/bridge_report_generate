@@ -13,6 +13,8 @@ Desktop.ini
 
 # ---------- 本地工具/环境 ----------
 .workbuddy/
+.agents/
+skills-lock.json
 .env
 .env.*
 !.env.example
