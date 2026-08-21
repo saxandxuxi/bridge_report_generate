@@ -26,6 +26,7 @@ Desktop.ini
 # ---------- 运行时产物（不推送到服务器） ----------
 outputs/
 debug/
+web/current_bridge.json
 data/*.csv
 !data/.gitkeep
 monitor_credentials.json
@@ -39,3 +40,6 @@ preprocess/*.csv
 preprocess/*.log
 preprocess/status.json
 preprocess/sensor_ids.txt
+
+.venv_web/
+docs/
