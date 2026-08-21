@@ -62,7 +62,8 @@ except Exception:
 
 # ---------------- 默认路径（可按需修改/用命令行参数覆盖） ----------------
 DEFAULT_DAILY_ROOT = r"D:\preprocess_sensor_data\daily"   # 预处理后的 daily 目录
-DEFAULT_LIB_ROOT = ".\\preprocess"                        # 图库/统计值 的上级目录(相对运行目录)
+# 图库/统计值的上级目录 = 项目 preprocess/ 目录（按脚本位置计算，与运行目录无关）
+DEFAULT_LIB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 传感器对照表（固定产物，不随季度变化，统一挂在 preprocess/ 下）
 DEFAULT_SENSOR_MAP_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -789,9 +790,15 @@ def aggregate_daily_from_hours(hours, means, maxs, mins):
 
 
 def compute_feature_stats(dates, means, maxs, mins, seconds=None,
-                          missing=None, start=None, end=None):
+                          missing=None, start=None, end=None,
+                          native_means=None, native_maxs=None,
+                          native_mins=None):
     """
     由日期/日均值/日最大/日最小系列计算整体统计值 + 每日统计。
+    native_means/native_maxs/native_mins 提供时（清洗后的原生粒度序列，
+    小时级或秒级，取决于特征），平均值/极值/实测/差值/均方根值改用原生粒度
+    计算，避免“日均值抹平”导致极值失真（如振动 ±5 的瞬时极值被日均摊到
+    -0.0003）。
     seconds/missing 为每日有效/缺失秒数(可选，来自 daily 明细)。
     返回 (stats_dict, dates, means, maxs, mins)。
     """
@@ -815,7 +822,10 @@ def compute_feature_stats(dates, means, maxs, mins, seconds=None,
     secs = list(secs)
     mis = list(mis)
 
-    arr = np.array(means, dtype=float)
+    ext_means = native_means if native_means is not None else means
+    ext_maxs = native_maxs if native_maxs is not None else maxs
+    ext_mins = native_mins if native_mins is not None else mins
+    arr = np.array(ext_means, dtype=float)
     daily = []
     for d, m, x, n in zip(dates, means, maxs, mins):
         daily.append({
@@ -837,10 +847,10 @@ def compute_feature_stats(dates, means, maxs, mins, seconds=None,
         "最大值": round(float(np.max(arr)), 6),
         "最小值": round(float(np.min(arr)), 6),
         "差值": round(float(np.max(arr) - np.min(arr)), 6),
-        "最大值_实测": round(float(np.max(maxs)), 6),
-        "最小值_实测": round(float(np.min(mins)), 6),
+        "最大值_实测": round(float(np.max(ext_maxs)), 6),
+        "最小值_实测": round(float(np.min(ext_mins)), 6),
         "绝对最大值": round(
-            max(abs(np.max(maxs)), abs(np.min(mins))), 6),
+            max(abs(np.max(ext_maxs)), abs(np.min(ext_mins))), 6),
         "均方根值": round(float(np.sqrt(np.mean(np.square(arr)))), 6),
         "每日统计": daily,
     }
@@ -887,6 +897,24 @@ def _temp_effect_stats(strain_dates, strain_means, temp_dates, temp_means):
         "剔除温度最小值": round(float(np.min(resid)), 6),
         "相关性系数": round(corr, 6),
     }
+
+
+def _norm_strain_temp_pos(name):
+    """位置归一化：去掉 上游/下游/左幅/右幅/左侧/右侧 等方位词，
+    用于应变-温度联合统计的跨位置配对（如 顶板左幅 <-> 顶板上游）。
+    保留 顶板/底板/截面/跨/墩 等核心部位，避免把不同截面错配。"""
+    s = str(name or "")
+    for w in ("上游侧", "下游侧", "上游", "下游", "左幅", "右幅",
+              "左侧", "右侧"):
+        s = s.replace(w, "")
+    return re.sub(r"\s+", "", s)
+
+
+# 允许“应变-温度跨方位配对”的大桥：编号文件里应变用 左幅/右幅、
+# 结构温度用 上游/下游，两套命名无法精确配对。
+# 对这些桥：同一核心部位(如 炎陵侧中跨1/4截面顶板)的温度序列，
+# 同时配给 左幅/右幅 的应变计算 剔除温度/相关性系数。
+STRAIN_TEMP_CROSS_SIDE_BRIDGES = {"洣水河", "洣水河特大桥", "mishuihe"}
 
 
 def _fmt_cn_dt(s):
@@ -2717,9 +2745,17 @@ def main():
             os.path.join(args.lib_root, f"统计值_{tag}") if tag
             else os.path.join(args.lib_root, "统计值"))
     if bridge:
-        # 图库/统计值(相对路径)：图库_<期>/<桥名>、统计值_<期>/<桥名>
-        chart_dir = os.path.join(chart_dir, bridge)
-        stats_dir = os.path.join(stats_dir, bridge)
+        # 图库/统计值：图库_<期>/<桥名>、统计值_<期>/<桥名>。
+        # 显式 --charts-dir/--stats-dir 可能已带桥名（web 传的是
+        # 图库_<期>/<桥名> 这种），已带时不再重复拼，避免出现
+        # 统计值_2026.4~6/洣水河特大桥/洣水河特大桥/位置统计
+        def _leaf_has_bridge(path):
+            leaf = os.path.basename(os.path.normpath(str(path or "")))
+            return bool(leaf) and leaf in _bridge_variants(bridge)
+        if not _leaf_has_bridge(chart_dir):
+            chart_dir = os.path.join(chart_dir, bridge)
+        if not _leaf_has_bridge(stats_dir):
+            stats_dir = os.path.join(stats_dir, bridge)
         print(f"大桥名称: {bridge}")
         print(f"daily 数据源: {args.daily_root}")
     if isinstance(args.daily_root, list) and len(args.daily_root) > 1:
@@ -2804,6 +2840,7 @@ def main():
                     gaps_all = []
                     day_dates, day_means, day_maxs = [], [], []
                     day_mins, day_secs, day_miss = [], [], []
+                    native_means, native_maxs, native_mins = [], [], []
                     hist_bins = np.linspace(-1000.0, 1000.0, 101)
                     hist_counts = None
                     chart_day = None          # (日期, hours, means, ix, rx, shifts, gaps)
@@ -2842,6 +2879,11 @@ def main():
                             max_dist_outliers=args.max_dist_outliers,
                             max_total_removals=args.max_removals)
                         spike_rec += r1 + r2 + r3
+                        # 累积清洗后的原生粒度序列（小时级/秒级），
+                        # 供全期极值按特征颗粒度计算
+                        native_means += list(means_d)
+                        native_maxs += list(maxs_d)
+                        native_mins += list(mins_d)
                         # 突变段(按天, 秒级至少 1 分钟)
                         shifts_d = []
                         if not _is_direction_feature(feature):
@@ -2916,7 +2958,8 @@ def main():
                         stats, day_dates, day_means, day_maxs, day_mins = \
                             compute_feature_stats(
                                 day_dates, day_means, day_maxs, day_mins,
-                                day_secs, day_miss, None, None)
+                                day_secs, day_miss, None, None,
+                                native_means, native_maxs, native_mins)
                         if stats is None:
                             issues.append(f"无数据: {sensor}/{feature}")
                             continue
@@ -3046,7 +3089,8 @@ def main():
                     stats, day_dates, day_means, day_maxs, day_mins = \
                         compute_feature_stats(
                             day_dates, day_means, day_maxs, day_mins,
-                            day_secs, day_miss, None, None)
+                            day_secs, day_miss, None, None,
+                            hmeans, hmaxs, hmins)
                     if stats is None:
                         issues.append(f"无数据: {sensor}/{feature}")
                         continue
@@ -3172,21 +3216,34 @@ def main():
     if not args.skip_stats:
         # 应变-温度联合统计：同一位置（可能不同传感器）的应变与温度
         # 按日对齐回归，剔除温度效应后写入应变特征(YB(rsg))的统计，
-        # 供报告应变表 “剔除温度最大值/剔除温度最小值/相关性系数” 列使用
+        # 供报告应变表 “剔除温度最大值/剔除温度最小值/相关性系数” 列使用。
+        # 位置名可能因“左幅/右幅”与“上游/下游”写法不一致而对不上，
+        # 先精确配对，失败时按“核心部位归一化”跨位置配对。
+        pos_feats_all = {}
         for pos_name in pos_daily:
-            pos_feats = {}
+            pf = {}
             for sid, feats in pos_daily[pos_name].items():
                 for feat, (dd, mm) in feats.items():
-                    pos_feats.setdefault(feat, []).append((sid, dd, mm))
-            if "YB(rsg)" not in pos_feats:
-                continue
-            temp_keys = [f for f in pos_feats
+                    pf.setdefault(feat, []).append((sid, dd, mm))
+            pos_feats_all[pos_name] = pf
+
+        def _pair_temp(pos_name, pf):
+            """用 pf 里的温度序列给 YB(rsg) 各测点算剔除温度统计。"""
+            if "YB(rsg)" not in pf:
+                return
+            temp_keys = [f for f in pf
                          if f in ("WD(temp)", "WSD(temp)")]
             if not temp_keys:
-                continue
-            # 取同位置第一个温度传感器作为温度序列
-            t_sid, t_dates, t_means = pos_feats[temp_keys[0]][0]
-            for s_sid, s_dates, s_means in pos_feats["YB(rsg)"]:
+                return
+            # 取同位置温度序列：优先选非恒值(有正常波动)的温度传感器，
+            # 避免取到“整季恒0”的故障传感器导致相关系数失真
+            temp_entries = pf[temp_keys[0]]
+            _t_sid, t_dates, t_means = temp_entries[0]
+            for _tsid, _tdd, _tmm in temp_entries:
+                if _tmm and (max(_tmm) - min(_tmm)) > 1e-9:
+                    _t_sid, t_dates, t_means = _tsid, _tdd, _tmm
+                    break
+            for s_sid, s_dates, s_means in pf["YB(rsg)"]:
                 te = _temp_effect_stats(s_dates, s_means,
                                         t_dates, t_means)
                 if not te:
@@ -3195,6 +3252,34 @@ def main():
                     "YB(rsg)")
                 if rec:
                     rec["统计"].update(te)
+
+        # 第一遍：精确位置配对
+        for pos_name, pf in pos_feats_all.items():
+            _pair_temp(pos_name, pf)
+        # 第二遍：核心部位归一化配对（顶板左幅 <-> 顶板上游 等）。
+        # 仅对配置名单内的大桥生效（洣水河编号文件应变/温度方位命名不一致），
+        # 其他桥仍只做精确配对，避免不同方位传感器被错误跨配。
+        cross_side = any(v in STRAIN_TEMP_CROSS_SIDE_BRIDGES
+                         for v in _bridge_variants(bridge))
+        if cross_side:
+            norm_index = {}
+            for pos_name, pf in pos_feats_all.items():
+                if any(f in ("WD(temp)", "WSD(temp)") for f in pf):
+                    norm_index.setdefault(
+                        _norm_strain_temp_pos(pos_name), []).append(pos_name)
+            for pos_name, pf in pos_feats_all.items():
+                if "YB(rsg)" not in pf:
+                    continue
+                if any(f in ("WD(temp)", "WSD(temp)") for f in pf):
+                    continue   # 已精确配对
+                core = _norm_strain_temp_pos(pos_name)
+                for t_pos in norm_index.get(core, []):
+                    if t_pos == pos_name:
+                        continue
+                    merged = dict(pf)
+                    merged.update(pos_feats_all[t_pos])
+                    _pair_temp(pos_name, merged)
+                    break
         # 位置统计库(与图库目录结构对齐):
         #   统计值_<期>/<桥名>/位置统计/<位置>/<特征>.json
         #   内容: {位置: {测点X: {统计, 传感器编号}}}（只存整体统计）
@@ -3351,9 +3436,17 @@ def main():
                     actual_feats = sensor_feats.get(str(sensor))
                     if actual_feats:
                         for af in actual_feats:
-                            groups[feature_group(af)].append((sensor, af))
+                            pair = (sensor, af)
+                            gk = feature_group(af)
+                            if pair not in groups[gk]:
+                                # 同一传感器多特征时会重复进入本循环，去重，
+                                # 避免合并图出现两个相同测点(如 431 出现两次)
+                                groups[gk].append(pair)
                     else:
-                        groups[feature_group(feat)].append((sensor, feat))
+                        pair = (sensor, feat)
+                        gk = feature_group(feat)
+                        if pair not in groups[gk]:
+                            groups[gk].append(pair)
                 pos_series = []   # 位置内全部特征序列（用于跨特征相关性散点图）
                 for g, gf_pairs in sorted(groups.items()):
                     uniq_sensors = {s for s, _ in gf_pairs}
