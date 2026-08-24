@@ -289,6 +289,22 @@ def build_value_resolver(stats: Dict, period: Dict,
                     missing_sink.append(key)
                 return missing_marker
             raise KeyError(f"不支持的总结占位符: {key}")
+        # 4.1 监测结论：{{conclusions}} —— LLM 综合各分项小结生成
+        if key == "conclusions" or key.startswith("conclusions."):
+            if bridge is not None:
+                text = bridge.build_conclusions(period, llm_cfg=llm_cfg)
+                if text:
+                    _log({
+                        "占位符": key,
+                        "类型": "监测结论",
+                        "输出": text[:200],
+                        "说明": "LLM/规则综合各监测分项小结生成",
+                    })
+                    return text
+                if missing_sink is not None:
+                    missing_sink.append(key)
+                return missing_marker
+            raise KeyError(f"不支持的结论占位符: {key}")
         # 通用数据占位符：回填 annotate_docx 阶段保存的原始值
         if key.startswith("data."):
             if data_values and key in data_values:
@@ -495,6 +511,13 @@ def _chart_insert_size(png_path: str, width_inches: float,
         img = Image.open(png_path)
         w, h = img.size
         ratio = h / w if w else 1.0
+        if w and h and (w / h > 6.0 or h / w > 6.0):
+            # 图库文件宽高比异常（如 37704×2323 的 16:1 合并图）：
+            # 按固定宽度插入会变成一条细线。这里只记录告警，图库侧需重建，
+            # 避免“图很小/挤到最左边”这类问题再静默出现。
+            log.warning(
+                "图片宽高比异常 %.1f:1（%dx%d），请检查图库该文件是否由旧版"
+                "本/错误路径生成: %s", w / h, w, h, png_path)
         if ratio * width_inches > max_height_inches:
             return None, Inches(max_height_inches)
     except Exception:  # noqa: BLE001

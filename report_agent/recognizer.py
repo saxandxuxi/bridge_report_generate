@@ -683,7 +683,8 @@ def _nearest_word(text: str, pos: int, win: int, words: dict, skip=()) -> Option
 SUMMARY_FAULT_RE = re.compile(
     r"[^。；]*?(?:"
     r"(?:一直|始终|持续|长期|连续)为\s*0(?:\s*[℃%％]?)|"
-    r"由设备设置错误引起|为传感器故障导致|传感器故障|监测数据异常|数据出现异常"
+    r"由设备设置错误引起|为传感器故障导致|传感器故障|监测数据异常|数据出现异常|"
+    r"出现异常跳动|异常跳动情况|出现异常变化"
     r")[^。]*。"
     r"(?:\s*其他[^。]*?(?:正常|无异常|未对[^。]*影响)[^。]*。)?"
 )
@@ -692,6 +693,15 @@ SUMMARY_FAULT_RE = re.compile(
 SUMMARY_POS_RE = re.compile(
     r"测点|监测部位|位置|截面|索塔|塔冠|塔|墩|跨|梁端|锚固区|箱梁|桥面|"
     r"主缆|加劲梁|索鞍|塔底|塔顶"
+)
+
+# 小结/总结段特征句：无故障句的小结段（如 3.3.5 结构响应监测小结）也要按
+# 段落提到的指标补 {{summary.<metric>}}，让应变/GNSS/振动等指标的季度总结
+# （极值 + 故障/缺失位置）能进报告，而不是只回填数字。
+SUMMARY_CLAIM_RE = re.compile(
+    r"监测数据结果表明|数据(?:良好|连续|持续|整体|基本)?稳定|"
+    r"结构安全稳定|处于安全稳定|正常范围内|未出现异常|均无超限|"
+    r"表现良好|状态良好"
 )
 
 
@@ -714,16 +724,37 @@ def _metrics_in_text(text: str, skip=("load", "vehicle_count")) -> list:
 
 
 def detect_summary_placeholders(texts_all: list) -> dict:
-    """识别“…位置一直为0/数据异常…为传感器故障导致…”总结句，
-    按该句附近（前 60 字窗口）的特征词生成 {{summary.<metric>}} 占位符。
-    一段同时总结多个特征（如 挠度+结构温度）时，按特征各生成一个占位符：
-    第一个原位替换整句，其余紧跟其后插入。
+    """识别“…位置一直为0/数据异常…为传感器故障导致…”总结句与无故障句的
+    小结段，生成 {{summary.<metric>}} 占位符。
+
+    指标判定 = 小节标题（如 3.3.1应变监测数据分析，自上一个小结起累积）
+    ∪ 段落/故障句附近的特征词，保证应变/GNSS/振动等指标的季度总结都能进
+    报告。一段总结多个特征时各生成一个占位符：故障句第一个原位替换整句、
+    其余紧跟其后插入；无故障句的小结段统一在段首补。
     返回 {段落索引: [(start, end, marker), ...]}（坐标基于原文）。"""
     out = {}
+    section_metrics = set()   # 自上一个小结以来 各“监测数据分析”节标题指标
+    heading_metrics = {}      # 小结标题段索引 -> 该小结应覆盖的指标
+    last_summary = -1
     for i, t in enumerate(texts_all or []):
         t = str(t)
+        # 节标题：如 3.2.1结构温度监测数据分析 / 3.3.5结构响应监测小结
+        hm = re.match(r"^\d+(?:\.\d+){1,3}\s*\S.*$", t)
+        if hm and len(t) <= 40 and re.search(r"监测|分析|小结", t):
+            title = re.sub(r"^\d+(?:\.\d+){1,3}\s*", "", t)
+            if "小结" not in title:
+                tm = _metrics_in_text(title)
+                if tm:
+                    # 累积：3.3.1~3.3.4 的指标都算进 3.3.5 结构响应小结
+                    section_metrics |= set(tm)
+            else:
+                heading_metrics[i] = set(section_metrics)
+                section_metrics = set()
+                last_summary = i
         if not t:
             continue
+        acc = heading_metrics.get(last_summary, set()) \
+            if last_summary >= 0 else set()
         for m in SUMMARY_FAULT_RE.finditer(t):
             seg = m.group(0)
             if not SUMMARY_POS_RE.search(seg):
@@ -732,6 +763,9 @@ def detect_summary_placeholders(texts_all: list) -> dict:
             metrics = _metrics_in_text(window)
             if not metrics:
                 metrics = _metrics_in_text(t)
+            for mm in acc:
+                if mm not in metrics:
+                    metrics.append(mm)
             if not metrics:
                 continue
             spans = []
@@ -744,7 +778,202 @@ def detect_summary_placeholders(texts_all: list) -> dict:
                     spans.append((m.end(), m.end(),
                                   f"{{{{summary.{metric}}}}}"))
             out.setdefault(i, []).extend(spans)
+    # 无故障句的“小结/总结”段：按“段落文字指标 ∪ 该小结标题累积指标”在
+    # 段首补 {{summary.<metric>}}，保证每个指标的小结都带上季度统计内容
+    cur_summary = -1
+    for i, t in enumerate(texts_all or []):
+        t = str(t)
+        hm = re.match(r"^\d+(?:\.\d+){1,3}\s*\S.*$", t)
+        if hm and len(t) <= 40 and "小结" in t:
+            cur_summary = i
+            continue
+        if i in out:
+            continue
+        if not SUMMARY_CLAIM_RE.search(t):
+            continue
+        metrics = _metrics_in_text(t)
+        acc = heading_metrics.get(cur_summary, set()) \
+            if cur_summary >= 0 else set()
+        for m in acc:
+            if m not in metrics:
+                metrics.append(m)
+        if not metrics:
+            continue
+        spans = [(0, 0, f"{{{{summary.{m}}}}}") for m in metrics]
+        out[i] = spans
     return out
+
+
+def detect_conclusion_item_paras(texts_all: list) -> list:
+    """返回 4.1 监测结论 条目段（（1）…（N））的段落索引。
+
+    “4.1监测结论”标题之后、以 （N）/(N) 开头、直到 综上/下一级标题 之前。
+    这些条目由 {{conclusions}} 占位符（LLM 综合各分项小结）替代，
+    避免原文里“最小值为1671.98 KN，对应测点位置为5RX（S）-1测点2”这类
+    写死的旧值/位置进模板。
+    """
+    start = -1
+    for i, t in enumerate(texts_all or []):
+        if re.match(r"^\s*4\.1\s*监测结论", str(t)):
+            start = i
+            break
+    if start < 0:
+        return []
+    out = []
+    for i in range(start + 1, len(texts_all or [])):
+        t = str(texts_all[i]).strip()
+        if not t:
+            continue
+        if re.match(r"^[（(]\d+[）)]", t):
+            out.append(i)
+            continue
+        if out:
+            # 条目段之后遇到“综上/建议/下一级标题”就结束
+            if "综上" in t or "建议" in t \
+                    or re.match(r"^\d+\.\d", t):
+                break
+            break
+        if "综上" in t or "建议" in t or re.match(r"^\d+\.\d", t):
+            break
+    return out
+
+
+LOC_PREFIX_RE = re.compile(r"(对应测点位置为|对应位置为|对应测点为)")
+
+# 交通车辆分车道句：原文/已替换成 data.N 的“车道1、车道2方向车辆总数为
+# X辆，其中车道3、车道4方向车辆总数为Y辆”是两两合并值，改为四个车道
+# cell 占位符（在数字替换后的最终文本上匹配，兼容 {{data.N}} 与字面值）
+TRAFFIC_LANE_SENT_RE = re.compile(
+    r"车道1、车道2方向车辆总数为"
+    r"(?:[^，。；]*?\{\{data\.\d+\}\}|[\d.\-]+)辆"
+    r"[，,]?其中车道3、车道4方向车辆总数为"
+    r"(?:[^，。；]*?\{\{data\.\d+\}\}|[\d.\-]+)辆")
+LANE4_PLACEHOLDER = (
+    "车道1方向车辆总数为{{cell.vehicle_count.车道1.count}}辆、"
+    "车道2方向车辆总数为{{cell.vehicle_count.车道2.count}}辆、"
+    "车道3方向车辆总数为{{cell.vehicle_count.车道3.count}}辆、"
+    "车道4方向车辆总数为{{cell.vehicle_count.车道4.count}}辆")
+
+
+def _apply_loc_placeholders(p) -> int:
+    """把“对应测点位置为X”转换为 {{stats.<指标>.<统计>.loc}}。
+
+    X 的边界：到下一个 ；。 或 “，出现/存在/未/请/建议/状态/异常/无数据”
+    等新分句为止；统计词取本分句内的 最小/最大差值/绝对最大/最大/平均，
+    指标取最近的 {{stats.*}} 占位符。转换后位置由运行时按季度统计重算，
+    不再保留原文写死的位置。
+    """
+    runs = p.runs
+    if not runs:
+        return 0
+    full = "".join(r.text for r in runs)
+    if "对应测点位置" not in full and "对应位置为" not in full \
+            and "对应测点为" not in full:
+        return 0
+    edits = []
+    for m in LOC_PREFIX_RE.finditer(full):
+        prefix = m.group(1)
+        rest = full[m.end():]
+        end = len(rest)
+        for mm in re.finditer(
+                r"[；。]|，(?=[^，。；]{0,14}"
+                r"(?:出现|存在|未|请|建议|状态|异常|无数据|没有数据))", rest):
+            end = mm.start()
+            break
+        if end <= 0:
+            continue
+        # 本分句（上一个 ；。 之后）里的统计词
+        sent = full[max(full.rfind("。", 0, m.start()),
+                        full.rfind("；", 0, m.start())) + 1:m.start()]
+        stat = None
+        if re.search(r"最小", sent):
+            stat = "min"
+        elif re.search(r"最大差值|差值", sent):
+            stat = "range"
+        elif re.search(r"绝对最大", sent):
+            stat = "abs_max"
+        elif re.search(r"最大|最高", sent):
+            stat = "max"
+        elif re.search(r"平均|均值", sent):
+            stat = "avg"
+        # 最近的 stats 占位符（指标 + 回退统计）
+        phs = list(re.finditer(
+            r"\{\{stats\.([a-zA-Z_]+)\.([a-zA-Z_]+)\}\}", full[:m.start()]))
+        if not phs:
+            continue
+        pm = phs[-1]
+        metric = pm.group(1)
+        if not stat:
+            stat = pm.group(2)
+        if stat in ("loc",):
+            continue
+        edits.append((m.start(), m.end() + end,
+                      f"{prefix}{{{{stats.{metric}.{stat}.loc}}}}"))
+    if not edits:
+        return 0
+    new_text = full
+    for s, e, marker in sorted(edits, reverse=True):
+        new_text = new_text[:s] + marker + new_text[e:]
+    runs[0].text = new_text
+    for r in runs[1:]:
+        r.text = ""
+    return len(edits)
+
+
+def _apply_traffic_lane_placeholders(p) -> int:
+    """把“车道1、车道2方向车辆总数为X辆，其中车道3、车道4…Y辆”改成四个
+    车道占位符。在数字替换后的段落文本上匹配（X 可能是 {{data.N}} 或字面值），
+    避免 data.N 已替换导致原文改写失效。"""
+    runs = p.runs
+    if not runs:
+        return 0
+    full = "".join(r.text for r in runs)
+    if "车道1、车道2" not in full:
+        return 0
+    m = TRAFFIC_LANE_SENT_RE.search(full)
+    if not m:
+        return 0
+    new_text = full[:m.start()] + LANE4_PLACEHOLDER + full[m.end():]
+    runs[0].text = new_text
+    for r in runs[1:]:
+        r.text = ""
+    return 1
+
+
+# 分句内指标修正：一句里出现“结构温度/支座位移”时，裸“温度/位移”的
+# stats.* 应沿用更具体指标（如 结构温度最低温度 -> stats.structure_temperature.min）
+_METRIC_CTX_FIX = [
+    ("structure_temperature", "结构温度", "temperature"),
+    ("bearing_displacement", "支座位移", "displacement"),
+]
+
+
+def _fix_stat_metric_context(p) -> int:
+    """按分句（；。为界）上下文修正 stats.<metric> 的指标键。"""
+    runs = p.runs
+    if not runs:
+        return 0
+    full = "".join(r.text for r in runs)
+    fixed = 0
+    for clause in re.split(r"(?<=[。；])", full):
+        for target, kw, from_metric in _METRIC_CTX_FIX:
+            if kw not in clause:
+                continue
+            if "环境温度" in clause and target == "structure_temperature":
+                continue
+            pat = re.compile(
+                r"\{\{stats\." + re.escape(from_metric) + r"\.([a-zA-Z_]+)\}\}")
+            new_clause, n = pat.subn(
+                lambda mm: f"{{{{stats.{target}.{mm.group(1)}}}}}", clause)
+            if n:
+                full = full.replace(clause, new_clause)
+                fixed += n
+    if not fixed:
+        return 0
+    runs[0].text = full
+    for r in runs[1:]:
+        r.text = ""
+    return fixed
 
 
 def _extract_tags(text: str, base: dict) -> list:
@@ -813,6 +1042,14 @@ def _classify_tag(tag: dict, texts: list) -> None:
             sentence = clause
     best_metric = _nearest_word(sentence, len(sentence), 60, METRIC_WORDS,
                                 skip={"load", "vehicle_count"})
+    # “结构温度/支座位移”等更具体的指标覆盖子句里的裸“温度/位移”：
+    # 如“…结构温度最高为[C-MAX]；温度最低为[C-MIN]”里 [C-MIN] 子句只含
+    # “温度”，但整句主语是结构温度，不能误判成环境温度。
+    sent_full = t[sent_start:pos]
+    if "结构温度" in sent_full:
+        best_metric = "structure_temperature"
+    elif "支座位移" in sent_full:
+        best_metric = "bearing_displacement"
     # F-MAX / F-MIN：剔除温度效应后的应变最大/最小差值（残差），
     # 与普通 E-MAX 不同，映射到 temp_rm_range / temp_rm_min；
     # 对应位置标记取“差值”本身的最值位置（temp_rm_range.loc），
@@ -1830,17 +2067,35 @@ def _chart_block_locations(paragraph, cell_ref_paras: Dict[int, tuple],
                 if composed not in out:
                     out.append(composed)
             return out
-    # 节标题方位词补全：标题带“上游侧/下游侧”等方位，而表格位置未带时，
-    # 把方位词拼进位置（湘江：3.1.1.1上游侧箱梁内环境温度 + 表“随州侧边跨跨中截面”
-    # → “随州侧边跨跨中截面上游”），否则运行时图库/名称对照匹配不到。
+    # 节标题方位词补全：标题/描述行带“上游/下游/左幅/右幅/左侧/右侧”等方位，
+    # 而表格位置未带时，把方位词拼进位置（湘江：3.1.1.1上游侧箱梁内环境温度 +
+    # 表“随州侧边跨跨中截面” → “随州侧边跨跨中截面上游”；洣水河：
+    # “3.1.2.2右幅截面湿度监测”+“炎陵侧边跨跨中截面” → “炎陵侧边跨跨中截面右幅”），
+    # 否则运行时图库/名称对照匹配不到左右幅。
     if heading_paras and texts:
         heading_dir = ""
         for hp in reversed(heading_paras):
             if hp < paragraph:
                 ht = str(texts[hp])
                 # 只取最近的节标题；若它本身没有方位词，就不继续往回找
-                heading_dir = next((w for w in ("上游", "下游") if w in ht), "")
+                heading_dir = next(
+                    (w for w in ("上游", "下游", "左幅", "右幅",
+                                 "上游侧", "下游侧", "左侧", "右侧")
+                     if w in ht), "")
                 break
+        if not heading_dir:
+            # 标题没带方位时，看图表块描述行（“…右幅截面环境湿度监测曲线图…
+            # 如下图所示：”）
+            for pi in range(paragraph - 1, max(paragraph - 5, -1), -1):
+                t = str(texts[pi]) if 0 <= pi < len(texts) else ""
+                if "如下图所示" not in t and "下图" not in t:
+                    continue
+                heading_dir = next(
+                    (w for w in ("上游", "下游", "左幅", "右幅",
+                                 "上游侧", "下游侧", "左侧", "右侧")
+                     if w in t), "")
+                if heading_dir:
+                    break
         if heading_dir:
             uniq = [r if heading_dir in r else r + heading_dir for r in uniq]
     return uniq
@@ -2360,10 +2615,28 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
                 sentence = clause
         best_metric = _nearest_word(sentence, len(sentence), 60, METRIC_WORDS,
                                     skip={"load", "vehicle_count"})
+        # “结构温度/支座位移”等更具体指标覆盖子句里的裸“温度/位移”
+        sent_full = t[sent_start:pos]
+        if "结构温度" in sent_full:
+            best_metric = "structure_temperature"
+        elif "支座位移" in sent_full:
+            best_metric = "bearing_displacement"
         best_stat = _nearest_word(sentence, len(sentence), 12, STAT_WORDS)
+        # “最大应变差值/应变最大差值/最大X差值”等跨词词组 -> range
+        # （如“最大应变差值”中间夹着指标词，_nearest_word 只会匹配到“最大”->max）
+        if re.search(r"(?:最大|最小).{0,4}差值", sentence):
+            best_stat = "range"
         if not best_metric or not best_stat or best_metric not in UPGRADE_METRICS:
             return marker
-        return f"{{{{stats.{best_metric}.{best_stat}}}}}"
+        # 方向后缀：句内“X方向/Y方向/Z方向 + 倾角/位移” -> rotation_x/y/z、
+        # displacement_x/y/z，运行时按方向取对应轴特征
+        direction = ""
+        dm = re.search(r"([XYZ])方向", sentence)
+        if dm and best_metric in ("rotation", "displacement", "deflection",
+                                  "bearing_displacement", "earthquake_load",
+                                  "vibration"):
+            direction = "_" + dm.group(1).lower()
+        return f"{{{{stats.{best_metric}{direction}.{best_stat}}}}}"
 
     def _fix_stat_key(para_idx, pos, marker) -> str:
         """按数字前的上下文纠正 stats 占位符的 max/min/range 键。
@@ -2376,7 +2649,7 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         metric, stat = m.group(1), m.group(2)
         t = str(texts_all[para_idx]) if 0 <= para_idx < len(texts_all) else ""
         win = t[max(0, pos - 12):pos]
-        if "最大差值" in win or "最小差值" in win:
+        if re.search(r"(?:最大|最小).{0,4}差值", win):
             expect = "range"
         elif "最高" in win or "最大" in win:
             expect = "max"
@@ -2748,7 +3021,6 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         for i, t in enumerate(analysis.get("texts", []) or []):
             if original in t:
                 text_targets.setdefault(i, []).append((original, replacement))
-
     replaced_numbers = 0
     skipped_numbers = 0
     replaced_images = 0
@@ -2757,6 +3029,26 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     replaced_cell_refs = 0
     replaced_summaries = 0
     pending_inserts = []   # [(anchor 段落元素, [marker, ...])] 遍历后统一插入
+
+    # 4.1 监测结论 条目段：整体由 {{conclusions}}（LLM 综合各分项小结）替代，
+    # 第一条保留占位符，其余清空，避免旧值/旧位置写死进模板
+    conclusion_paras = detect_conclusion_item_paras(texts_all)
+
+    # 交通荷载跨车道图：“交通荷载图1/图2”类图题 -> {{chart.traffic_...}}
+    traffic_chart_targets = {}
+    for i, t in enumerate(texts_all or []):
+        t2 = str(t)
+        if "交通荷载图" not in t2:
+            continue
+        m1 = re.search(r"交通荷载图\s*1", t2)
+        m2 = re.search(r"交通荷载图\s*2", t2)
+        markers = []
+        if m1:
+            markers.append("{{chart.traffic_cumulative_trend_1}}")
+        if m2:
+            markers.append("{{chart.traffic_ratio_trend_2}}")
+        if markers:
+            traffic_chart_targets[i] = markers
 
     def _clean_chart_para(para) -> None:
         """去掉图名(af3)样式并居中，避免图片段样式不一致导致 Word 渲染重叠。"""
@@ -2769,6 +3061,27 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
 
     def process_paragraph(p, idx):
         nonlocal replaced_numbers, skipped_numbers, replaced_images, replaced_texts, replaced_chart_texts, replaced_cell_refs, replaced_summaries
+        # 交通荷载跨车道图：图题行 -> {{chart.traffic_...}} 占位符
+        if idx in traffic_chart_targets:
+            _flatten_omml(p._p)
+            _replace_whole_paragraph(p, traffic_chart_targets[idx][0])
+            _clean_chart_para(p)
+            replaced_chart_texts += 1
+            if len(traffic_chart_targets[idx]) > 1:
+                pending_inserts.append(
+                    (p._p, traffic_chart_targets[idx][1:]))
+            return
+        # 4.1 监测结论条目段：第一条替换为 {{conclusions}}，其余清空
+        if conclusion_paras:
+            if idx == conclusion_paras[0]:
+                _flatten_omml(p._p)
+                _replace_whole_paragraph(p, "{{conclusions}}")
+                replaced_texts += 1
+                return
+            if idx in conclusion_paras[1:]:
+                _flatten_omml(p._p)
+                _clear_paragraph_text(p)
+                return
         if idx in cleared_sensor_lines:
             # 清空整段前先转换公式节点，避免 oMath 悬空渲染
             _flatten_omml(p._p)
@@ -2859,6 +3172,12 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
                     edits.append((s, e, marker))
                     replaced_summaries += 1
             _apply_position_edits(p, edits, full)
+        # 后处理：①“对应测点位置为X” -> {{stats.<指标>.<统计>.loc}}；
+        # ②车道1、2合并值 -> 四个车道占位符；③分句内 温度/位移 指标修正
+        if num_t or tag_t or cell_t or summary_t:
+            _apply_loc_placeholders(p)
+            _apply_traffic_lane_placeholders(p)
+            _fix_stat_metric_context(p)
         if img_targets.get(idx):
             _replace_image_paragraph(p, img_targets[idx][0][1])
             replaced_images += 1

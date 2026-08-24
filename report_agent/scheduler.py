@@ -1,26 +1,36 @@
 # -*- coding: utf-8 -*-
-"""定时调度：每周或每月自动生成报告。
+"""定时调度：每周/每月/每季度/每年自动生成报告。
 
 使用 APScheduler 的 CronTrigger 实现精确调度，不再轮询。
 APScheduler 未安装时自动降级为原轮询模式（每 30s 检查一次）。
 
 配置项（config.json → schedule）：
-  mode: weekly | monthly
+  mode: weekly | monthly | quarterly | yearly
   weekday: 1-7（1=周一...7=周日），weekly 模式用
-  day_of_month: 1-31，monthly 模式用
+  day_of_month: 1-31，monthly/quarterly/yearly 模式用
   hour / minute: 触发时刻
+  start_date: YYYY-MM-DD，调度起始日期：
+    - quarterly：启动时先补跑“从 start_date 到今天的已结束季度”，
+      之后每到季度过完（次季首月 day_of_month 日）再生成上一季度；
+      同时每年 1 月还会自动生成上一年度报告；
+    - yearly：每年 1 月 day_of_month 日触发，生成上一年全年；
+      启动时若上一年度报告还不存在，也会补跑一份。
+    例：start_date=2026-01-01，8 月启动 → 先补跑 Q1、Q2，再等 Q3 过完。
 
 也支持手动通过 run_agent.py --mode weekly 单次执行。
 """
 
 import calendar
 import datetime as dt
+import json
 import logging
 import os
 import subprocess
 import sys
 import time
 
+from .period_utils import (last_completed_quarter, last_completed_year,
+                           quarter_range)
 from .config import load_config
 
 log = logging.getLogger("report-agent.scheduler")
@@ -50,6 +60,23 @@ def next_run_time(now: dt.datetime, schedule: dict) -> dt.datetime:
                 year=year, month=month, day=min(day, last),
                 hour=hour, minute=minute, second=0, microsecond=0,
             )
+        return candidate
+
+    if mode == "quarterly":
+        # 每季度首月（1/4/7/10）的 day_of_month 日触发，生成刚结束的上一季度
+        day = int(schedule.get("day_of_month", 1))
+        for month in (1, 4, 7, 10):
+            last = calendar.monthrange(now.year, month)[1]
+            candidate = now.replace(
+                year=now.year, month=month, day=min(day, last),
+                hour=hour, minute=minute, second=0, microsecond=0,
+            )
+            if candidate > now:
+                return candidate
+        candidate = now.replace(
+            year=now.year + 1, month=1, day=min(day, 31),
+            hour=hour, minute=minute, second=0, microsecond=0,
+        )
         return candidate
 
     if mode == "yearly":
@@ -90,27 +117,235 @@ def _setup_logging(output_dir: str) -> None:
     )
 
 
-def _run_report_generation(cwd: str, mode: str) -> None:
-    """调用 run_agent.py 生成报告。"""
+def _period_for(mode: str, year: int = None, quarter: int = None) -> dict:
+    """由模式 + 年份/季度算出报告期（start/end/label/dir_label）。"""
+    if mode == "quarterly":
+        if quarter is None:
+            # 季度过完（次季首月触发）时，报告刚结束的上一季度：
+            # 4/1 跑 1~3 月、7/1 跑 4~6 月、10/1 跑 7~9 月、1/1 跑去年 10~12 月
+            year, quarter = last_completed_quarter()
+        start, end = quarter_range(year, quarter)
+        label = f"{year}.{start.month}~{end.month}"
+        return {"mode": mode, "year": year, "quarter": quarter,
+                "start": start.isoformat(), "end": end.isoformat(),
+                "label": label, "dir_label": label}
+    # yearly：目录名统一用 2026.1~12（与建图脚本一致），报告名仍用 2026年
+    if year is None:
+        year = last_completed_year()
+    return {"mode": mode, "year": year,
+            "start": f"{year}-01-01", "end": f"{year}-12-31",
+            "label": f"{year}年", "dir_label": f"{year}.1~12"}
+
+
+def _data_dirs_for(cwd: str, cfg: dict, dir_label: str) -> tuple:
+    """计算 图库_<期>/<桥名> 与 统计值_<期>/<桥名>（基目录从配置 charts_dir 推导）。"""
+    bd = cfg.get("bridge_data") or {}
+    bridge = str(bd.get("bridge_name") or "").strip()
+    cd = str(bd.get("charts_dir") or "").replace("\\", "/")
+    base = os.path.join(cwd, "preprocess")
+    for marker in ("图库_", "图库"):
+        idx = cd.find(marker)
+        if idx >= 0:
+            b = cd[:idx].rstrip("/")
+            base = b if os.path.isabs(b) else os.path.normpath(
+                os.path.join(cwd, b))
+            break
+    charts = os.path.join(base, f"图库_{dir_label}", bridge) if bridge \
+        else os.path.join(base, f"图库_{dir_label}")
+    stats = os.path.join(base, f"统计值_{dir_label}", bridge) if bridge \
+        else os.path.join(base, f"统计值_{dir_label}")
+    return charts, stats
+
+
+def _data_ready(charts_dir: str, stats_dir: str) -> bool:
+    """图库有 png 且统计值有“位置统计”json 才算就绪。"""
+    if not os.path.isdir(charts_dir):
+        return False
+    if not any(fn.lower().endswith((".png", ".jpg", ".jpeg"))
+               for _r, _d, files in os.walk(charts_dir) for fn in files):
+        return False
+    pos_dir = os.path.join(stats_dir, "位置统计")
+    if not os.path.isdir(pos_dir):
+        return False
+    return any(fn.lower().endswith(".json")
+               for _r, _d, files in os.walk(pos_dir) for fn in files)
+
+
+def _load_preprocess_config(cwd: str) -> dict:
+    pcfg_path = os.path.join(cwd, "preprocess", "config.json")
+    try:
+        with open(pcfg_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("读取 preprocess/config.json 失败: %s", exc)
+        return {}
+
+
+def _run_pipeline_cmd(cwd: str, raw: str, daily: str,
+                      charts_dir: str, stats_dir: str,
+                      bridge: str, start: str, end: str,
+                      period_mode: str = "quarterly",
+                      map_docx: str = "",
+                      skip_preprocess: bool = False,
+                      resume: bool = False,
+                      skip_charts: bool = False) -> None:
+    """调用 pipeline.py 执行预处理（日志+超时处理）。"""
+    cmd = [sys.executable, os.path.join(cwd, "preprocess", "pipeline.py"),
+           "--raw", raw, "--daily", daily,
+           "--charts", charts_dir, "--stats", stats_dir,
+           "--start", start, "--end", end]
+    if bridge:
+        cmd += ["--bridge", bridge]
+    if period_mode == "yearly":
+        cmd += ["--period", "yearly"]
+    if skip_preprocess:
+        cmd += ["--skip-preprocess"]
+    if resume:
+        cmd += ["--resume"]
+    if skip_charts:
+        # 只补日级数据时跳过出图/统计（如年度报告缺某个季度日级）
+        cmd += ["--skip-charts"]
+    if map_docx:
+        cmd += ["--sensor-map-docx", map_docx]
+    log.info("== 自动预处理命令: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, timeout=86400)
+        if proc.returncode != 0:
+            log.error("自动预处理失败，返回码 %s（报告仍会尝试生成）",
+                      proc.returncode)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("自动预处理异常: %s", exc)
+
+
+def _daily_period_ready(daily_root: str, tag: str,
+                        start: str, end: str) -> bool:
+    """判断某期日级数据是否完整：目录存在 + 日期覆盖 >= 90%。
+
+    预处理中断时目录可能残留但不完整（日期覆盖不全），据此可区分
+    “完整可复用”与“需要续跑/重跑”。
+    """
+    d = os.path.join(daily_root, f"daily_{tag}")
+    if not os.path.isdir(d):
+        return False
+    dates = set()
+    for _r, _dirs, files in os.walk(d):
+        for fn in files:
+            if fn.lower().endswith(".csv") and len(fn) >= 10:
+                dates.add(fn[:10])
+    if not dates:
+        return False
+    try:
+        expected = (dt.date.fromisoformat(end)
+                    - dt.date.fromisoformat(start)).days + 1
+    except ValueError:
+        expected = 1
+    coverage = len(dates) / max(expected, 1)
+    if coverage < 0.9:
+        log.info("日级数据不完整: %s（日期覆盖 %d/%d 天）",
+                 d, len(dates), expected)
+        return False
+    return True
+
+
+def _quarter_daily_plan(year: int):
+    """返回当年 4 个季度的 (季度号, 目录标签, 起, 止)。"""
+    plan = []
+    for q in range(1, 5):
+        s, e = quarter_range(year, q)
+        plan.append((q, f"{year}.{s.month}~{e.month}",
+                     s.isoformat(), e.isoformat()))
+    return plan
+
+
+def _ensure_report_data(cwd: str, cfg: dict, period: dict) -> None:
+    """生成报告前检查图库/统计值/日级数据，按需自动预处理。
+
+    调度器 = web 生成报告模块的拓展：
+      - 目标期图库/统计值已就绪 -> 什么都不做；
+      - 日级数据完整 -> 只重建图库/统计值/总结（--skip-preprocess）；
+      - 日级数据缺失/不完整 -> 先补预处理（断点续跑）再建图库/统计值；
+      - 年度报告：4 个季度日级都完整就直接建年度图库/统计值，缺哪个季度
+        就补哪个季度，不再整年重跑。
+    """
+    bd = cfg.get("bridge_data") or {}
+    if not bd.get("enabled"):
+        return
+    bridge = str(bd.get("bridge_name") or "").strip()
+    charts_dir, stats_dir = _data_dirs_for(cwd, cfg, period["dir_label"])
+    if _data_ready(charts_dir, stats_dir):
+        return
+    log.info("报告期 %s 图库/统计值缺失，准备自动预处理：%s、%s",
+             period["label"], charts_dir, stats_dir)
+    pcfg = _load_preprocess_config(cwd)
+    raw = str(pcfg.get("raw_data_dir") or "").strip()
+    daily = str(pcfg.get("daily_dir") or "").strip()
+    map_docx = str(pcfg.get("sensor_map_docx") or "").strip()
+    if map_docx and not os.path.isabs(map_docx):
+        map_docx = os.path.normpath(os.path.join(
+            cwd, "preprocess", map_docx))
+    if not raw or not daily:
+        log.warning("缺数据但未配置 preprocess/config.json 的 raw_data_dir/"
+                    "daily_dir，跳过自动预处理")
+        return
+    daily_root = os.path.join(daily, bridge) if bridge else daily
+
+    if period["mode"] == "yearly":
+        year = period["year"]
+        missing = []
+        for q, tag, qs, qe in _quarter_daily_plan(year):
+            if not _daily_period_ready(daily_root, tag, qs, qe):
+                missing.append((q, tag, qs, qe))
+        for q, tag, qs, qe in missing:
+            log.info("年度 %d 缺第 %d 季度日级数据(%s)，先补该季度预处理",
+                     year, q, tag)
+            qcharts, qstats = _data_dirs_for(cwd, cfg, tag)
+            _run_pipeline_cmd(cwd, raw, daily, qcharts, qstats,
+                              bridge, qs, qe, "quarterly", map_docx,
+                              resume=True, skip_charts=True)
+        # 日级齐了之后，只重建年度图库/统计值/总结
+        _run_pipeline_cmd(cwd, raw, daily, charts_dir, stats_dir,
+                          bridge, period["start"], period["end"],
+                          "yearly", map_docx, skip_preprocess=True)
+        return
+
+    # 季度模式
+    if _daily_period_ready(daily_root, period["dir_label"],
+                           period["start"], period["end"]):
+        # 日级已完整：只重建图库/统计值/总结
+        _run_pipeline_cmd(cwd, raw, daily, charts_dir, stats_dir,
+                          bridge, period["start"], period["end"],
+                          "quarterly", map_docx, skip_preprocess=True)
+    else:
+        # 日级缺失或不完整：全量预处理（--resume 续跑已生成的日文件）
+        _run_pipeline_cmd(cwd, raw, daily, charts_dir, stats_dir,
+                          bridge, period["start"], period["end"],
+                          "quarterly", map_docx, resume=True)
+
+
+def _run_report_generation(cwd: str, mode: str, cfg: dict = None,
+                           year: int = None, quarter: int = None) -> None:
+    """调用 run_agent.py 生成报告（缺数据时先自动预处理）。"""
+    cfg = cfg or {}
+    config_path = cfg.get("_config_path") or ""
+    period = _period_for(mode, year, quarter)
+    # 调度器 = web 生成报告模块的拓展：缺数据先预处理，再生成报告
+    _ensure_report_data(cwd, cfg, period)
+
     log.info("触发报告生成（模式=%s）", mode)
     cmd = [sys.executable, "run_agent.py", "--mode", mode]
+    if config_path:
+        # 必须带 --config，否则 run_agent 会落到默认配置(config.json)，
+        # 导致调度器一直用错桥的数据源（如报 data/temperature_daily.csv 不存在）
+        cmd += ["--config", config_path]
     if mode == "quarterly":
-        # 季度首月(1/4/7/10月)触发时，报告上一个完整季度：
-        # 4/1 跑 1~3 月、7/1 跑 4~6 月、10/1 跑 7~9 月、1/1 跑去年 10~12 月
-        today = dt.date.today()
-        q = (today.month - 1) // 3          # 当前季度 0 基
-        first = dt.date(today.year, q * 3 + 1, 1)
-        end = first - dt.timedelta(days=1)  # 上一季度最后一天
-        cmd += ["--date", end.isoformat()]
-        log.info("季度报告期截止: %s（覆盖 %s ~ %s）",
-                 end.isoformat(),
-                 dt.date(end.year, ((end.month - 1) // 3) * 3 + 1, 1).isoformat(),
-                 end.isoformat())
+        cmd += ["--year", str(period["year"]), "--quarter",
+                str(period["quarter"])]
+        log.info("季度报告期: %s（覆盖 %s ~ %s）",
+                 period["label"], period["start"], period["end"])
     elif mode == "yearly":
-        # 年度任务在次年 1 月触发时，报告上一年全年
-        end = dt.date(dt.date.today().year - 1, 12, 31)
-        cmd += ["--date", end.isoformat()]
-        log.info("年度报告期截止: %s", end.isoformat())
+        cmd += ["--year", str(period["year"])]
+        log.info("年度报告期: %s（覆盖 %s ~ %s）",
+                 period["label"], period["start"], period["end"])
     try:
         proc = subprocess.run(cmd, cwd=cwd, timeout=1800)
         if proc.returncode != 0:
@@ -119,6 +354,98 @@ def _run_report_generation(cwd: str, mode: str) -> None:
             log.info("报告生成完成")
     except Exception as exc:  # noqa: BLE001
         log.exception("报告生成异常: %s", exc)
+
+
+def _pending_quarters(start_date: dt.date, today: dt.date = None) -> list:
+    """返回从 start_date 到今天之间“已完整结束且完全落在 start_date 之后”的季度。
+
+    例如 start_date=2026-01-01、today=2026-08-19 -> [(2026,1),(2026,2)]；
+    start_date 为今天（2026-08-19，Q3 未结束）-> []。
+    """
+    today = today or dt.date.today()
+    if today < start_date:
+        return []
+    ly, lq = last_completed_quarter(today)
+    out = []
+    y, q = start_date.year, (start_date.month - 1) // 3 + 1
+    while (y, q) <= (ly, lq):
+        s, _e = quarter_range(y, q)
+        if s >= start_date:
+            out.append((y, q))
+        q += 1
+        if q > 4:
+            q = 1
+            y += 1
+    return out
+
+
+def _yearly_report_exists(output_dir: str, year_label: str) -> bool:
+    """输出目录里是否已有某年度的年度报告（文件名含 “2025年” 等）。"""
+    if not output_dir or not os.path.isdir(output_dir):
+        return False
+    try:
+        for fn in os.listdir(output_dir):
+            if fn.lower().endswith(".docx") and year_label in fn:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _catch_up_yearly(cwd: str, cfg: dict) -> None:
+    """启动补跑：上一完整年度还没有年度报告时生成一份（季度/年度模式通用）。
+
+    例如 start_date=2025-06-30、2026 年 8 月启动，会自动补生成
+    2025 年年度报告（已存在则跳过，避免每次重启重跑）。
+    """
+    schedule = cfg.get("schedule", {})
+    prev_year = last_completed_year()
+    # 起始日期保护：start_date 所在年份晚于上一年度才不补跑
+    # （start_date=2025-06-30 时，2025 年度仍然补跑）
+    start_str = str(schedule.get("start_date") or "").strip()
+    if start_str:
+        try:
+            if dt.date.fromisoformat(start_str).year > prev_year:
+                log.info("起始日期 %s 晚于 %d 年，不补跑 %d 年年度报告",
+                         start_str, prev_year, prev_year)
+                return
+        except ValueError:
+            log.warning("schedule.start_date 无效: %r，忽略补跑", start_str)
+            return
+    label = f"{prev_year}年"
+    if _yearly_report_exists(cfg.get("output_dir", "outputs"), label):
+        log.info("已存在 %d 年年度报告，跳过补跑", prev_year)
+        return
+    log.info("== 补跑 %d 年年度报告 ==", prev_year)
+    _run_report_generation(cwd, "yearly", cfg, year=prev_year)
+
+
+def _catch_up_pending(cwd: str, cfg: dict) -> None:
+    """调度器启动时补跑：季度模式补已结束季度；同时补上一年年度报告。"""
+    schedule = cfg.get("schedule", {})
+    # 年度报告补跑对季度/年度模式都执行
+    _catch_up_yearly(cwd, cfg)
+    if schedule.get("mode") != "quarterly":
+        return
+    start_str = str(schedule.get("start_date") or "").strip()
+    if not start_str:
+        log.info("未配置 schedule.start_date，调度从今天开始（当前季度过完才生成）")
+        return
+    try:
+        start_date = dt.date.fromisoformat(start_str)
+    except ValueError:
+        log.warning("schedule.start_date 无效: %r，忽略补跑", start_str)
+        return
+    pending = _pending_quarters(start_date)
+    if not pending:
+        log.info("起始日期 %s 之后没有需要补跑的已结束季度", start_date.isoformat())
+        return
+    log.info("起始日期 %s：补跑 %d 个已结束季度：%s",
+             start_date.isoformat(), len(pending),
+             "、".join(f"{y}Q{q}" for y, q in pending))
+    for y, q in pending:
+        log.info("== 补跑 %d 年第 %d 季度 ==", y, q)
+        _run_report_generation(cwd, "quarterly", cfg, year=y, quarter=q)
 
 
 def run_with_apscheduler(cfg: dict) -> None:
@@ -170,11 +497,27 @@ def run_with_apscheduler(cfg: dict) -> None:
     scheduler.add_job(
         _run_report_generation,
         trigger=trigger,
-        args=[cwd, mode],
+        args=[cwd, mode, cfg, None, None],
         id="report_generation",
         misfire_grace_time=3600,  # 错过1小时内仍可补执行
         coalesce=True,  # 多次错过只执行一次
     )
+    if mode == "quarterly":
+        # 季度模式下，每年 1 月额外生成上一年度报告
+        day = int(schedule.get("day_of_month", 1))
+        scheduler.add_job(
+            _run_report_generation,
+            CronTrigger(month="1", day=day, hour=hour, minute=minute),
+            args=[cwd, "yearly", cfg, None, None],
+            id="yearly_report",
+            misfire_grace_time=3600,
+            coalesce=True,
+        )
+        log.info("已附加年度报告任务：每年 1 月 %d 日 %02d:%02d 生成上一年报告",
+                 day, hour, minute)
+
+    # 先补跑 start_date 之后已结束的季度 / 上一年度报告，再进入周期调度
+    _catch_up_pending(cwd, cfg)
 
     # 下次执行时间
     next_time = next_run_time(dt.datetime.now(), schedule)
@@ -193,6 +536,7 @@ def run_with_polling(cfg: dict) -> None:
     cwd = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     log.info("轮询模式启动：模式=%s，下次执行=%s", mode, next_run_time(dt.datetime.now(), schedule))
+    _catch_up_pending(cwd, cfg)
     while True:
         now = dt.datetime.now()
         target = next_run_time(now, schedule)
@@ -201,7 +545,7 @@ def run_with_polling(cfg: dict) -> None:
             time.sleep(min(wait_seconds, 30))
             continue
 
-        _run_report_generation(cwd, mode)
+        _run_report_generation(cwd, mode, cfg)
         time.sleep(60)
 
 
@@ -212,6 +556,7 @@ def run_forever(config_path: str = None) -> None:
     APScheduler 未安装时降级为 30s 轮询模式。
     """
     cfg = load_config(config_path)
+    cfg.setdefault("_config_path", config_path or "")
     output_dir = cfg.get("output_dir", "outputs")
     _setup_logging(output_dir)
 

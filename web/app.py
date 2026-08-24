@@ -243,6 +243,48 @@ def _stats_ready(stats_dir: str) -> bool:
     return os.path.isdir(pos_dir) and _dir_nonempty(pos_dir)
 
 
+def _period_daily_ready(bridge: str, period: Dict) -> bool:
+    """本报告期日级数据是否已就绪。
+
+    就绪判定：桥根目录下跑过预处理（存在 summary.csv），且本期的
+    daily_<期> 目录里已有实际 CSV（年度则桥根下存在任一 daily_* 子目录
+    含 CSV）。就绪时 web“开始生成”跳过 秒级->日级，直接建图库/统计值，
+    避免 daily 全的情况下仍空跑一遍预处理步骤。
+    """
+    if not bridge:
+        return False
+    pcfg = {}
+    if os.path.isfile(PREPROCESS_CONFIG):
+        try:
+            with open(PREPROCESS_CONFIG, "r", encoding="utf-8") as f:
+                pcfg = json.load(f)
+        except Exception:  # noqa: BLE001
+            pcfg = {}
+    daily_root = pcfg.get("daily_dir",
+                          os.path.join(PREPROCESS_DIR, "日级数据"))
+    bridge_root = os.path.join(daily_root, bridge)
+    if not os.path.isdir(bridge_root):
+        return False
+    if not os.path.isfile(os.path.join(bridge_root, "summary.csv")):
+        return False
+    label = str(period.get("label") or "")
+    dir_label = re.sub(r"^(\d{4})年$", r"\1.1~12", label) or label
+    if dir_label:
+        if label.endswith("年"):
+            # 年度：daily 按季度分目录（daily_2026.1~3 …），桥根下任一子目录有数据即可
+            try:
+                subs = [d for d in os.listdir(bridge_root)
+                        if d == "daily" or d.startswith("daily_")]
+            except OSError:
+                subs = []
+            return any(
+                _dir_nonempty(os.path.join(bridge_root, s)) for s in subs)
+        daily_dir = os.path.join(bridge_root, f"daily_{dir_label}")
+    else:
+        daily_dir = os.path.join(bridge_root, "daily")
+    return _dir_nonempty(daily_dir)
+
+
 # ---------------------------------------------------------------------------
 # 工具
 # ---------------------------------------------------------------------------
@@ -1438,7 +1480,8 @@ def _canon_bridge_name(name: str) -> str:
 
 
 def _run_pipeline(period: Dict, charts_dir: str, stats_dir: str,
-                  st: Dict, bridge: str = "") -> int:
+                  st: Dict, bridge: str = "",
+                  skip_preprocess: bool = False) -> int:
     """调用 pipeline.py 完成 秒级->日级->图库/统计值->对照表。
     返回子进程退出码。"""
     pcfg = {}
@@ -1459,6 +1502,9 @@ def _run_pipeline(period: Dict, charts_dir: str, stats_dir: str,
         cmd += ["--bridge", bridge]
     if map_docx:
         cmd += ["--sensor-map-docx", map_docx]
+    if skip_preprocess:
+        # daily 已就绪：跳过 秒级->日级，直接 日级->图库/统计值
+        cmd.append("--skip-preprocess")
     # 断点续跑必须默认开启（预处理时跳过已生成的 daily 文件）
     cmd.append("--resume")
     st["pipeline_cmd"] = " ".join(cmd)
@@ -1666,12 +1712,23 @@ def api_bridge_run(bridge_id):
             st["data_ready"] = data_ready
             if auto_preprocess:
                 if not data_ready:
+                    bridge_name = ((cfg.get("bridge_data") or {})
+                                   .get("bridge_name") or "")
+                    daily_ready = _period_daily_ready(bridge_name, period)
+                    st["daily_ready"] = daily_ready
+                    if daily_ready:
+                        log.info(
+                            "桥 %s 日级数据已就绪（%s），跳过 秒级->日级，"
+                            "直接生成图库/统计值", bridge_id,
+                            period.get("label") or "")
                     st["preprocess"] = "running"
                     rc = _run_pipeline(
                         period, charts_dir, stats_dir, st,
-                        bridge=((cfg.get("bridge_data") or {})
-                                .get("bridge_name") or ""))
-                    st["preprocess"] = "done" if rc == 0 else "failed"
+                        bridge=bridge_name,
+                        skip_preprocess=daily_ready)
+                    st["preprocess"] = (
+                        "skipped_daily" if (rc == 0 and daily_ready)
+                        else ("done" if rc == 0 else "failed"))
                     if rc != 0:
                         st["error"] = ("数据预处理失败，详见 pipeline 日志。"
                                        if not st.get("pipeline_error")

@@ -64,7 +64,7 @@ OUTPUT_ROOT = ""        # 留空 = 自动放在 DATA_ROOT 上一级的 results/ 
 BUCKET_SECONDS = 3600   # 聚合粒度(秒)，默认 3600 = 1 小时，一天输出 24 行
 WORKERS = 0             # 0 = 自动使用全部 CPU 核数
 MEDIAN_MODE = "none"    # none=不计算中位数(默认,图库/统计值不使用中位数列)
-RESUME = False          # True = 已生成过的 daily 日文件自动跳过(断点续跑)
+RESUME = True           # True = 已生成过的 daily 日文件自动跳过(断点续跑，默认开)
 SENSORS_PER_WORKER = 3  # 每个工作进程一次处理的传感器数量(按传感器分批)
 DAILY_SUBDIR = "daily"  # daily 输出子目录（带期号时为 daily_2026.1~3）
 # -----------------------------------------------------------
@@ -890,13 +890,91 @@ def write_inventory(info):
         for feature, st in sorted(feats.items()):
             days = sorted(st["days"])
             rows.append([sensor, feature, st["files"], st["bytes"],
-                         len(days), days[0], days[-1]])
+                         len(days), days[0], days[-1], "|".join(days)])
     out_path = os.path.join(OUTPUT_ROOT, "inventory.csv")
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["sensor", "feature", "files", "bytes", "days", "first_day", "last_day"])
+        w.writerow(["sensor", "feature", "files", "bytes", "days",
+                    "first_day", "last_day", "dates"])
         w.writerows(rows)
     logger.info(f"摸底表已写入: {out_path}")
+
+
+def load_inventory(path):
+    """读取摸底表(inventory.csv)为 info 结构，用于跳过摸底扫描直接预处理。
+
+    要求新版格式含 dates 列（实际日期列表，| 分隔）；旧格式或缺列返回 None。
+    """
+    if not os.path.isfile(path):
+        return None
+    info = {}
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header or "dates" not in header:
+                return None
+            idx = {name: i for i, name in enumerate(header)}
+            for row in reader:
+                if len(row) <= idx["sensor"]:
+                    continue
+                sensor, feature = row[idx["sensor"]], row[idx["feature"]]
+                try:
+                    files = int(row[idx["files"]])
+                except (IndexError, ValueError):
+                    continue
+                dates = {x for x in row[idx["dates"]].split("|") if x}
+                info.setdefault(sensor, {})[feature] = {
+                    "files": files,
+                    "bytes": 0,
+                    "days": dates,
+                }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"读取摸底表失败 {path}: {exc}")
+        return None
+    return info or None
+
+
+def _inventory_covers(inventory, start, end):
+    """复用摸底表的严格判定：请求时间段必须完整落在表内。
+
+    规则（全部满足才允许复用，否则重新摸底）：
+      - 表不能为空；
+      - 请求的起止日期都必须真实出现在表中；
+      - 请求时间段内每一天在表中出现的覆盖率 >= 90%。
+    避免旧摸底表(如只含 2026)被复用到 2025，导致任务数为 0、
+    “管道全部完成”却一个文件都不生成。
+    """
+    if not inventory:
+        return False
+    all_days = set()
+    for feats in (inventory or {}).values():
+        for st in feats.values():
+            all_days.update(st.get("days") or ())
+    if not all_days:
+        return False
+    try:
+        s = dt.date.fromisoformat(start) if start else None
+        e = dt.date.fromisoformat(end) if end else None
+    except ValueError:
+        return False
+    if s and s.isoformat() not in all_days:
+        return False
+    if e and e.isoformat() not in all_days:
+        return False
+    if s and e:
+        total = (e - s).days + 1
+        if total <= 0:
+            return False
+        present = 0
+        day = s
+        while day <= e:
+            if day.isoformat() in all_days:
+                present += 1
+            day += dt.timedelta(days=1)
+        if present / total < 0.9:
+            return False
+    return True
 
 
 def build_tasks(info, sensors, features, start, end, limit_days):
@@ -1101,7 +1179,9 @@ def main():
                     default=MEDIAN_MODE,
                     help="exact=精确中位数(默认); none=不计算中位数(最省内存)")
     ap.add_argument("--resume", action="store_true", default=RESUME,
-                    help="跳过已生成过的 daily 日文件(断点续跑)")
+                    help="跳过已生成过的 daily 日文件(断点续跑，默认开启)")
+    ap.add_argument("--no-resume", action="store_false", dest="resume",
+                    help="关闭断点续跑(重新处理全部)")
     ap.add_argument("--limit-days", type=int, default=0,
                     help="每个传感器每个特征只处理前 N 天(试跑用)")
     ap.add_argument("--period-tag", default="",
@@ -1153,18 +1233,49 @@ def main():
         scan_scope = (sensors_arg or "全部") + " / " + \
             (args.start or "最早") + " ~ " + (args.end or "最新")
         logger.info(f"摸底范围: 传感器 {scan_scope}")
-        info = discover(sensors=sensors_arg, start=args.start, end=args.end)
-        print_inventory(info)
-        show_sample(info)
-        write_inventory(info)
-        logger.info(f"摸底完成: 共 {sum(len(feats) for feats in info.values())} "
-                    f"个传感器-特征组合")
+        info = None
+        inv_path = os.path.join(OUTPUT_ROOT, "inventory.csv")
+        reused_inventory = False
+        if args.mode != "inventory":
+            # 已有本桥摸底表则直接复用，跳过耗时扫描（--mode inventory 才会重扫）
+            info = load_inventory(inv_path)
+            if info is not None and not _inventory_covers(
+                    info, args.start, args.end):
+                logger.warning("摸底表未覆盖请求时间段(%s ~ %s)，"
+                               "重新摸底扫描", args.start or "最早",
+                               args.end or "最新")
+                info = None
+            else:
+                reused_inventory = info is not None
+        if info is None:
+            logger.info("未找到可复用的摸底表，开始摸底扫描...")
+            info = discover(sensors=sensors_arg, start=args.start, end=args.end)
+            print_inventory(info)
+            show_sample(info)
+            write_inventory(info)
+            logger.info(f"摸底完成: 共 {sum(len(feats) for feats in info.values())} "
+                        f"个传感器-特征组合")
+        else:
+            logger.info(f"复用摸底表: {inv_path}（跳过摸底扫描，"
+                        f"共 {sum(len(feats) for feats in info.values())} "
+                        f"个传感器-特征组合）")
     else:
         info = {}
 
     if args.mode in ("preprocess", "all") and not args.traffic_only:
         tasks = build_tasks(info, sensors_arg, args.features,
                             args.start, args.end, args.limit_days)
+        if not tasks and reused_inventory:
+            # 兜底：复用表可能仍不准确（如部分传感器缺日期），强制重新摸底一次
+            logger.warning("复用摸底表后任务数为 0，强制重新摸底扫描一次...")
+            info = discover(sensors=sensors_arg, start=args.start, end=args.end)
+            write_inventory(info)
+            tasks = build_tasks(info, sensors_arg, args.features,
+                                args.start, args.end, args.limit_days)
+        if not tasks:
+            logger.warning("没有符合条件的任务：请确认原始数据目录结构、摸底表"
+                           "是否覆盖 %s ~ %s，以及 --bridge 桥名是否正确",
+                           args.start or "最早", args.end or "最新")
         processed = run_preprocess(tasks)
         logger.info(f"本次运行结束: 新完成任务 {processed} 个")
 

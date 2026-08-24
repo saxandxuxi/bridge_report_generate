@@ -2258,6 +2258,10 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
         fig.tight_layout(rect=(0, 0, 1, 0.97))
     # 多段标注: 收缩子图宽度，把右侧留白区让出来放文字
     if margin_labels:
+        # 先预留右侧留白再画标注，保证文字全部落在画布内：个别 matplotlib
+        # 版本对 tight bbox 中“画布外元素”处理异常，会把画布放大成 16:1 的
+        # 废图（如 37704×2323，内容被挤到右侧），这里从根上避免。
+        fig.subplots_adjust(right=0.80)
         for a in axes:
             x0, y0, w, h = a.get_position().bounds
             a.set_position([x0, y0, w * 0.78, h])
@@ -2266,9 +2270,40 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
             by_ax.setdefault(pi, []).append((label, color, xv, yv))
         for pi, items in by_ax.items():
             _label_in_margin(fig, axes[pi].get_position(), items,
-                             fontsize=12)
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+                             fontsize=11)
+        # 有右侧标注时用固定画布保存（不带 tight bbox），避免标注文字
+        # 超出画布边缘触发 tight 放大；正常无标注的图仍用 tight 裁剪留白。
+        _save_group_fig(fig, out_path, dpi, tight=False)
+    else:
+        _save_group_fig(fig, out_path, dpi, tight=True)
     plt.close(fig)
+
+
+def _save_group_fig(fig, out_path: str, dpi: int = 200,
+                    tight: bool = True) -> None:
+    """保存合并图并做宽高比体检。
+
+    个别 matplotlib 版本（如服务器 conda 环境的 3.11.x）对
+    bbox_inches='tight' 中位于画布外/边缘的标注元素处理异常，会把画布
+    放大成 37704×2323 这类 16:1 的废图。检测到异常宽高比时改用不带
+    tight 的画布重存一版，并打印警告便于在 生成失败记录.txt / 日志 定位。
+    """
+    fig.savefig(out_path, dpi=dpi,
+                bbox_inches=("tight" if tight else None),
+                facecolor="white")
+    try:
+        from PIL import Image
+        im = Image.open(out_path)
+        w, h = im.size
+        if w and h and (w / h > 6.0 or h / w > 6.0):
+            print(
+                f"[警告] 合并图宽高比异常 {w}x{h}（{w / h:.1f}:1），"
+                f"改用非 tight 画布重存: {out_path}",
+                flush=True)
+            fig.savefig(out_path, dpi=dpi, bbox_inches=None,
+                        facecolor="white")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[警告] 合并图尺寸体检失败 {out_path}: {exc}", flush=True)
 
 
 def plot_group_histogram(position, group, series, out_path, dpi=200):

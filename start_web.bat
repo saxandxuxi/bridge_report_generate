@@ -11,7 +11,7 @@ if not exist "%PYTHONW%" set "PYTHONW=C:\ProgramData\miniconda3\pythonw.exe"
 if not exist "%PYTHONW%" set "PYTHONW=pythonw.exe"
 
 rem 访问令牌（生产环境务必改成随机值；留空则不鉴权，仅建议本机调试）
-if "%REPORT_WEB_TOKEN%"=="" set "REPORT_WEB_TOKEN=change-me"
+if "%REPORT_WEB_TOKEN%"=="" set "REPORT_WEB_TOKEN=VbJMBaud4tqkpXxZN1sAw3vS2oI8O5Fr"
 if "%REPORT_WEB_HOST%"=="" set "REPORT_WEB_HOST=0.0.0.0"
 if "%REPORT_WEB_PORT%"=="" set "REPORT_WEB_PORT=8456"
 set "REPORT_PROJECT_ROOT=%PROJECT_ROOT%"

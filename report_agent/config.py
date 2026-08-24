@@ -132,6 +132,18 @@ def _apply_latest_bridge_dirs(cfg: dict, base: str) -> None:
         return
     stats = dirs.get("stats") or ""
     charts = dirs.get("charts") or ""
+    # status.json 里的目录是“最近一次 pipeline 运行”的产物，可能属于其他桥；
+    # 只有当目录名与当前桥名兼容（桥名变体匹配）时才允许覆盖，
+    # 避免新桥路径还没生成时被上一次其他桥的目录顶替。
+    bname = bridge_data.get("bridge_name", "") or ""
+    for _key, _val in (("stats", stats), ("charts", charts)):
+        if _val and bname:
+            _leaf = os.path.basename(os.path.normpath(_val))
+            if not bridge_dir_match(bname, _leaf):
+                if _key == "stats":
+                    stats = ""
+                else:
+                    charts = ""
     # 配置里已显式指定且路径存在时，不覆盖（模拟/服务器绝对路径优先）
     cur_stats = bridge_data.get("stats_dir", "")
     cur_charts = bridge_data.get("charts_dir", "")
@@ -149,8 +161,7 @@ def _apply_latest_bridge_dirs(cfg: dict, base: str) -> None:
             bridge_data["sensor_map"] = sm
         nd = os.path.join(map_dir, "传感器名称对照")
         if os.path.isdir(nd):
-            bridge_name = bridge_data.get("bridge_name", "") or ""
-            for fn in name_dict_candidates(bridge_name):
+            for fn in name_dict_candidates(bname):
                 nd_file = os.path.join(nd, fn)
                 if os.path.isfile(nd_file):
                     bridge_data["name_dict"] = nd_file
@@ -161,8 +172,7 @@ def _apply_latest_bridge_dirs(cfg: dict, base: str) -> None:
             bridge_data["sensor_map"] = sm
         nd = os.path.join(stats, "传感器名称对照")
         if os.path.isdir(nd) and not bridge_data.get("name_dict"):
-            bridge_name = bridge_data.get("bridge_name", "") or ""
-            for fn in name_dict_candidates(bridge_name):
+            for fn in name_dict_candidates(bname):
                 nd_file = os.path.join(nd, fn)
                 if os.path.isfile(nd_file):
                     bridge_data["name_dict"] = nd_file

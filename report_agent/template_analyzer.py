@@ -65,6 +65,12 @@ _KEEP_END = ("布置图", "示意图", "平面图", "立面图", "断面图", "�
 _LEADIN_END = ("如下图所示。", "如下图所示：", "如下表。", "如下表：",
                "如下图所示", "如下表")
 
+# 时效性语句：原报告针对当季事件的“请及时…/请尽快…/立即…”类建议，
+# 换季度后不适用，生成模版时删除（异常现象描述保留，只去掉时效性措辞）
+TIMELINESS_RE = re.compile(
+    r"[，,]\s*(?:请|望|应)?\s*(?:及时|尽快|立即|尽快安排)[^。；]*?"
+    r"(?:查明|处理|排查|检修|复核|整改|调查|安排)[^。；]*")
+
 
 def cleanup_redundant_captions(doc: Document) -> int:
     """生成模版后清洗：删除未被替换成占位符的冗余图注文字。
@@ -76,17 +82,33 @@ def cleanup_redundant_captions(doc: Document) -> int:
     """
     removed = 0
     for para in iter_paragraphs(doc):
-        t = "".join(r.text or "" for r in para.runs).strip()
+        runs = [r for r in para.runs]
+        t = "".join(r.text or "" for r in runs).strip()
         if not t:
             continue
         if t.startswith("{{") or re.match(r"^图\s*\d+[-.]\d+", t):
             continue  # 占位符 / 编号正规图注
+        # “(结果图1) / （结果图3）”等多余图注：清空段落
+        if re.match(r"^[（(]?\s*结果图\s*\d*\s*[）)]?$", t):
+            for r in runs:
+                r.text = ""
+            removed += 1
+            continue
         if any(t.endswith(x) for x in _LEADIN_END):
             continue  # “…如下图所示。”引导句保留
         if any(t.endswith(x) for x in _KEEP_END):
             continue  # 原报告图纸标题保留
+        # 时效性语句删除（如“，请及时查明情况”），保留异常现象本身
+        t2 = TIMELINESS_RE.sub("", t)
+        if t2 != t:
+            if runs:
+                runs[0].text = t2
+                for r in runs[1:]:
+                    r.text = ""
+                removed += 1
+            continue
         if any(t.endswith(x) for x in _CAPTION_END):
-            for r in para.runs:
+            for r in runs:
                 r.text = ""
             removed += 1
     return removed

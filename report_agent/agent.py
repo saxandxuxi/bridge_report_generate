@@ -486,11 +486,14 @@ class ReportAgent:
                 name_prefix = f"{name_prefix}_template_v{m.group(1)}"
 
         with_ts = name_cfg.get("with_timestamp", True)
+        # 模板版本前缀（如 _template_v1）与报告期之间补下划线，
+        # 避免拼成 “洣水河特大桥_template_v12026.4~6.docx”。
+        _period_sep = "_" if "_template_v" in name_prefix else ""
         if mode == "quarterly":
             # 季度命名：洞庭湖大桥2026.1~3.docx（用户指定格式）
-            out_name = f"{name_prefix}{period['label']}.docx"
+            out_name = f"{name_prefix}{_period_sep}{period['label']}.docx"
         elif mode == "yearly":
-            out_name = f"{name_prefix}{period['label']}.docx"
+            out_name = f"{name_prefix}{_period_sep}{period['label']}.docx"
         elif with_ts:
             out_name = (
                 f"{name_prefix}_{period['start'].strftime('%Y%m%d')}_"
@@ -540,10 +543,22 @@ class ReportAgent:
         logs_dir = os.path.join(os.path.dirname(out_dir_abs), "logs")
         os.makedirs(logs_dir, exist_ok=True)
 
+        # 模板占位符级补全（只做一次，所有审查轮次共用同一份临时模板）：
+        # 小结段落按“小节标题 + chart/cell 占位符前缀 + 季度统计实际特征”
+        # 联合识别该段应覆盖的指标，缺哪个 {{summary.<metric>}} 就补哪个，
+        # 保证总结段落囊括全部指标的季度总结内容（极值 + 故障/缺失位置）。
+        tpl_path = self.cfg.get("template", "")
+        if bridge is not None:
+            enriched = self._enrich_template_summaries(
+                tpl_path, bridge, period)
+            if enriched and enriched != tpl_path:
+                tpl_path = enriched
+                log.info("模板小结段补全完成，使用临时模板: %s", tpl_path)
+
         for rnd in range(1, max_rounds + 1):
             lineage.clear()
             unfilled = report_builder.build_report(
-                template_path=self.cfg.get("template", ""),
+                template_path=tpl_path,
                 output_path=out_path,
                 resolver=resolver,
                 chart_images=chart_images,
@@ -745,6 +760,140 @@ class ReportAgent:
             summary["stats"] = {k: v for k, v in computed.items() if k != "days"}
         log.info("报告已生成: %s", out_path)
         return summary
+
+    # ------------------------------------------------------------------
+    # 模板小结段补全：按“小节标题 + 占位符前缀 + 季度统计特征”识别指标
+    # ------------------------------------------------------------------
+
+    def _enrich_template_summaries(self, template_path: str, bridge,
+                                   period: Dict) -> str:
+        """扫描模板，为“小结/总结”段落补全缺失的 {{summary.<metric>}}。
+
+        识别逻辑（三条件联合，接近人工语义）：
+          1) 小节标题：如 “3.3.1应变监测数据分析” -> strain；
+          2) 该节内 chart/cell 占位符的指标前缀（如
+             {{chart.vibration_3#柱墩墩底左幅_trend_1}} -> vibration），
+             仅在标题识别不出指标时补充；
+          3) 季度统计实际特征键（bridge._feature_for_metric 非空才补）。
+        返回临时模板路径（无改动时返回原路径），不改动原始模板文件。
+        """
+        if not template_path or not os.path.isfile(template_path):
+            return template_path
+        try:
+            from docx import Document as _TplDoc
+            from .recognizer import _metrics_in_text, SUMMARY_CLAIM_RE
+            doc = _TplDoc(template_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("模板小结段补全读取失败: %s", exc)
+            return template_path
+
+        summary_metrics = {}   # 小结标题段索引 -> [metric]
+        sections = []          # [(节标题指标, 节内占位符指标)]
+        cur_head, cur_chart = set(), set()
+        for idx, p in enumerate(doc.paragraphs):
+            t = p.text.strip()
+            if not t:
+                continue
+            hm = re.match(r"^(\d+(?:\.\d+){1,3})\s*(\S.*)$", t)
+            if hm and len(t) <= 40 and re.search(r"监测|分析|小结", t):
+                title = hm.group(2)
+                if "小结" in title:
+                    merged = set()
+                    for h, c in sections:
+                        merged |= (h or c)
+                    merged |= (cur_head or cur_chart)
+                    if merged:
+                        summary_metrics[idx] = sorted(merged)
+                    sections = []
+                    cur_head, cur_chart = set(), set()
+                else:
+                    if cur_head or cur_chart:
+                        sections.append((cur_head, cur_chart))
+                    cur_head = set(_metrics_in_text(title))
+                    cur_chart = set()
+                continue
+            pref = self._template_para_metric_prefixes([t], bridge, period)
+            if pref:
+                cur_chart |= pref
+
+        # 找每个小结标题后的“总结正文段”（含 监测数据结果表明/稳定/正常 等
+        # 特征句，跳过“本季度，我们对…进行了持续监测”这类引子段），把缺的
+        # {{summary.<metric>}} 补到段首
+        if not summary_metrics:
+            return template_path
+        added = 0
+        for hidx, metrics in summary_metrics.items():
+            target = None
+            for j in range(hidx + 1, min(hidx + 5, len(doc.paragraphs))):
+                pt = doc.paragraphs[j].text.strip()
+                if pt and (SUMMARY_CLAIM_RE.search(pt)
+                           or "{{summary." in pt):
+                    target = doc.paragraphs[j]
+                    break
+            if target is None:
+                continue
+            existing = {m for m in re.findall(
+                r"\{\{summary\.([a-zA-Z_]+)\}\}", target.text)}
+            missing = [m for m in metrics if m not in existing
+                       and self._metric_summary_ok(bridge, m, period)]
+            if not missing:
+                continue
+            ph = "".join(f"{{{{summary.{m}}}}}" for m in missing)
+            # 插到段落第一句（如“依据《…》…未出现异常。”）之后，阅读更顺
+            inserted = False
+            for r in target.runs:
+                if r.text and "。" in r.text:
+                    i = r.text.find("。")
+                    r.text = r.text[:i + 1] + ph + r.text[i + 1:]
+                    inserted = True
+                    break
+            if not inserted:
+                if target.runs:
+                    target.runs[0].text = ph + (target.runs[0].text or "")
+                else:
+                    target.add_run(ph)
+            added += len(missing)
+            log.info("模板小结段补全 %s -> %s", target.text[:40], missing)
+        if not added:
+            return template_path
+        import tempfile as _tf
+        fd, tmp_path = _tf.mkstemp(suffix=".docx",
+                                   prefix="tpl_summary_", dir=os.path.dirname(
+                                       os.path.abspath(template_path)))
+        os.close(fd)
+        try:
+            doc.save(tmp_path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("模板小结段补全保存失败: %s", exc)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return template_path
+        return tmp_path
+
+    @staticmethod
+    def _template_para_metric_prefixes(texts, bridge, period) -> set:
+        """从段落文本里提取 chart/cell 占位符的指标前缀。"""
+        out = set()
+        for t in texts or []:
+            for mm in re.finditer(r"\{\{(?:chart|cell)\.([A-Za-z_]+)", str(t)):
+                prefix = mm.group(1)
+                metric = next(
+                    (mk for mk in sorted(bridge.metrics, key=len,
+                                         reverse=True)
+                     if prefix == mk or prefix.startswith(mk + "_")),
+                    None)
+                if metric:
+                    out.add(metric)
+        return out
+
+    def _metric_summary_ok(self, bridge, metric: str, period: Dict) -> bool:
+        """该指标的小结能否生成：季度统计里有实际特征键。"""
+        try:
+            return bool(bridge._feature_for_metric(metric, period))
+        except Exception:  # noqa: BLE001
+            return False
 
     # ------------------------------------------------------------------
     # 缺图推断：按本节约应有的监测部位数 vs 实际图表数

@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-"""多桥注册表：六座桥 / 多台服务器的统一管理入口。
+"""多桥注册表：各独立桥梁服务器的统一管理入口。
 
 注册表文件：<项目根>/bridges/registry.json
+
+没有中心服务器：每座桥的原始监测数据只存储在该桥自己的服务器上（保密要求），
+本注册表仅记录“每台独立服务器上部署了哪座桥的报告智能体”，供 --bridge 快速切换。
 
 结构：
 {
@@ -11,7 +14,7 @@
       "name": "赤石大桥",
       "config": "config_chishi.json",            // 相对项目根或绝对路径
       "host": "222.242.152.65",                  // 部署该桥的服务器
-      "port": 8080,                              // 该服务器上 Web 服务端口
+      "port": 8456,                              // 该服务器上 Web 服务端口
       "token_env": "BRIDGE_CHISHI_TOKEN",        // 访问令牌的环境变量名
       "description": "赤石大桥健康监测"
     }
@@ -58,10 +61,46 @@ def list_bridges(registry_path: Optional[str] = None) -> List[Dict]:
 
 
 def get_bridge(bridge_id: str, registry_path: Optional[str] = None) -> Optional[Dict]:
+    # 精确匹配（id 或 name）优先
     for b in list_bridges(registry_path):
         if b.get("id") == bridge_id or b.get("name") == bridge_id:
             return b
+    # 模糊匹配：去掉“大桥/特大桥”后缀后按包含/前缀匹配
+    # （如 --bridge 洣水河特 -> 洣水河特大桥；mishui -> mishuihe）
+    q = _bridge_key(bridge_id)
+    if q:
+        for b in list_bridges(registry_path):
+            if _bridge_key(b.get("name")) == q:
+                return b
+        for b in list_bridges(registry_path):
+            if _bridge_fuzzy(q, b.get("name")):
+                return b
+        for b in list_bridges(registry_path):
+            if _bridge_fuzzy(q, b.get("id")):
+                return b
     return None
+
+
+def _bridge_key(s) -> str:
+    """桥名/ID 归一化：去空白、去“大桥/特大桥”后缀、转小写。"""
+    s = str(s or "").strip().lower()
+    for suffix in ("特大桥", "大桥"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    return s
+
+
+def _bridge_fuzzy(query: str, candidate) -> bool:
+    """桥名/ID 模糊匹配：子串/前后缀包含；query 或 candidate 太短时不匹配。"""
+    c = _bridge_key(candidate)
+    if not query or not c or len(query) < 2 or len(c) < 2:
+        return False
+    if query in c or c in query:
+        return True
+    # ID 前缀匹配（mishui -> mishuihe）
+    if len(query) >= 3 and (c.startswith(query) or query.startswith(c)):
+        return True
+    return False
 
 
 def resolve_bridge_config(bridge_id: str, registry_path: Optional[str] = None) -> Optional[str]:
