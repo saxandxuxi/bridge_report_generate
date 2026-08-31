@@ -58,6 +58,36 @@ def _side_set(s: str) -> set:
     return codes
 
 
+def _fmt_range_readable(s: str) -> str:
+    """把紧凑缺失时间段(4.1 0~4.8 14)转成可读形式(4.1日0点至4.8日14点)，
+    用于总结段落。已是可读形式/无法解析时原样返回。
+    兼容同月缩写与跨年带年份(2026.1.18 3~2027.1.19 5)两种存储格式。
+    """
+    t = str(s or "").strip()
+    if not t or ("日" in t and "点" in t):
+        return t
+    m = re.match(
+        r"^(?P<y1>\d{4})\.(?P<m1>\d{1,2})\.(?P<d1>\d{1,2}) "
+        r"(?P<h1>\d{1,2})[~～\-—–]"
+        r"(?P<y2>\d{4})\.(?P<m2>\d{1,2})\.(?P<d2>\d{1,2}) "
+        r"(?P<h2>\d{1,2})$", t)
+    if m:
+        return (f"{m.group('y1')}.{int(m.group('m1'))}.{int(m.group('d1'))}"
+                f"日{int(m.group('h1'))}点至"
+                f"{m.group('y2')}.{int(m.group('m2'))}.{int(m.group('d2'))}"
+                f"日{int(m.group('h2'))}点")
+    m = re.match(
+        r"^(?P<m1>\d{1,2})\.(?P<d1>\d{1,2}) (?P<h1>\d{1,2})"
+        r"[~～\-—–]"
+        r"(?P<m2>\d{1,2})\.(?P<d2>\d{1,2}) (?P<h2>\d{1,2})$", t)
+    if m:
+        return (f"{int(m.group('m1'))}.{int(m.group('d1'))}"
+                f"日{int(m.group('h1'))}点至"
+                f"{int(m.group('m2'))}.{int(m.group('d2'))}"
+                f"日{int(m.group('h2'))}点")
+    return t
+
+
 log = logging.getLogger("report-agent.bridge")
 
 
@@ -1917,7 +1947,8 @@ class BridgeData:
         cm_periods = gs.get("多数传感器缺失时间段") or []
         if cm_periods:
             prompts.append("多数传感器公共缺失时间段："
-                           + "、".join(cm_periods))
+                           + "、".join(_fmt_range_readable(x)
+                                       for x in cm_periods))
         if zero_pos:
             prompts.append("恒0/恒值疑似故障位置：" + _cap(zero_pos))
         if seg_pos:
@@ -1958,7 +1989,8 @@ class BridgeData:
         if missing_pos:
             special.append(missing_label + _cap(missing_pos))
         if cm_periods:
-            special.append("多数传感器在" + "、".join(cm_periods)
+            special.append("多数传感器在" + "、".join(
+                _fmt_range_readable(x) for x in cm_periods)
                            + "时间段内数据缺失")
         if not special:
             fallback = f"{label}监测数据整体正常，{head}。"
@@ -2239,7 +2271,8 @@ class BridgeData:
         cm_periods = gs_ax.get("多数传感器缺失时间段") or []
         if cm_periods:
             prompts.append("多数传感器公共缺失时间段："
-                           + "、".join(cm_periods))
+                           + "、".join(_fmt_range_readable(x)
+                                       for x in cm_periods))
         if zero_pos:
             prompts.append("恒0/恒值疑似故障位置：" + _cap(zero_pos))
         if seg_pos:
@@ -2263,7 +2296,8 @@ class BridgeData:
         if missing_pos:
             special.append(missing_label + _cap(missing_pos))
         if cm_periods:
-            special.append("多数传感器在" + "、".join(cm_periods)
+            special.append("多数传感器在" + "、".join(
+                _fmt_range_readable(x) for x in cm_periods)
                            + "时间段内数据缺失")
         head = "、".join(fallback_parts) if fallback_parts else "整体正常"
         if not special:
@@ -2629,7 +2663,9 @@ class BridgeData:
             return None
         t = _norm(title)
         direction = ""
-        for w in ("上游", "下游"):
+        # 标题里的方位词：左幅/右幅/左侧/右侧 与 上游/下游 都要认，
+        # 否则“右幅汝城侧边跨跨中截面…统计”会因方向为空串到左幅测点
+        for w in ("上游", "下游", "左幅", "右幅", "左侧", "右侧"):
             if w in t:
                 direction = w
                 break
@@ -2647,7 +2683,7 @@ class BridgeData:
                 part, point_no = m2.group(1), m2.group(2)
         # 完整位置里也可能带方位（上游/下游），从 column 提取方向补充
         if not direction:
-            for w in ("上游", "下游"):
+            for w in ("上游", "下游", "左幅", "右幅", "左侧", "右侧"):
                 if w in col:
                     direction = w
                     break
@@ -2660,8 +2696,8 @@ class BridgeData:
         # 标题基座：去掉 方向 / 应变监测统计 等，再取核心段。
         # 先去掉带“侧”的完整方位词（上游侧/下游侧），再处理裸方位，
         # 避免“上游侧”只去掉“上游”留下孤立“侧”污染核心段。
-        base = re.sub(r"(上游侧|下游侧)", "", title)
-        base = re.sub(r"(上游|下游)", "", base)
+        base = re.sub(r"(上游侧|下游侧|左幅|右幅|左侧|右侧)", "", title)
+        base = re.sub(r"(上游|下游|左幅|右幅|左|右)", "", base)
         base = re.sub(r"(结构)?(应变|振动).*$", "", base)
         base = base.replace("监测", "").replace("统计", "").strip()
         core = ""
@@ -2683,7 +2719,9 @@ class BridgeData:
             if alias:
                 sides = _side_set(pn)
                 if (direction == "上游" and "L" in sides) \
-                        or (direction == "下游" and "R" in sides):
+                        or (direction == "下游" and "R" in sides) \
+                        or (direction == "左幅" and "U" in sides) \
+                        or (direction == "右幅" and "D" in sides):
                     return True
             return False
 
@@ -3062,6 +3100,31 @@ class BridgeData:
                             # 传感器统计也无聚合统计时，整行填“—”，不再顺延
                             # 到同位置其他传感器——否则缺数/坏测点会串成
                             # 上一行同值（如 测点2 重复 测点1 的值）。
+                            if (self._pos_stats
+                                    and str(_primary) not in self._pos_stats
+                                    and re.search(
+                                        r"测点\s*\d+", str(column))):
+                                # 传感器不在位置统计库中（整季无数据，或逐
+                                # 传感器 JSON 残留旧版假值）：整行“—”，
+                                # 不回退到逐传感器 JSON / 聚合统计
+                                return None, {
+                                    "占位符": f"cell.{metric}.{column}.{stat}",
+                                    "结果": "未找到",
+                                    "原因": f"测点 {column} 对应传感器"
+                                            f"({_primary})不在位置统计库中"
+                                            f"(整季无数据)，整行填“—”",
+                                    "分支": "名称对照位置-按行取传感器"
+                                            "(位置统计库无此传感器)",
+                                    "监测部位": pos,
+                                    "表格标题": table_title,
+                                    "表格行号": row_index + 1,
+                                    "传感器": {
+                                        "传感器编号": _primary,
+                                        "监测部位": self._position_for_sensor(
+                                            _primary),
+                                        "特征": _feat,
+                                    },
+                                }
                             if _pf is None and re.search(
                                     r"测点\s*\d+", str(column)) and \
                                     self._aggregate_sensor_stat(
@@ -3707,7 +3770,7 @@ class BridgeData:
                         if score > best_score:
                             best_score = score
                             best = pos
-                if best and best_score >= 0.72:
+                if best and best_score >= 0.70:
                     return metric, best, kind, n
         return None
 
@@ -3899,11 +3962,22 @@ class BridgeData:
         else:
             metric_from_id = parsed[0] if parsed else None
             kind = parsed[1] if parsed else "trend"
+            # 位置化占位符的位置模糊匹配失败时（如 洣水河
+            # strain_左幅中跨1/2顶板_scatter_69），仍从原始 ID 提取图型，
+            # 避免 scatter/histogram 被当成 trend 去匹配时程图。
+            if kind == "trend":
+                _mk = re.search(
+                    r"_(?P<k>scatter|correlation|histogram|hist|"
+                    r"timeseries|time_series|trend)_\d+$",
+                    str(chart_id))
+                if _mk:
+                    kind = _mk.group("k")
         if kind not in CHART_KIND_FILE:
             if kind in ("scatter", "correlation"):
-                # 相关性散点图：图库没有对应图时返回 None（由上层生成占位图），
-                # 不要退化为时程图导致“散点图位置插入时程图”
-                return None
+                # 相关性散点图：图库/<监测部位>/相关性_<特征A>-<特征B>.png
+                return self._resolve_scatter_chart(
+                    sensor_id, metric_from_id, metric_hint,
+                    feature_hint, chart_id, caption)
             kind = "trend"
 
         # 优先：合并图库（图库/<监测部位>/<特征组>/<图型>.png）
@@ -3949,6 +4023,58 @@ class BridgeData:
             "sensor_id": sensor_id,
             "kind": kind,
             "display": self.display_name_for(sensor_id, chart_id, kind,
+                                              metric_for_label=display_metric),
+        }
+
+    def _resolve_scatter_chart(self, sensor_id: str, metric_from_id: str,
+                               metric_hint: str, feature_hint: str,
+                               chart_id: str, caption: str) -> Optional[Dict]:
+        """解析相关性散点图：图库/<监测部位>/相关性_<特征A>-<特征B>.png。
+
+        优先选包含该传感器特征（如 YB(rsg)）的相关图，避免多个相关性图
+        时取错；找不到对应图时返回 None（上层生成占位图）。
+        """
+        pos = self._position_for_sensor(sensor_id)
+        if not pos:
+            return None
+        base_dir = self._fuzzy_position_dir(pos)
+        if not os.path.isdir(base_dir):
+            return None
+        cands = sorted(f for f in os.listdir(base_dir)
+                       if f.startswith("相关性_") and f.endswith(".png"))
+        if not cands:
+            return None
+        feat = feature_hint or ""
+        if not feat:
+            for m in (metric_hint, metric_from_id):
+                if m and m in self.metrics:
+                    feat = self.metrics[m].get("feature", "") or ""
+                    if feat:
+                        break
+        feats = self._sensor_features.get(str(sensor_id), []) or []
+        pick = None
+        for c in cands:
+            if feat and feat in c:
+                pick = c
+                break
+        if pick is None:
+            for c in cands:
+                if any(f and f in c for f in feats):
+                    pick = c
+                    break
+        if pick is None:
+            pick = cands[0]
+        path = os.path.join(base_dir, pick)
+        if not os.path.isfile(path):
+            return None
+        display_metric = (metric_hint
+                          or self._metric_alias_hit(caption)
+                          or metric_from_id)
+        return {
+            "path": path,
+            "sensor_id": sensor_id,
+            "kind": "scatter",
+            "display": self.display_name_for(sensor_id, chart_id, "scatter",
                                               metric_for_label=display_metric),
         }
 

@@ -173,6 +173,24 @@ def click_by_text(page, text: str, timeout_ms: int = 15000):
     raise RuntimeError(f"找不到可点击元素: {text}")
 
 
+def click_by_text_exact(page, text: str, timeout_ms: int = 15000):
+    """按文本精确匹配点击（用于桥名等容易误匹配的场景，如 洞庭湖大桥 vs 洞庭湖大桥(G240)）。"""
+    for fr in iter_frames(page):
+        try:
+            loc = fr.get_by_text(text, exact=True).first
+            loc.wait_for(state="visible", timeout=timeout_ms)
+            loc.scroll_into_view_if_needed(timeout=5000)
+            loc.click(timeout=timeout_ms)
+            log(f"已点击(精确): {text}")
+            return loc
+        except PlaywrightTimeoutError:
+            continue
+        except Exception:
+            continue
+    dump_debug(page, f"click_exact_{text}")
+    raise RuntimeError(f"找不到精确文本元素: {text}")
+
+
 def wait_infra_frame(page, timeout_s: int = 30):
     """等待「基础设施监测」的 iframe 元素出现，返回可操作的 frame_locator。"""
     selector = "iframe[src*='7001']"
@@ -541,13 +559,13 @@ def download_chunk(page, start: str, end: str, out_dir: Path) -> bool:
 def navigate_to_lane_stats(page, bridge, timeout_s=60):
     """导航到指定桥的「车道统计」页（假设已进入旧平台页面）。"""
     try:
-        click_by_text(page, bridge, timeout_ms=8000)
+        click_by_text_exact(page, bridge, timeout_ms=8000)
     except RuntimeError:
         log(f"页面未见「{bridge}」，先点击「在线监测」进入桥列表...")
         click_by_text(page, "在线监测", timeout_ms=15000)
         time.sleep(3)
         close_modals(page)
-        click_by_text(page, bridge, timeout_ms=15000)
+        click_by_text_exact(page, bridge, timeout_ms=15000)
     time.sleep(2)
     nav_steps = ("在线监测", "作用监测", "车辆荷载", "车道统计")
     for i, step in enumerate(nav_steps):

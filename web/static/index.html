@@ -521,7 +521,16 @@ function loadCurrentBridge() {
     }
     var active = document.querySelector("nav button.active");
     if (active) showTab(active.dataset.tab);
+    if ($("runTraffic") && currentBridgeId()) checkTraffic();
   }).catch(function (e) { showMsg(String(e), "err"); });
+}
+
+function wirePeriodTraffic() {
+  // 周期/桥参数变化时自动刷新交通数据状态，让“下载交通数据”按钮及时出现
+  ["runMode", "runQuarter", "runYear", "runEnd", "runStart"].forEach(function (id) {
+    var el = $(id);
+    if (el) el.addEventListener("change", function () { if ($("runTraffic")) checkTraffic(); });
+  });
 }
 
 function onBridgeModeChange() {
@@ -808,6 +817,14 @@ function checkTraffic() {
     .then(function (r) {
       if (r.has_traffic === false) {
         $("trafficInfo").textContent = "该桥无交通荷载数据";
+        $("trafficDownloadBtn").style.display = "none";
+        return;
+      }
+      if (r.download_ready === false) {
+        $("trafficInfo").innerHTML =
+          '<span class="err">交通荷载数据不齐全，且当前 web 环境缺少 playwright（'
+          + esc(r.download_python || "python") + '）。请用装有 playwright 的 python '
+          + "启动 web（如 .venv_web），或先手动在命令行运行下载。</span>";
         $("trafficDownloadBtn").style.display = "none";
         return;
       }
@@ -1471,8 +1488,9 @@ api("/api/status").then(function (st) {
   $("modeBadge").textContent = "独立桥服务器模式";
   $("authBadge").textContent = st.auth_required ? "已启用令牌鉴权" : "未鉴权（本机）";
   $("tokenInput").value = token();
+  wirePeriodTraffic();
   loadCurrentBridge();
-}).catch(function () { loadCurrentBridge(); });
+}).catch(function () { wirePeriodTraffic(); loadCurrentBridge(); });
 </script>
 <div id="pvMask" class="modal-mask">
   <div class="modal">

@@ -908,11 +908,15 @@ def compute_feature_stats(dates, means, maxs, mins, seconds=None,
     return stats, dates, means, maxs, mins
 
 
-def _temp_effect_stats(strain_hours, strain_means, temp_hours, temp_means):
+def _temp_effect_stats(strain_hours, strain_means, strain_maxs, strain_mins,
+                       temp_hours, temp_means):
     """应变-温度联合统计：按小时对齐做线性回归，
     计算 剔除温度后的应变最大值/最小值 与 Pearson 相关系数。
 
     温度必须用清洗后的小时序列（与结构温度曲线图一致），不用原始序列；
+    剔除温度最大值 = max(清洗后 小时最大序列 - (a·T+b))，
+    剔除温度最小值 = min(清洗后 小时最小序列 - (a·T+b))，
+    与其他特征“极值取清洗后最大/最小序列”的口径一致。
     统计库“相关性系数”存 Pearson 相关系数 r；
     散点图（相关性_<特征A>-<特征B>.png）单独标注回归斜率 a（με/℃）。
     返回 dict 或 None(数据不足)。"""
@@ -934,14 +938,31 @@ def _temp_effect_stats(strain_hours, strain_means, temp_hours, temp_means):
         slope, intercept = np.polyfit(xa, ya, 1)
     except Exception:  # noqa: BLE001
         return None
-    resid = ya - (slope * xa + intercept)   # 剔除温度效应后的应变(荷载应变)
-    if resid.size < 2 or float(np.std(xa)) == 0:
+    # 残差(荷载应变) = 应变 - (a·T+b)；极值按 最大/最小 序列分别计算
+    if strain_maxs is not None and strain_mins is not None:
+        resid_max, resid_min = [], []
+        for j, h in enumerate(temp_hours):
+            i = si.get(h)
+            if i is None:
+                continue
+            fitted = slope * float(temp_means[j]) + intercept
+            resid_max.append(float(strain_maxs[i]) - fitted)
+            resid_min.append(float(strain_mins[i]) - fitted)
+        rm_max = max(resid_max) if resid_max else None
+        rm_min = min(resid_min) if resid_min else None
+    else:
+        resid = ya - (slope * xa + intercept)   # 均值残差（兼容无 max/min）
+        rm_max = float(np.max(resid))
+        rm_min = float(np.min(resid))
+    if rm_max is None or rm_min is None:
+        return None
+    if float(np.std(xa)) == 0:
         corr = 0.0
     else:
         corr = float(np.corrcoef(xa, ya)[0, 1])
     return {
-        "剔除温度最大值": round(float(np.max(resid)), 6),
-        "剔除温度最小值": round(float(np.min(resid)), 6),
+        "剔除温度最大值": round(float(rm_max), 6),
+        "剔除温度最小值": round(float(rm_min), 6),
         "相关性系数": round(corr, 6),
     }
 
@@ -955,6 +976,12 @@ def _norm_strain_temp_pos(name):
               "左侧", "右侧"):
         s = s.replace(w, "")
     return re.sub(r"\s+", "", s)
+
+
+# 应变“剔除温度后”荷载应变叠加线的颜色（绿色实线，与主曲线的彩色
+# 实线区分；叠加线自身的尖峰/异常标记统一用黑色，不用红色/品红）
+LOAD_STRAIN_OVERLAY_COLOR = "#00b050"
+LOAD_STRAIN_OVERLAY_MARK_COLOR = "#000000"
 
 
 # 允许“应变-温度跨方位配对”的大桥：编号文件里应变用 左幅/右幅、
@@ -2135,6 +2162,8 @@ _LEGEND_ANNO_PRIORITY = {
     "长时间偏低": 0,
     "已替换尖峰(统计)": 1,
     "已剔除异常值(范围外)": 1,
+    "剔除温度后-已替换尖峰(统计)": 1,
+    "剔除温度后-已剔除异常值(范围外)": 1,
     "数据缺失(已插值填充)": 2,
     "可能故障(恒0超过24h)": 3,
 }
@@ -2276,6 +2305,33 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                 day_date = ""
             ax.plot(xs, plot_means, "-", linewidth=1.3,
                     color=colors[i % len(colors)], label=plot_label)
+            # 应变组：同一子图上叠加“剔除温度后”荷载应变折线
+            # （不新增子图，共用坐标轴；与统计库 _temp_effect_stats 同口径）
+            for _ov in (s.get("load_overlays") or []):
+                _ov_hours, _ov_means, _ov_label = _ov[:3]
+                if day_mode:
+                    _ov_xs = [
+                        (_t - t0).total_seconds() / 3600.0
+                        for _t in _ov_hours]
+                else:
+                    _ov_xs = _ov_hours
+                ax.plot(_ov_xs, _ov_means, "-", linewidth=1.4,
+                        color=LOAD_STRAIN_OVERLAY_COLOR, label=_ov_label)
+                # 叠加线自身的尖峰/异常：单独标记（主线的缺失/故障/突变段
+                # 不重复，因为叠加线由原应变计算而来）
+                if len(_ov) >= 5:
+                    _ov_xmap = dict(zip(_ov_hours, _ov_xs))
+                    _ov_spike, _ov_range = _ov[3], _ov[4]
+                    if _ov_spike:
+                        ax.plot([_ov_xmap[p[0]] for p in _ov_spike],
+                                [p[1] for p in _ov_spike],
+                                "x", color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                markersize=9, mew=2.2, zorder=6)
+                    if _ov_range:
+                        ax.plot([_ov_xmap[p[0]] for p in _ov_range],
+                                [p[1] for p in _ov_range],
+                                "D", color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                markersize=6, mew=1.6, zorder=6)
             for g in s["gaps"]:
                 try:
                     t0 = dt.datetime.strptime(g["起始时间"], "%Y-%m-%d %H:%M")
@@ -2402,6 +2458,16 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                     plt.Line2D([], [], marker="x", color="#d62728",
                                linestyle="None", markersize=8, mew=1.8)]
         labels += ["已替换尖峰(统计)", "已剔除异常值(范围外)"]
+        if any(len(ov) >= 5 and (ov[3] or ov[4])
+               for ss in sub for ov in (ss.get("load_overlays") or [])):
+            handles += [plt.Line2D([], [], marker="x",
+                                   color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                   linestyle="None", markersize=7, mew=1.8),
+                        plt.Line2D([], [], marker="D",
+                                   color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                   linestyle="None", markersize=6, mew=1.6)]
+            labels += ["剔除温度后-已替换尖峰(统计)",
+                       "剔除温度后-已剔除异常值(范围外)"]
         if any_gap:
             handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#ff7f0e",
                                          alpha=0.35))
@@ -2529,14 +2595,14 @@ def _plot_group_histogram_chunk(position, group, series, out_path, dpi=200,
     n = len(series)
     if n == 0:
         return
-    # 2/3 个子图一律单列竖排(两行/三行一列)，4 个以上两列网格，
-    # 1 个即主图；子图占满整幅宽度，避免列数多导致挤压
-    cols = 1 if n <= 3 else 2
+    # 子图缩小并横向排列：每行最多 3 个（≤3 个测点单行横排），
+    # 面板约 5.0×3.2，整体更紧凑，便于报告排版
+    cols = min(n, 3)
     rows = (n + cols - 1) // cols
-    row_h = 4.6 if n <= 3 else 3.8
+    panel_w, panel_h = 5.0, 3.2
     fig, axes = plt.subplots(
         rows, cols,
-        figsize=((7.5, row_h * rows) if n <= 3 else (7.5 * cols, 3.8 * rows)))
+        figsize=(panel_w * cols, panel_h * rows + 1.0))
     axes = np.array(axes).reshape(-1)
     colors = plt.cm.tab10.colors + plt.cm.Set2.colors
     for i, s in enumerate(series):
@@ -2589,13 +2655,14 @@ def _plot_group_histogram_from_counts_chunk(position, group, hist_acc,
     if not keys:
         return
     n = len(keys)
-    # 2/3 个子图一律单列竖排，4 个以上两列网格，1 个即主图
-    cols = 1 if n <= 3 else 2
+    # 子图缩小并横向排列：每行最多 3 个（≤3 个测点单行横排），
+    # 面板约 5.0×3.2，整体更紧凑，便于报告排版
+    cols = min(n, 3)
     rows = (n + cols - 1) // cols
-    row_h = 4.6 if n <= 3 else 3.8
+    panel_w, panel_h = 5.0, 3.2
     fig, axes = plt.subplots(
         rows, cols,
-        figsize=((7.5, row_h * rows) if n <= 3 else (7.5 * cols, 3.8 * rows)),
+        figsize=(panel_w * cols, panel_h * rows + 1.0),
         squeeze=False)
     axes = np.array(axes).reshape(-1)
     centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
@@ -3054,7 +3121,7 @@ def main():
     pos_stats = {}   # 位置 -> 传感器编号 -> 特征 -> {统计, 每日统计}
     pos_sensor_order = {}   # 位置 -> 传感器编号列表(按首次出现顺序)
     pos_daily = {}   # 位置 -> 传感器编号 -> 特征 -> (dates, means) 用于应变-温度联合统计
-    _corr_hourly = {}   # (传感器, 特征) -> (hours, 清洗后means) 用于应变-温度回归
+    _corr_hourly = {}   # (传感器, 特征) -> (hours, 清洗后means/maxs/mins)
     _feature_hour_cov = {}   # 特征 -> {sensors:set, covered:{小时:覆盖传感器数}}
                              # 用于“多数传感器公共缺失时间段”统计
     # 只出合并图(--skip-per-sensor --skip-stats)时，逐传感器统计计算与出图
@@ -3314,11 +3381,6 @@ def main():
                     max_spikes=args.max_spikes, dist_k=args.dist_k,
                     max_dist_outliers=args.max_dist_outliers,
                     max_total_removals=args.max_removals)
-                # 缓存清洗后小时序列供 应变-温度回归 使用
-                # （与结构温度曲线图同一套清洗，不用原始序列）
-                if actual_feature in ("YB(rsg)", "WD(temp)", "WSD(temp)"):
-                    _corr_hourly[(str(sensor), actual_feature)] = (
-                        list(hours), list(hmeans))
                 hmaxs, r2, ix2, rx2 = clean_series_value(
                     hours, hmaxs, "小时最大值", spike_k,
                     hour_level=True, vrange=vrange,
@@ -3331,6 +3393,12 @@ def main():
                     max_spikes=args.max_spikes, dist_k=args.dist_k,
                     max_dist_outliers=args.max_dist_outliers,
                     max_total_removals=args.max_removals)
+                # 缓存清洗后小时序列（均值/最大/最小）供 应变-温度回归/绘图
+                # 使用（与结构温度曲线图同一套清洗，不用原始序列）
+                if actual_feature in ("YB(rsg)", "WD(temp)", "WSD(temp)"):
+                    _corr_hourly[(str(sensor), actual_feature)] = (
+                        list(hours), list(hmeans),
+                        list(hmaxs), list(hmins))
                 spike_rec = r1 + r2 + r3
                 # 图上只标均值序列的剔除点；最大/最小序列的清洗记录仍写入 JSON
                 spike_idx = sorted(ix1)
@@ -3546,7 +3614,8 @@ def main():
             temp_entries = pf[temp_keys[0]]   # [(sid, dates, means)]
 
             def _series(sid, feat):
-                return _corr_hourly.get((str(sid), feat), ([], []))
+                return _corr_hourly.get(
+                    (str(sid), feat), ([], [], [], []))
 
             def _is_flat(means):
                 return (not means) or (max(means) - min(means)) <= 1e-9
@@ -3573,10 +3642,13 @@ def main():
                     _t_sid = _first_good_temp(temp_entries)
                 if not _t_sid:
                     continue
-                s_hours, s_means = _series(s_sid, "YB(rsg)")
-                t_hours, t_means = _series(_t_sid, temp_keys[0])
-                te = _temp_effect_stats(s_hours, s_means,
-                                        t_hours, t_means)
+                s_hours, s_means, s_maxs, s_mins = _series(
+                    s_sid, "YB(rsg)")
+                t_hours, t_means, _t_maxs, _t_mins = _series(
+                    _t_sid, temp_keys[0])
+                te = _temp_effect_stats(
+                    s_hours, s_means, s_maxs, s_mins,
+                    t_hours, t_means)
                 if not te:
                     continue
                 rec = pos_stats.get(pos_name, {}).get(str(s_sid), {}).get(
@@ -3824,45 +3896,79 @@ def main():
             merged_fail = 0
 
             def _append_load_strain(series, pos):
-                """给应变组时间序列图追加“剔除温度后的荷载应变”子图。
+                """给应变组时间序列图叠加“剔除温度后的荷载应变”折线。
 
                 对每个应变测点：用配对的温度传感器（同位置测点N↔测点N，
                 洣水河等跨方位 左幅↔上游/右幅↔下游）做线性回归
                 ε=a·T+b，荷载应变 ε_load = ε − (a·T+b)，与应变序列画在
-                同一张画布上。回归用的温度/应变都是清洗后小时序列
-                （与统计库 _temp_effect_stats 同口径）。
+                同一子图、同一坐标轴上（不新增子图），颜色明显区分。
+                回归用的温度/应变都是清洗后小时序列（与统计库
+                _temp_effect_stats 同口径）。
                 """
                 if "YB(rsg)" not in {s.get("feature") for s in series}:
                     return
-                temp_list = []   # [(sid, feat, hours, means)]
-                for _sid, _feats in (pos_daily.get(pos) or {}).items():
-                    for _f in ("WD(temp)", "WSD(temp)"):
-                        if _f in _feats:
-                            _th, _tm = _corr_hourly.get(
-                                (str(_sid), _f), ([], []))
-                            if _th:
-                                temp_list.append(
-                                    (str(_sid), _f, _th, _tm))
-                            break
+
+                def _temp_series(_sid, _feat):
+                    """取清洗后温度小时序列 (hours, means)：优先用统计循环
+                    缓存(未插值)，否则直接从 daily 读取(与图库同一套清洗)。
+                    """
+                    _c = _corr_hourly.get((str(_sid), _feat))
+                    if _c:
+                        return _c[0], _c[1]
+                    _th, _tm, _sp, _rg, _gp, _rc, _sh = \
+                        read_clean_hourly_means(
+                            args.daily_root, str(_sid), _feat,
+                            args.start, args.end,
+                            args.spike_threshold, args.max_spikes,
+                            args.gap_fill_hours, args.shift_min_days,
+                            args.shift_threshold, args.dist_k,
+                            args.max_dist_outliers, args.max_shifts,
+                            args.max_removals)
+                    return _th, _tm
+
+                def _temp_at_pos(_p):
+                    """返回 _p 位置可用的温度序列 [(sid, feat, hours, means)]。
+                    只出图模式(--skip-stats)时 pos_daily/_corr_hourly 为空，
+                    改按 位置-传感器映射(pos_map) + daily 直接读取。
+                    """
+                    out = []
+                    seen = set()
+                    for _sid, _feats in (pos_daily.get(_p) or {}).items():
+                        for _f in ("WD(temp)", "WSD(temp)"):
+                            if _f in _feats:
+                                _th, _tm = _temp_series(_sid, _f)
+                                if _th and (str(_sid), _f) not in seen:
+                                    out.append(
+                                        (str(_sid), _f, _th, _tm))
+                                    seen.add((str(_sid), _f))
+                                break
+                    if out:
+                        return out
+                    for _sid, _f in (pos_map.get(_p) or []):
+                        if _f not in ("WD(temp)", "WSD(temp)"):
+                            continue
+                        _af = sensor_feats.get(str(_sid)) or []
+                        _actual = next(
+                            (x for x in _af
+                             if x in ("WD(temp)", "WSD(temp)")), _f)
+                        _th, _tm = _temp_series(_sid, _actual)
+                        if _th and (str(_sid), _actual) not in seen:
+                            out.append((str(_sid), _actual, _th, _tm))
+                            seen.add((str(_sid), _actual))
+                    return out
+
+                temp_list = _temp_at_pos(pos)
                 if not temp_list:
                     # 洣水河跨方位：应变 左幅/右幅 ↔ 温度 上游/下游
                     _want = ("下游" if ("右幅" in pos or "右侧" in pos)
                              else "上游")
                     _core = _norm_strain_temp_pos(pos)
-                    for _p in sorted(pos_daily):
+                    for _p in sorted(set(pos_daily) | set(pos_map)):
                         if _p == pos or _norm_strain_temp_pos(_p) != _core:
                             continue
                         if _want and _want not in _p:
                             continue
-                        for _sid, _feats in (pos_daily.get(_p) or {}).items():
-                            for _f in ("WD(temp)", "WSD(temp)"):
-                                if _f in _feats:
-                                    _th, _tm = _corr_hourly.get(
-                                        (str(_sid), _f), ([], []))
-                                    if _th:
-                                        temp_list.append(
-                                            (str(_sid), _f, _th, _tm))
-                                    break
+                        temp_list = _temp_at_pos(_p)
                         if temp_list:
                             break
                 if not temp_list:
@@ -3872,8 +3978,14 @@ def main():
                         continue
                     _t = temp_list[i] if i < len(temp_list) else temp_list[0]
                     _tsid, _tfeat, _th, _tm = _t
-                    _s_h, _s_m = _corr_hourly.get(
-                        (str(s.get("sensor")), "YB(rsg)"), ([], []))
+                    _s_c = _corr_hourly.get(
+                        (str(s.get("sensor")), "YB(rsg)"))
+                    if _s_c:
+                        _s_h, _s_m = _s_c[0], _s_c[1]
+                    else:
+                        # 只出图模式：用合并序列(已清洗)做回归
+                        _s_h = s.get("hours", [])
+                        _s_m = s.get("means", [])
                     if not _s_h or not _th:
                         continue
                     _si = {}
@@ -3902,15 +4014,26 @@ def main():
                             _rh.append(_hh)
                     if not _rh:
                         continue
-                    series.append({
-                        "label": f"剔除温度后-{s.get('sensor')}",
-                        "feature": "YB(rsg)",
-                        "sensor": f"剔除温度后-{s.get('sensor')}",
-                        "hours": _rh, "means": _rm,
-                        "spike_pts": [], "range_pts": [],
-                        "gaps": s.get("gaps", []), "records": [],
-                        "shifts": [],
-                    })
+                    # 叠加线自身的尖峰/异常：对“剔除温度后”荷载应变均值序列
+                    # 用与主序列相同的参数再做一遍清洗（仅用于图上显示与
+                    # 标记；统计口径仍是 原始 max/min/mean 清洗后 序列，
+                    # 见 _temp_effect_stats）。缺失/故障/突变段不重复标注，
+                    # 因为叠加线由原应变计算而来，主线的标注已覆盖。
+                    _ov_k = (0 if _is_direction_feature("YB(rsg)")
+                             else args.spike_threshold)
+                    _rm_clean, _recs2, _ix2, _rx2 = clean_series_value(
+                        _rh, _rm, f"剔除温度后-{s.get('sensor')}",
+                        _ov_k, hour_level=True,
+                        vrange=feature_range("YB(rsg)"),
+                        max_spikes=args.max_spikes, dist_k=args.dist_k,
+                        max_dist_outliers=args.max_dist_outliers,
+                        max_total_removals=args.max_removals)
+                    s["load_overlays"] = [(
+                        _rh, _rm_clean,
+                        f"剔除温度后-{s.get('sensor')}",
+                        [(_rh[i], _rm_clean[i]) for i in _ix2],
+                        [(_rh[i], _rm_clean[i]) for i in _rx2],
+                    )]
 
             for pos, pairs in sorted(pos_map.items()):
                 if allowed is not None:
@@ -3991,7 +4114,8 @@ def main():
                             continue
                         pos_series.extend(series)
                         os.makedirs(out_dir, exist_ok=True)
-                        # 应变组：追加“剔除温度后的荷载应变”子图到时间序列图
+                        # 应变组：在时间序列图上叠加“剔除温度后的荷载应变”
+                        # 折线（同一子图、同一坐标轴，不新增子图）
                         series_ts = list(series)
                         if g == "YB(rsg)":
                             _append_load_strain(series_ts, pos)
@@ -4039,6 +4163,45 @@ def main():
                     except Exception as exc:  # noqa: BLE001
                         issues.append(f"相关性图错误: {pos}: {exc}")
                         print(f"[警告] 相关性图失败 {pos}: {exc}", flush=True)
+                elif any(s["feature"] == "YB(rsg)" for s in pos_series):
+                    # 洣水河等跨方位：应变 左幅/右幅 ↔ 温度 上游/下游。
+                    # 该位置只有应变时，找配对温度位置（去方位核心一致 +
+                    # 方位对应）的温度序列并入，生成相关性散点图，放在
+                    # 应变方位文件夹下（图库/<应变位置>/相关性_<A>-<B>.png）。
+                    _want = ""
+                    if "右幅" in pos or "右侧" in pos:
+                        _want = "下游"
+                    elif "左幅" in pos or "左侧" in pos:
+                        _want = "上游"
+                    _core = _norm_strain_temp_pos(pos)
+                    for _p in sorted(pos_map):
+                        if _p == pos or _norm_strain_temp_pos(_p) != _core:
+                            continue
+                        if _want and _want not in _p:
+                            continue
+                        _t_pairs = [(s, f) for s, f in pos_map[_p]
+                                    if f in ("WD(temp)", "WSD(temp)")]
+                        if not _t_pairs:
+                            continue
+                        _ts = _build_merged_series(
+                            args.daily_root, _t_pairs, args.start, args.end,
+                            args.spike_threshold, args.max_spikes,
+                            args.gap_fill_hours, args.shift_min_days,
+                            args.shift_threshold, args.dist_k,
+                            args.max_dist_outliers, args.max_shifts,
+                            args.max_removals)
+                        if not _ts:
+                            continue
+                        try:
+                            plot_position_correlation(
+                                pos, list(pos_series) + _ts,
+                                os.path.join(chart_dir, _safe_dirname(pos)),
+                                dpi=args.dpi)
+                        except Exception as exc:  # noqa: BLE001
+                            issues.append(f"相关性图错误: {pos}: {exc}")
+                            print(f"[警告] 相关性图失败 {pos}: {exc}",
+                                  flush=True)
+                        break
             print(f"合并图库完成: 成功 {merged_ok} 组，失败 {merged_fail} 组")
 
     # 失败/数据不足记录（--skip-charts 时写到统计值目录，图库目录不存在）

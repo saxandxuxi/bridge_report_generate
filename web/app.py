@@ -89,6 +89,62 @@ _schedulers: Dict[str, Dict] = {}
 TRAFFIC_BRIDGES = {"赤石大桥", "矮寨大桥", "洞庭湖大桥"}
 _TRAFFIC_FILE_RE = re.compile(
     r"车道统计_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.xls$")
+_download_python_cache = None
+_download_env_ok_cache = None
+
+
+def _pick_download_python() -> str:
+    """找一个装了 playwright 的 python 用于交通数据下载。
+
+    download_monitor_data.py 依赖 playwright；web 可能由 bridge 环境或
+    其它 python 启动，直接用 sys.executable 可能没有 playwright 导致
+    下载静默失败。这里按优先级探测常见环境，命中即缓存。
+    """
+    global _download_python_cache
+    if _download_python_cache:
+        return _download_python_cache
+    cands = [sys.executable]
+    for p in (
+        os.path.join(ROOT, ".venv_web", "Scripts", "python.exe"),
+        r"C:\ProgramData\miniconda3\envs\bridge\python.exe",
+        r"C:\ProgramData\anaconda3\envs\bridge\python.exe",
+        r"D:\ProgramData\anaconda3\envs\bridge\python.exe",
+    ):
+        if p not in cands:
+            cands.append(p)
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for p in cands:
+        if not p or not os.path.isfile(p):
+            continue
+        try:
+            r = subprocess.run(
+                [p, "-c", "import playwright"], capture_output=True,
+                timeout=20, creationflags=flags)
+            if r.returncode == 0:
+                _download_python_cache = p
+                return p
+        except Exception:  # noqa: BLE001
+            continue
+    _download_python_cache = sys.executable
+    return sys.executable
+
+
+def _download_env_ok() -> bool:
+    """下载子进程所用 python 是否真的装了 playwright。"""
+    global _download_env_ok_cache
+    if _download_env_ok_cache is not None:
+        return _download_env_ok_cache
+    p = _pick_download_python()
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        r = subprocess.run(
+            [p, "-c", "import playwright"], capture_output=True,
+            timeout=20, creationflags=flags)
+        _download_env_ok_cache = (r.returncode == 0)
+        return _download_env_ok_cache
+    except Exception:  # noqa: BLE001
+        _download_env_ok_cache = False
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1812,6 +1868,8 @@ def api_bridge_traffic_status(bridge_id):
     st = _traffic_raw_status(bridge, period)
     st["daily_ready"] = _traffic_daily_ready(bridge, period)
     st["bridge"] = bridge
+    st["download_ready"] = _download_env_ok()
+    st["download_python"] = _pick_download_python()
     return jsonify(st)
 
 
@@ -1848,6 +1906,7 @@ def api_bridge_traffic_download(bridge_id):
         return jsonify({"error": "交通数据下载任务已在运行"}), 409
     # 每个季度一次：年度报告自动依次下载 Q1~Q4（需开 VPN + 手动验证码）
     cmds = []
+    py = _pick_download_python()
     for q in qs:
         year, qn = int(q[:4]), int(q[-1])
         ms = (qn - 1) * 3 + 1
@@ -1856,7 +1915,7 @@ def api_bridge_traffic_download(bridge_id):
         e2 = dt.date(year, me,
                      calendar.monthrange(year, me)[1]).isoformat()
         cmds.append([
-            sys.executable,
+            py,
             os.path.join(ROOT, "download_monitor_data.py"),
             "--bridges", bridge, "--start", s2, "--end", e2,
         ])
@@ -2035,25 +2094,10 @@ def api_bridge_run(bridge_id):
                             bridge=bridge_name,
                             skip_preprocess=False,
                             period_mode=mode)
-                    elif daily_ready and charts_ok and not stats_ok:
-                        # 有图库没统计库：只补对应时间的统计值
-                        log.info("图库已存在、统计库缺失，只重建统计值")
-                        rc = _run_pipeline(
-                            period, charts_dir, stats_dir, st,
-                            bridge=bridge_name,
-                            skip_preprocess=True,
-                            period_mode=mode,
-                            stats_only=True)
-                    elif daily_ready and stats_ok and not charts_ok:
-                        # 有统计库没图库：只补对应时间的图库
-                        log.info("统计库已存在、图库缺失，只重建图库")
-                        rc = _run_pipeline(
-                            period, charts_dir, stats_dir, st,
-                            bridge=bridge_name,
-                            skip_preprocess=True,
-                            period_mode=mode,
-                            charts_only=True)
                     else:
+                        # 图库或统计库任一缺失都跑完整 pipeline：
+                        # 图库+统计值+季度/年度总结一起重建，避免“只出图库”
+                        # 导致 季度总结/公共缺失时间段 缺失、结论段为空。
                         rc = _run_pipeline(
                             period, charts_dir, stats_dir, st,
                             bridge=bridge_name,

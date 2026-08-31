@@ -1,7 +1,7 @@
 {
-  "template": "templates/洣水河特大桥_template_v2.docx",
+  "template": "templates/洣水河特大桥_template_v1.docx",
   "output_dir": "outputs/reports",
-  "source_report": "inputs/湘江特大桥.docx",
+  "source_report": "inputs/洣水河特大桥.docx",
   "bridge_data": {
     "enabled": true,
     "bridge_name": "洣水河特大桥",
@@ -132,6 +132,6 @@
     "weekly_days": 7,
     "monthly_days": 30
   },
-  "analysis_file": "outputs/analysis/analysis_湘江特大桥.json",
+  "analysis_file": "outputs/analysis/analysis_洣水河特大桥.json",
   "data": {}
 }

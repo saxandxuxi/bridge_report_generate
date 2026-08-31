@@ -2157,7 +2157,7 @@ def _position_from_title(title: str) -> str:
               "挠度监测", "位移监测", "倾角监测", "裂缝监测", "索力监测",
               "风速风向监测", "风速监测", "支座位移监测", "交通监测",
               "空间变位监测", "空间变位", "变位监测", "变位",
-              "地震监测", "振动监测", "应力监测", "承台监测",
+              "地震监测", "振动监测", "振动", "地震", "应力监测", "承台监测",
               "振动的", "位移的", "温度的", "湿度的", "挠度的", "应变的",
               "时程曲线图", "频率分布直方图", "相关性散点图", "散点图",
               "曲线图", "直方图", "如下图所示", "时程",
@@ -2351,27 +2351,9 @@ def _expand_chart_blocks(analysis: dict, cell_ref_paras: Dict[int, tuple],
         block_paras = sorted(block_paras)
 
         if locations:
-            # 标题回推单位置：每个占位行（含“第2组”等额外行）都保留并带上位置，
-            # 而不是折叠成“位置×图型”后丢掉多余的占位行
-            if title_fallback and len(locations) == 1:
-                loc0 = locations[0]
-                for c in block:
-                    counter[metric] = counter.get(metric, 0) + 1
-                    k = ("trend" if c.get("kind") in ("time_series", "trend", "curve")
-                         else "histogram")
-                    uid = f"{metric}_{loc0}_{k}_{counter[metric]}"
-                    targets[c["paragraph"]] = f"{{{{chart.{uid}}}}}"
-                    new_entries.append({
-                        "paragraph": c.get("paragraph"),
-                        "kind": k,
-                        "chart_id": "trend" if k == "trend" else "histogram",
-                        "metric": metric,
-                        "text": c.get("text", ""),
-                        "source": "expanded_block",
-                        "_unique_chart_id": uid,
-                        "location": loc0,
-                    })
-                continue
+            # 同位置多个传感器/占位行（如 振动节 417/422/452/454 四张传感器
+            # 图注）在合并图库里是同一张多子图，只生成一个占位符
+            # （位置×图型各一张），不再每个占位行一张，避免重复插入同一张图。
             markers = []
             meta = []
             for loc in locations:
@@ -2389,7 +2371,15 @@ def _expand_chart_blocks(analysis: dict, cell_ref_paras: Dict[int, tuple],
                     # 插入段落没有独立段落索引，用锚点段落（块内最后一段），
                     # 保证运行时按节聚类时这些图表归入同一节，避免被误判为缺图重复补图
                     meta[i]["paragraph"] = block_paras[-1]
+            # 相关性散点图图题段由后面的 scatter 逻辑单独处理，折叠时不能删
+            _scatter_paras = {
+                ct["paragraph"] for ct in cts
+                if ct.get("source") == "bare_caption"
+                and "相关性散点图" in str(ct.get("text") or "")
+                and isinstance(ct.get("paragraph"), int)}
             for p in block_paras[len(markers):]:
+                if p in _scatter_paras:
+                    continue
                 removed.add(p)
             for m in meta:
                 new_entries.append({
@@ -2442,20 +2432,55 @@ def _expand_chart_blocks(analysis: dict, cell_ref_paras: Dict[int, tuple],
                         break
         if not pos:
             continue
-        # 顶板/底板/左幅/右幅等是同一特征下的监测位置，不是不同的特征变量：
-        # 位置之间没有相关性可画（如 应变监测节 顶板/底板 不生成 应变-温度 散点图），
-        # 只有当同一位置有两个特征变量（如 温度-湿度）时才需要相关性图
-        if any(w in pos for w in ("顶板", "底板", "左幅", "右幅", "腹板", "翼板", "侧板")):
+        # 图题明确给出“特征A-特征B 相关性”（如 结构应变-温度、温度-湿度）
+        # 时，是同一位置两个特征变量之间的相关性，必须生成散点图占位符；
+        # 仅当图题没有特征对、且位置带 顶板/底板/左幅/右幅 等部位词时，
+        # 才视为“不同位置无相关性可画”而跳过。
+        _is_pair = bool(re.search(
+            r"(应变|温度|湿度|位移|挠度|索力|倾角|裂缝|风速|风向|振动|地震)"
+            r"[\-—]"
+            r"(应变|温度|湿度|位移|挠度|索力|倾角|裂缝|风速|风向|振动|地震)",
+            cap))
+        if (not _is_pair
+                and any(w in pos for w in ("顶板", "底板", "左幅", "右幅",
+                                           "腹板", "翼板", "侧板"))):
             continue
         metric = _metric_from_chart_text(cap) or "chart"
-        counter[metric] = counter.get(metric, 0) + 1
-        uid = f"{metric}_{pos}_scatter_{counter[metric]}"
-        targets[p] = f"{{{{chart.{uid}}}}}"
-        new_entries.append({
-            "paragraph": p, "kind": "scatter", "chart_id": "scatter",
-            "metric": metric, "text": cap, "source": "expanded_scatter",
-            "_unique_chart_id": uid, "location": pos,
-        })
+        # 同节内 trend/histogram 已有多个部位变体（顶板/底板/腹板/翼板…）时，
+        # 散点图也按相同部位各生成一张（如 应变节 顶板+底板 各一张
+        # 应变-温度散点图），与其它图型占位符一致。
+        _part_words = ("顶板", "底板", "腹板", "翼板", "侧板")
+        _norm_self = _norm(pos).replace("截面", "")
+        _part_self = next((w for w in _part_words if w in _norm_self), "")
+        _sc_positions = [pos]
+        if _part_self:
+            _rest = _norm_self.replace(_part_self, "", 1)
+            # 部位词以图题自带的那个为基准，不再重复加同部位变体
+            _seen_parts = {_part_self}
+            for _e in new_entries:
+                _loc = str(_e.get("location") or "")
+                if not _loc or str(_e.get("kind")) == "scatter":
+                    continue
+                _nl = _norm(_loc).replace("截面", "")
+                _pl = next((w for w in _part_words if w in _nl), "")
+                if not _pl or _pl in _seen_parts:
+                    continue
+                if _nl.replace(_pl, "", 1) != _rest:
+                    continue
+                _seen_parts.add(_pl)
+                _sc_positions.append(_loc)
+        for _si, _pp in enumerate(_sc_positions):
+            counter[metric] = counter.get(metric, 0) + 1
+            uid = f"{metric}_{_pp}_scatter_{counter[metric]}"
+            if _si == 0:
+                targets[p] = f"{{{{chart.{uid}}}}}"
+            else:
+                inserts.setdefault(p, []).append(f"{{{{chart.{uid}}}}}")
+            new_entries.append({
+                "paragraph": p, "kind": "scatter", "chart_id": "scatter",
+                "metric": metric, "text": cap, "source": "expanded_scatter",
+                "_unique_chart_id": uid, "location": _pp,
+            })
     return targets, inserts, new_entries, removed
 
 
