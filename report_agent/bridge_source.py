@@ -233,8 +233,36 @@ def _position_similarity(a: str, b: str) -> float:
     ratio = sm.ratio()
     # 公共子序列覆盖度：保证长位置的主要词序一致
     lcs = sum(blk.size for blk in sm.get_matching_blocks())
-    cover = 2.0 * lcs / max(len(na), len(nb))
+    # 覆盖度 = 公共子序列长度 / 较长串长度（0~1）。不能用 2*，否则近似
+    # 匹配（如 “59#墩墩顶截面上游”）会超过精确匹配的 1.0，把精确位置挤掉。
+    cover = float(lcs) / max(len(na), len(nb))
     return max(ratio, cover)
+
+
+_LOC_METRIC_SUFFIXES = (
+    "空间变位", "位移", "变位", "挠度", "应变", "倾角", "振动", "地震",
+    "结构温度", "环境温度", "环境湿度", "温度", "湿度", "风速", "风向",
+    "索力", "裂缝", "监测", "统计", "时程曲线图", "频率分布直方图",
+    "曲线图", "直方图",
+)
+
+
+def _strip_loc_metric_suffix(loc: str) -> str:
+    """去掉位置关键词末尾的指标/图型词（如 “3#墩承台空间变位” -> “3#墩承台”）。
+
+    表格行标签常把指标名拼进监测部位（“3#墩承台空间变位”），而名称对照/
+    图库目录名是纯位置（“3#墩承台”），匹配前先剥掉后缀。
+    """
+    t = str(loc or "")
+    changed = True
+    while changed:
+        changed = False
+        for w in _LOC_METRIC_SUFFIXES:
+            if len(t) > len(w) and t.endswith(w):
+                t = t[:-len(w)].rstrip(" 、，,和及")
+                changed = True
+                break
+    return t
 
 
 def _position_side_words(text: str) -> set:
@@ -267,10 +295,34 @@ def normalize_unit_spacing(text: str) -> str:
     if not text:
         return text
     t = re.sub(r" {2,}", " ", str(text))
+    t = re.sub(r"。{2,}", "。", t)   # “。。/。。。” -> “。”
     t = _UNIT_SPACE_RE.sub(
         lambda m: f"{m.group('num')} {m.group('unit')}", t)
     t = _UNIT_TRAIL_RE.sub(r"\1", t)
     return t.strip()
+
+
+def format_report_number(value) -> str:
+    """报告数值统一格式：
+      - 0 以上：保留两位小数（如 21.57、26.08）
+      - 0 以下：保留三位有效数字（如 -3.37、-15.1）
+      - 量级特别小（|x| < 0.01 且非 0）：科学计数法，保留三位有效数字
+        （如 2.81e-04、-1.90e-04）
+      - 整数（如 0、90）原样输出
+    总结段落、表格单元格统一走这里，保证口径一致。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if v == 0.0:
+        return "0"
+    if v == int(v) and abs(v) < 1e9:
+        return str(int(v))
+    if abs(v) < 0.01:
+        return f"{v:.3e}"
+    if v > 0:
+        return f"{v:.2f}"
+    return f"{v:.3g}"
 
 
 def feature_group(feature: str) -> str:
@@ -286,6 +338,70 @@ def feature_group(feature: str) -> str:
     if len(inner) >= 2 and inner[-1].lower() in ("s", "x"):
         return f"{prefix}({inner[-1].lower()})"
     return feature
+
+
+_AXIS_TOKEN_MAP = {
+    "X方向": "x", "Y方向": "y", "Z方向": "z",
+    "纵桥向": "x", "横桥向": "y", "竖向": "z",
+    "纵向": "x", "横向": "y", "垂直向": "z",
+    "Δx": "x", "Δy": "y", "Δz": "z",
+}
+
+
+def _hint_axes(unit_hint: str) -> set:
+    """从表格列头提示里提取轴向集合（如 纵桥向(X方向)/横桥向(Y方向) -> {x,y}）。"""
+    t = str(unit_hint or "")
+    return {ax for tok, ax in _AXIS_TOKEN_MAP.items() if tok in t}
+
+
+def _hint_unit(unit_hint: str) -> str:
+    """从表格列头提示里提取单位（m/s²、mm、℃ 等），用于与特征组单位族对账。"""
+    t = str(unit_hint or "")
+    for u in ("m/s²", "m/s2", "mm", "με", "kN", "℃", "%", "°", "辆"):
+        if u in t:
+            return "m/s²" if u == "m/s2" else u
+    return ""
+
+
+def _feature_axis_set(feature: str) -> set:
+    """特征串括号内的轴集合：SZJSD(xJsd) -> {'x'}、GNSS(Δx) -> {'x'}。"""
+    inner = _axis_inner(feature)
+    if not inner:
+        return set()
+    i = re.sub(r"j[ds]$", "", inner.lower())
+    return {ax for ax in ("x", "y", "z") if ax in i}
+
+
+def _group_unit_family(group: str) -> str:
+    """特征组前缀 → 单位族（用于与表格列头单位对账，如 SZJSD/JSD -> m/s²）。"""
+    g = str(group or "").upper()
+    if any(w in g for w in ("JSD", "JXD", "JYD", "JZD")):
+        return "m/s²"
+    if g.startswith(("GNSS", "WY", "ND", "LF")):
+        return "mm"
+    if g == "YB":
+        return "με"
+    if g == "SL":
+        return "kN"
+    if g.startswith("EZJD"):
+        return "°"
+    if g.startswith("WD"):
+        return "℃"
+    if g.startswith("WSD"):
+        return "℃"
+    return ""
+
+
+def _group_axis_guess(group: str) -> set:
+    """目录只有特征组名（如 SZJSD）没有精确特征时，按前缀猜测轴覆盖。"""
+    g = str(group or "").upper()
+    if g.startswith(("SZ", "GNSS")):
+        return {"x", "y", "z"}
+    if g.startswith("EZ"):
+        return {"x", "y"}
+    if g.startswith("DZ"):
+        return {"x"}
+    return set()
 
 
 def _similarity(a: str, b: str) -> float:
@@ -393,7 +509,7 @@ class BridgeData:
         self.table_map: Dict = {}                        # 表格映射：表类 -> 墩/位置 -> {编号, 特征}
         self._category_sensors: Dict[str, List[str]] = {}  # 类别 -> 编号列表（从名称对照表）
         self._stats_cache: Dict[str, Dict] = {}          # 编号 -> 统计值 JSON
-        self._agg_cache: Optional[Dict] = None            # 季度/年度统计.json 缓存
+        self._agg_cache: Dict[str, Dict] = {}             # 期型 -> 季度/年度统计.json
         self._summary_cache: Dict[str, str] = {}          # (指标|报告期) -> 总结句缓存
         self._conclusions_cache: Dict[str, str] = {}      # 报告期 -> 4.1结论缓存
         self._source_text: str = ""                       # 成品报告原文（供总结润色对照）
@@ -631,58 +747,68 @@ class BridgeData:
         """
         key = _norm(pos)
         key_sides = _side_set(key)
-        # 精确键 + 模糊/方位顺序无关的候选键合并（按编号去重），
-        # 再统一按特征过滤。这样“跨中1/2截面左幅”即使精确命中的是挠度，
-        # 也能补进温度传感器“跨中左幅1/2截面”。
+        # 精确键优先：先只按精确键过滤，命中该指标的传感器就直接返回，
+        # 避免“跨中1/2截面”把“跨中1/2截面上游/下游”等带方位变体并进来
+        # （图表占位符跨中1/2截面 -> 应取无方位的 368，而不是上游 398）。
+        # 精确键下没有该指标传感器时，再做模糊/方位顺序无关的候选键合并
+        # （如“跨中1/2截面左幅”能补进温度传感器“跨中左幅1/2截面”；
+        #  “2#墩墩顶”只有左/右幅候选时也能取到）。
         entries = list(self.name_dict.get(key) or [])
         seen_ids = {str(e.get("编号", "")) for e in entries if e.get("编号")}
-        for k, v in self.name_dict.items():
-            kn = _norm(k)
-            ok = (kn == key
-                  or (len(key) >= 2 and key in kn)
-                  or (len(kn) >= 2 and kn in key))
-            if not ok and key_sides:
-                # 方位词顺序不同（如 跨中1/2截面左幅 vs 跨中左幅1/2截面）：
-                # 去掉方位词后相同、且双方方位一致才匹配
-                skey = _SIDE_RE.sub("", key)
-                skn = _SIDE_RE.sub("", kn)
-                if (skey and skn and skey == skn
-                        and _side_set(kn) == key_sides):
-                    ok = True
-            if ok and key_sides:
-                # 位置带方位时，候选键必须带相同方位
-                # （排除 跨中1/2截面 这类无方位键被子串误匹配）
-                if _side_set(kn) != key_sides:
-                    ok = False
-            if not ok:
-                continue
-            for e in v or []:
+
+        def _filter_entries(entries):
+            feat = self.metrics.get(metric, {}).get("feature", "")
+            cat = self.metric_category.get(metric, "")
+            sids, cat_sids = [], []
+            for e in entries:
                 sid = str(e.get("编号", ""))
-                if sid and sid not in seen_ids:
-                    seen_ids.add(sid)
-                    entries.append(e)
+                if not sid or self._is_excluded(sid):
+                    continue
+                feats = [str(x) for x in (e.get("特征编码") or [])]
+                entry_cat = str(e.get("特征") or "")
+                if cat and entry_cat == cat:
+                    sids.append(sid)
+                    if not feat or feat in feats or any(
+                            feature_group(f) == feature_group(feat)
+                            for f in feats if f):
+                        cat_sids.append(sid)
+                elif not cat:
+                    if not feat or feat in feats:
+                        sids.append(sid)
+            if cat_sids:
+                sids = cat_sids
+            return sids
+
+        sids = _filter_entries(entries)
+        if not sids:
+            # 精确键未命中该指标传感器：模糊/方位顺序无关合并
+            for k, v in self.name_dict.items():
+                kn = _norm(k)
+                ok = (kn == key
+                      or (len(key) >= 2 and key in kn)
+                      or (len(kn) >= 2 and kn in key))
+                if not ok and key_sides:
+                    # 方位词顺序不同（如 跨中1/2截面左幅 vs 跨中左幅1/2截面）：
+                    # 去掉方位词后相同、且双方方位一致才匹配
+                    skey = _SIDE_RE.sub("", key)
+                    skn = _SIDE_RE.sub("", kn)
+                    if (skey and skn and skey == skn
+                            and _side_set(kn) == key_sides):
+                        ok = True
+                if ok and key_sides:
+                    # 位置带方位时，候选键必须带相同方位
+                    if _side_set(kn) != key_sides:
+                        ok = False
+                if not ok:
+                    continue
+                for e in v or []:
+                    sid = str(e.get("编号", ""))
+                    if sid and sid not in seen_ids:
+                        seen_ids.add(sid)
+                        entries.append(e)
+            sids = _filter_entries(entries)
         feat = self.metrics.get(metric, {}).get("feature", "")
         cat = self.metric_category.get(metric, "")
-        sids = []
-        cat_sids = []
-        for e in entries:
-            sid = str(e.get("编号", ""))
-            if not sid or self._is_excluded(sid):
-                continue
-            feats = [str(x) for x in (e.get("特征编码") or [])]
-            if feat and feat in feats:
-                sids.append(sid)
-                # 同位置混装多种传感器且共享特征编码时（如 58#墩墩顶截面
-                # 同时有 地震/振动 传感器都写 DZJSD(xJsd)），按监测类别优先：
-                # 振动表取“振动”传感器、地震表取“地震”传感器，避免取错。
-                if cat and e.get("特征") == cat:
-                    cat_sids.append(sid)
-            elif not feat and cat and e.get("特征") == cat:
-                sids.append(sid)
-            elif not feat and not cat:
-                sids.append(sid)
-        if cat_sids:
-            sids = cat_sids
         if not sids and not feat and cat:
             # 类别严格匹配不到时（如 vibration 表取到 特征=“地震”的传感器，
             # 洣水河 3#/4#柱墩墩底按“地震荷载”登记），在地震/振动同族内兜底，
@@ -931,8 +1057,30 @@ class BridgeData:
     def sensors_for_metric(self, metric: str) -> List[str]:
         """返回支持某指标特征的传感器编号（按编号排序）。"""
         feat = self.metrics.get(metric, {}).get("feature", "")
+        cat = self.metric_category.get(metric, "")
         sids = []
-        if feat:
+        # 1) 监测类别优先（名称对照表 特征 列）：地震/振动/应变/温湿度…
+        #    避免 config 特征写错（如 洣水河 earthquake_load 配 DZJSD，
+        #    实际地震传感器是 SZJSD）导致按特征过滤取到另一类传感器。
+        cat_cands = [sid for sid in (self._category_sensors.get(cat) or [])
+                     if not self._is_excluded(sid)]
+        if cat_cands:
+            if feat:
+                g0 = feature_group(feat)
+                matched = [
+                    sid for sid in cat_cands
+                    if any(feature_group(f) == g0
+                           for f in self._sensor_features.get(sid, []))]
+                if matched:
+                    sids = matched
+                else:
+                    # 类别内特征匹配不到（如 config 写 DZJSD、实际 SZJSD）：
+                    # 直接按类别返回，保证地震/振动各自取对传感器
+                    sids = cat_cands
+            else:
+                sids = cat_cands
+        # 2) 特征过滤兜底（类别缺失 / 类别内无传感器时）
+        if not sids and feat:
             for sid, feats in self._sensor_features.items():
                 if self._is_excluded(sid):
                     continue
@@ -946,7 +1094,6 @@ class BridgeData:
                     sids.append(sid)
         if not sids:
             # 特征未知时：优先用监测类别限定（振动/应变/索力…），避免跨类别污染
-            cat = self.metric_category.get(metric, "")
             if cat and cat in self._category_sensors:
                 sids = [sid for sid in self._category_sensors[cat] if not self._is_excluded(sid)]
         if not sids:
@@ -1201,28 +1348,33 @@ class BridgeData:
         if self._pos_stats:
             log.info("位置统计库: %s（%d 个传感器）", pos_dir, len(self._pos_stats))
 
-    def _load_aggregate_stats(self) -> Dict:
+    def _load_aggregate_stats(self, period: Optional[Dict] = None) -> Dict:
         """加载 季度统计.json / 年度统计.json(按监测部位聚合)，用于血缘回退。
 
-        新布局: 统计值_<期>/<桥名>/季度总结/季度统计.json；
-        同时兼容旧布局 统计值_<期>/<桥名>/季度统计.json。
+        新布局: 统计值_<期>/<桥名>/季度总结/季度统计.json 或 年度统计.json；
+        同时兼容旧布局 统计值_<期>/<桥名>/<文件名>。
+        年度报告优先 年度统计.json、季度报告优先 季度统计.json，
+        避免同目录两文件并存时年度报告取到季度数据。
         """
-        if self._agg_cache is not None:
-            return self._agg_cache
+        yearly = bool(period and str(period.get("label") or "").endswith("年"))
+        ck = "yearly" if yearly else "quarterly"
+        if ck in self._agg_cache:
+            return self._agg_cache[ck]
+        order = (("年度统计.json", "季度统计.json") if yearly
+                 else ("季度统计.json", "年度统计.json"))
         agg = {}
-        candidates = []
-        for fn in ("季度统计.json", "年度统计.json"):
-            candidates.append((fn, os.path.join(self.stats_dir, "季度总结", fn)))
-            candidates.append((fn, os.path.join(self.stats_dir, fn)))  # 旧布局回退
-        for fn, p in candidates:
-            if fn in agg or not os.path.isfile(p):
-                continue
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    agg[fn] = json.load(f)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("读取聚合统计 %s 失败: %s", p, exc)
-        self._agg_cache = agg
+        for fn in order:
+            for base in (os.path.join(self.stats_dir, "季度总结"),
+                         self.stats_dir):
+                p = os.path.join(base, fn)
+                if fn in agg or not os.path.isfile(p):
+                    continue
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        agg[fn] = json.load(f)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("读取聚合统计 %s 失败: %s", p, exc)
+        self._agg_cache[ck] = agg
         return agg
 
     def _aggregate_sensor_stat(self, sensor_id: str, metric: str, stat: str,
@@ -1244,22 +1396,20 @@ class BridgeData:
             fe = bridges[b].get(feat)
             v = None
             if isinstance(fe, dict):
-                if stat in ("max", "min", "avg", "abs_max", "rms", "range"):
-                    v = (fe.get("全桥统计") or {}).get(
-                        STAT_KEY_MAP.get(stat, stat))
-                if v is None:
-                    # 该位置指定测点
-                    pts = ((fe.get("位置") or {}).get(loc) or {})
-                    for _pt, rec in pts.items():
-                        if str(rec.get("传感器编号", "")) == str(sensor_id):
-                            st = (rec.get("统计") or {})
-                            # 恒值故障（整季最大值==最小值，且非“0为正常值”特征）
-                            # 的回退聚合值必须排除，避免把 0℃ 故障当真实极值
-                            if self._constant_faulty(st, feat):
-                                break
-                            v = st.get(STAT_KEY_MAP.get(stat, stat))
-                            if v is not None:
-                                break
+                # 该位置指定测点：无数据传感器（该测点不在位置统计/聚合里）
+                # 不回退到“全桥统计”——否则整季无数据的测点行会填成全桥
+                # 聚合值（多行同值/假数据），应整行“—”。
+                pts = ((fe.get("位置") or {}).get(loc) or {})
+                for _pt, rec in pts.items():
+                    if str(rec.get("传感器编号", "")) == str(sensor_id):
+                        st = (rec.get("统计") or {})
+                        # 恒值故障（整季最大值==最小值，且非“0为正常值”特征）
+                        # 的回退聚合值必须排除，避免把 0℃ 故障当真实极值
+                        if self._constant_faulty(st, feat):
+                            break
+                        v = st.get(STAT_KEY_MAP.get(stat, stat))
+                        if v is not None:
+                            break
             if v is None:
                 # 旧格式: 位置为最高键 -> {位置:{特征:{统计}}}
                 pos = bridges[b].get(loc)
@@ -1274,7 +1424,8 @@ class BridgeData:
                 return v
         return None
 
-    def _agg_feature_location(self, feature: str, stat: str) -> str:
+    def _agg_feature_location(self, feature: str, stat: str,
+                              period: Optional[Dict] = None) -> str:
         """从季度/年度统计 全桥统计 里取极值对应监测部位（如 最大值位置）。
 
         build_quarterly_stats 已把 最大值/最小值/绝对最大值/差值/
@@ -1285,7 +1436,7 @@ class BridgeData:
             return ""
         key = STAT_KEY_MAP.get(stat, stat)
         pos_key = f"{key}位置"
-        agg = self._load_aggregate_stats()
+        agg = self._load_aggregate_stats(period)
         for data in agg.values():
             bridges = data.get("桥", {}) or {}
             for b in bridges.values():
@@ -1308,7 +1459,7 @@ class BridgeData:
         if not feat:
             return []
         out = []
-        agg = self._load_aggregate_stats()
+        agg = self._load_aggregate_stats(period)
         for data in agg.values():
             bridges = data.get("桥", {}) or {}
             for b in bridges.values():
@@ -1385,12 +1536,7 @@ class BridgeData:
         避免同一指标前后数值不一致。
         """
         mcfg = self.metrics.get(metric) or {}
-        feat = mcfg.get("feature", "")
-        if not feat:
-            # 配置里 feature 为空（如 振动）时，按类别族从季度/年度统计自动
-            # 探测实际特征键（DZJSD/SZJSD 等），否则 {{summary.vibration}}
-            # 会因 feature 为空直接返回空串。
-            feat = self._feature_for_metric(metric, period)
+        feat = self._metric_summary_feature(metric, period)
         label = mcfg.get("label", metric)
         unit = mcfg.get("unit", "")
         if not feat:
@@ -1413,8 +1559,10 @@ class BridgeData:
                     + "。成品报告原文对应该指标的结论（仅作对照，若与真实数据矛盾"
                     "必须以真实数据为准）：" + src
                 )
+            # 方向化指标（空间变位/地震/振动 X/Y/Z）极值+位置较多，
+            # 220 字不够会被截成半句（如“Z方向…、最小值”），放大上限
             text = classifier.summarize_feature(
-                prompt, max_chars=220)
+                prompt, max_chars=600)
             if text and not self._summary_text_valid(text, digest):
                 log.warning("总结数值与统计摘要不一致，降级为规则化兜底: %s",
                             text)
@@ -1422,8 +1570,38 @@ class BridgeData:
         if not text:
             text = digest["fallback"]
         text = normalize_unit_spacing(text)
+        # 分轴总结（空间变位 GNSS X/Y/Z 等）LLM 可能漏掉主语
+        # （如直接以“X方向最大值…”开头）：补上指标名，保持与其它
+        # 分项（挠度监测/应变/振动指标）一致的表达。
+        if text and re.match(r"^[XYZ]方向", text) and label \
+                and not text.startswith(label):
+            text = f"{label}：" + text
         self._summary_cache[cache_key] = text
         return text
+
+    def _metric_summary_feature(self, metric: str,
+                                period: Dict) -> str:
+        """返回该指标用于总结的实际特征键。
+
+        config 特征可能过时（如 地震 配 DZJSD(xJsd)、实际数据是
+        SZJSD(xJsd/yJsd/zJsd)）：当 config 特征组不在该类别的实际特征组里
+        时，改用 _feature_for_metric（类别传感器实际特征族优先）。这样
+        地震/振动的总结与表格（分方向）一致，而不是读到同族其它指标的数据。
+        """
+        mcfg = self.metrics.get(metric) or {}
+        cfg_feat = str(mcfg.get("feature", "") or "")
+        cat = self.metric_category.get(metric, "")
+        actual_groups = set()
+        if cat:
+            for sid in (self._category_sensors.get(cat) or []):
+                for f in (self._sensor_features.get(str(sid)) or []):
+                    if f:
+                        actual_groups.add(feature_group(f))
+        if cfg_feat:
+            if actual_groups and feature_group(cfg_feat) not in actual_groups:
+                return self._feature_for_metric(metric, period) or cfg_feat
+            return cfg_feat
+        return self._feature_for_metric(metric, period)
 
     def build_conclusions(self, period: Dict,
                           llm_cfg: Optional[Dict] = None) -> str:
@@ -1468,8 +1646,11 @@ class BridgeData:
                 self._conclusions_cache[ck] = text
                 return text
         bn = self.bridge_name or "该桥"
-        text = "；".join(f"（{i + 1}）{bn}{lb}：{tx}"
-                         for i, (lb, tx) in enumerate(items))
+        # 各分项总结已自带“指标：”主语（结构温度：最高…），避免再重复
+        text = "\n".join(
+            f"（{i + 1}）{bn}{tx}" if tx.startswith(f"{lb}：")
+            else f"（{i + 1}）{bn}{lb}：{tx}"
+            for i, (lb, tx) in enumerate(items))
         self._conclusions_cache[ck] = text
         return text
 
@@ -1503,7 +1684,7 @@ class BridgeData:
         cat = self.metric_category.get(metric, "")
         mcfg = self.metrics.get(metric) or {}
         cfg_feat = mcfg.get("feature", "")
-        agg = self._load_aggregate_stats()
+        agg = self._load_aggregate_stats(period)
         agg_keys = []
         for data in agg.values():
             for b in (data.get("桥") or {}).values():
@@ -1594,7 +1775,7 @@ class BridgeData:
     def _feature_summary_digest(self, feature: str, label: str, unit: str,
                                 period: Dict, metric: str = "") -> Optional[Dict]:
         """组装特征统计摘要（给 LLM）与规则化兜底句。"""
-        agg = self._load_aggregate_stats()
+        agg = self._load_aggregate_stats(period)
         fe = None
         bridge_feats = None
         for data in agg.values():
@@ -1693,33 +1874,60 @@ class BridgeData:
             except (TypeError, ValueError):
                 pass
         if avg is not None:
-            prompts.append(f"平均值{avg:g}{unit}")
+            prompts.append(f"平均值{format_report_number(avg)}{unit}")
             values.append(avg)
         if max_v is not None:
-            prompts.append(f"最大值{max_v:g}{unit}" + (f"（位置：{max_loc}）" if max_loc else ""))
+            prompts.append(f"最大值{format_report_number(max_v)}{unit}"
+                           + (f"（位置：{max_loc}）" if max_loc else ""))
             values.append(max_v)
         if min_v is not None:
-            prompts.append(f"最小值{min_v:g}{unit}" + (f"（位置：{min_loc}）" if min_loc else ""))
+            prompts.append(f"最小值{format_report_number(min_v)}{unit}"
+                           + (f"（位置：{min_loc}）" if min_loc else ""))
             values.append(min_v)
         for v, loc, name in ((range_v, range_loc, "最大差值"),
                              (abs_v, abs_loc, "绝对最大值"),
                              (trm_v, trm_loc, "剔除温度效应后最大差值")):
             if v is not None:
-                prompts.append(f"{name}{v:g}{unit}" + (f"（位置：{loc}）" if loc else ""))
+                prompts.append(f"{name}{format_report_number(v)}{unit}"
+                               + (f"（位置：{loc}）" if loc else ""))
                 values.append(v)
         if miss_h and miss_h >= self._summary_miss_threshold():
-            prompts.append(f"全桥缺失小时数合计{miss_h:g}")
+            prompts.append(f"全桥缺失小时数合计{format_report_number(miss_h)}")
+        _cap = self._cap_positions
+        _yearly = str(period.get("label") or "").endswith("年")
+        month_miss = []
+        if _yearly:
+            avg_cov = gs.get("平均覆盖天数")
+            if avg_cov is not None:
+                try:
+                    prompts.append(
+                        f"全年平均覆盖天数{format_report_number(avg_cov)}天")
+                except (TypeError, ValueError):
+                    pass
+            month_miss = self._month_missing_positions(pos_entries, 30)
+        # 年度报告只报“缺失一个月以上”，季度/月度报 72h 阈值；
+        # 避免年度同时出现“一个月以上”和“72h以上”两套缺失口径。
+        missing_pos = month_miss if _yearly else abnormal
+        missing_label = (
+            "数据缺失一个月以上位置（缺失天数>30天）：" if _yearly
+            else "数据缺失较多位置（72h以上）：")
+        if missing_pos:
+            prompts.append(missing_label + _cap(missing_pos))
+        # 多数传感器公共缺失时间段（build_chart_library 生成的小时级区间）
+        cm_periods = gs.get("多数传感器缺失时间段") or []
+        if cm_periods:
+            prompts.append("多数传感器公共缺失时间段："
+                           + "、".join(cm_periods))
         if zero_pos:
-            prompts.append("恒0/恒值疑似故障位置：" + "、".join(zero_pos))
+            prompts.append("恒0/恒值疑似故障位置：" + _cap(zero_pos))
         if seg_pos:
-            prompts.append("疑似故障位置（含故障段）：" + "、".join(seg_pos))
-        if abnormal:
-            prompts.append("数据缺失位置：" + "、".join(abnormal))
-        if zero_pos or seg_pos or abnormal:
+            prompts.append("疑似故障位置（含故障段）：" + _cap(seg_pos))
+        if zero_pos or seg_pos or missing_pos:
             prompts.append(
-                "总结必须把上面列出的全部 恒0/恒值故障、含故障段、数据缺失 "
-                "位置都写进去（即使原文没提也要补上）；含故障段位置不得写成"
-                "“恒0”，数据缺失不得写成“故障”。")
+                "总结必须把上面列出的 恒0/恒值故障、含故障段、数据缺失 "
+                "位置写进去（即使原文没提也要补上）；位置过多时列前 5 个"
+                "并加“等”，不要全部罗列；含故障段位置不得写成“恒0”，"
+                "数据缺失不得写成“故障”。")
         if min_v is not None and min_v == 0.0 and zero_pos:
             prompts.append(
                 "注意：最低值0来自持续为0疑似故障位置，属传感器故障，"
@@ -1728,29 +1936,37 @@ class BridgeData:
         prompts.append(
             "只能引用上面给出的数值，禁止自行计算或编造新的数值；"
             "摘要中没有出现的数值（尤其差值/极值）一律不要写。")
-        digest_text = "；".join(prompts) + "。"
+        digest_text = "；".join(prompts).rstrip("。；") + "。"
 
         # 规则化兜底句（恒0/恒值、含故障段、缺失分开表述，避免把“0℃故障”
         # 当真实极值；故障/缺失位置完整列出，不截断）
         parts = []
         if max_v is not None:
-            parts.append(f"最高{max_v:g}{unit}" + (f"（{max_loc}）" if max_loc else ""))
+            parts.append(f"最高{format_report_number(max_v)}{unit}"
+                         + (f"（{max_loc}）" if max_loc else ""))
         if min_v is not None:
-            parts.append(f"最低{min_v:g}{unit}" + (f"（{min_loc}）" if min_loc else ""))
+            parts.append(f"最低{format_report_number(min_v)}{unit}"
+                         + (f"（{min_loc}）" if min_loc else ""))
         if not parts:
             parts.append("整体正常")
         head = "、".join(parts)
         special = []
         if zero_pos:
-            special.append("恒0/恒值疑似故障位置：" + "、".join(zero_pos))
+            special.append("恒0/恒值疑似故障位置：" + _cap(zero_pos))
         if seg_pos:
-            special.append("疑似故障位置（含故障段）：" + "、".join(seg_pos))
-        if abnormal:
-            special.append("数据缺失位置：" + "、".join(abnormal))
+            special.append("疑似故障位置（含故障段）：" + _cap(seg_pos))
+        if missing_pos:
+            special.append(missing_label + _cap(missing_pos))
+        if cm_periods:
+            special.append("多数传感器在" + "、".join(cm_periods)
+                           + "时间段内数据缺失")
         if not special:
             fallback = f"{label}监测数据整体正常，{head}。"
         else:
-            fallback = f"{head}；{'；'.join(special)}，其余测点正常，需关注。"
+            # 有故障/缺失时补上指标主语（如 结构温度：最高…、最低…），
+            # 避免小结段落里只有数值没有监测对象
+            fallback = f"{label}：{head}；{'；'.join(special)}，" \
+                       f"其余测点正常，需关注。"
         return {"prompt": digest_text, "fallback": fallback, "values": values}
 
     def _summary_miss_threshold(self) -> float:
@@ -1758,6 +1974,33 @@ class BridgeData:
             return float(self.cfg.get("summary_miss_hours", 72) or 72)
         except (TypeError, ValueError):
             return 72.0
+
+    @staticmethod
+    def _cap_positions(items, cap: int = 5) -> str:
+        """位置列表过多时截断：列出前 cap 个并加“等”，避免总结过长影响阅读。"""
+        items = [str(x) for x in (items or []) if str(x).strip()]
+        if len(items) <= cap:
+            return "、".join(items)
+        return "、".join(items[:cap]) + "等"
+
+    def _month_missing_positions(self, pos_entries: Dict,
+                                 min_days: int = 30) -> List[str]:
+        """返回缺失天数超过 min_days 的监测部位（年度报告“数据缺失一个月
+        以上”用）。"""
+        out = []
+        for pos, points in (pos_entries or {}).items():
+            if not isinstance(points, dict):
+                continue
+            worst = 0.0
+            for _pt, rec in points.items():
+                st = (rec.get("统计") or {}) if isinstance(rec, dict) else {}
+                try:
+                    worst = max(worst, float(st.get("缺失天数") or 0))
+                except (TypeError, ValueError):
+                    continue
+            if worst > min_days:
+                out.append(str(pos))
+        return out
 
     def _fault_positions(self, gs: Dict, pos_entries: Dict, feature: str,
                          metric: str, period: Dict):
@@ -1941,7 +2184,8 @@ class BridgeData:
         避免总结把 Y 方向位置串给 Z 方向。"""
         axis_labels = {"X": "X方向", "Y": "Y方向", "Z": "Z方向"}
         prompts = [
-            f"指标：{label}（分方向统计）；"
+            f"指标：{label}（分方向统计）；总结开头必须带指标名"
+            f"（如“{label}：X方向最大值…”）；"
             f"报告期：{period.get('start')} ~ {period.get('end')}"
         ]
         fallback_parts = []
@@ -1956,6 +2200,7 @@ class BridgeData:
                     ("max", "最大值", "最大值位置", "最大"),
                     ("min", "最小值", "最小值位置", "最小"),
                     ("range", "差值", "差值位置", "差值")):
+                stat_cn = cn if stat == "range" else f"{cn}值"
                 v, loc = None, ""
                 if am:
                     val, detail = self.resolve_metric_stat_detail(
@@ -1972,41 +2217,60 @@ class BridgeData:
                 if v is None:
                     continue
                 values.append(v)
-                lines.append(f"{cn}值{v:g}{unit}"
+                lines.append(f"{stat_cn}{format_report_number(v)}{unit}"
                              + (f"（位置：{loc}）" if loc else ""))
                 fallback_parts.append(
-                    f"{axis_labels[ax]}{cn}{v:g}{unit}"
+                    f"{axis_labels[ax]}{stat_cn}{format_report_number(v)}{unit}"
                     + (f"（{loc}）" if loc else ""))
             if lines:
                 prompts.append(f"{axis_labels[ax]}：" + "、".join(lines))
+        _cap = self._cap_positions
+        _yearly = str(period.get("label") or "").endswith("年")
+        month_miss = []
+        if _yearly:
+            month_miss = self._month_missing_positions(pos_entries, 30)
+        # 年度报告只报“缺失一个月以上”，季度/月度报 72h 阈值
+        missing_pos = month_miss if _yearly else abnormal
+        missing_label = (
+            "数据缺失一个月以上位置（缺失天数>30天）：" if _yearly
+            else "数据缺失较多位置（72h以上）：")
+        if missing_pos:
+            prompts.append(missing_label + _cap(missing_pos))
+        cm_periods = gs_ax.get("多数传感器缺失时间段") or []
+        if cm_periods:
+            prompts.append("多数传感器公共缺失时间段："
+                           + "、".join(cm_periods))
         if zero_pos:
-            prompts.append("恒0/恒值疑似故障位置：" + "、".join(zero_pos))
+            prompts.append("恒0/恒值疑似故障位置：" + _cap(zero_pos))
         if seg_pos:
-            prompts.append("疑似故障位置（含故障段）：" + "、".join(seg_pos))
-        if abnormal:
-            prompts.append("数据缺失位置：" + "、".join(abnormal))
-        if zero_pos or seg_pos or abnormal:
+            prompts.append("疑似故障位置（含故障段）：" + _cap(seg_pos))
+        if zero_pos or seg_pos or missing_pos:
             prompts.append(
-                "总结必须把上面列出的全部 恒0/恒值故障、含故障段、数据缺失 "
-                "位置都写进去（即使原文没提也要补上）；含故障段位置不得写成"
-                "“恒0”，数据缺失不得写成“故障”。")
+                "总结必须把上面列出的 恒0/恒值故障、含故障段、数据缺失 "
+                "位置写进去（即使原文没提也要补上）；位置过多时列前 5 个"
+                "并加“等”，不要全部罗列；含故障段位置不得写成“恒0”，"
+                "数据缺失不得写成“故障”。")
         prompts.append(
             "X/Y/Z 各方向的数值与对应测点位置必须按上面逐一对应，"
             "不得把某一方向的位置串用到其他方向；"
             "只能引用上面给出的数值，禁止编造新的数值。")
-        digest_text = "；".join(prompts) + "。"
+        digest_text = "；".join(prompts).rstrip("。；") + "。"
         special = []
         if zero_pos:
-            special.append("恒0/恒值疑似故障位置：" + "、".join(zero_pos))
+            special.append("恒0/恒值疑似故障位置：" + _cap(zero_pos))
         if seg_pos:
-            special.append("疑似故障位置（含故障段）：" + "、".join(seg_pos))
-        if abnormal:
-            special.append("数据缺失位置：" + "、".join(abnormal))
+            special.append("疑似故障位置（含故障段）：" + _cap(seg_pos))
+        if missing_pos:
+            special.append(missing_label + _cap(missing_pos))
+        if cm_periods:
+            special.append("多数传感器在" + "、".join(cm_periods)
+                           + "时间段内数据缺失")
         head = "、".join(fallback_parts) if fallback_parts else "整体正常"
         if not special:
             fallback = f"{label}监测数据整体正常，{head}。"
         else:
-            fallback = f"{head}；{'；'.join(special)}，其余测点正常，需关注。"
+            fallback = f"{label}：{head}；{'；'.join(special)}，" \
+                       f"其余测点正常，需关注。"
         return {"prompt": digest_text, "fallback": fallback, "values": values}
 
     @staticmethod
@@ -2330,6 +2594,14 @@ class BridgeData:
 
         qd = _direction(query)
         q_body = query.replace(qd, "") if qd else query
+        # 精确键优先：查询与候选完全一致时直接返回，避免无方位查询
+        # （如“跨中1/2截面”）被“跨中1/2截面上游/下游”等带方位变体
+        # 以相同相似度先遍历到而抢走（与 _sensors_at_position 的
+        # 精确键优先策略一致）。
+        qn = _norm(query)
+        for pos in positions:
+            if _norm(pos) == qn:
+                return pos
         best, best_score = None, -1.0
         for pos in positions:
             pd = _direction(pos)
@@ -2342,35 +2614,6 @@ class BridgeData:
             if score > best_score:
                 best, best_score = pos, score
         return best if best is not None and best_score >= threshold else None
-
-    def _position_temp_stat(self, pos: str, temp_stat: str,
-                            period: Dict) -> Optional[float]:
-        """该监测断面结构温度(WD(temp))传感器的最大/最小（多传感器跨取极值）。"""
-        ids: List[str] = []
-        pn = _norm(pos)
-        tm = self.table_map.get("结构温度表", {}) or {}
-        for k, v in tm.items():
-            if _norm(str(k)) == pn:
-                ids = [str(x) for x in v]
-                break
-        if not ids:
-            for k, v in self.name_dict.items():
-                if _norm(str(k)) != pn:
-                    continue
-                for e in v or []:
-                    if "WD(temp)" in [str(x) for x in (e.get("特征编码") or [])]:
-                        ids.append(str(e.get("编号")))
-                if ids:
-                    break
-        vals = []
-        for sid in ids:
-            v = self._sensor_stat(sid, "structure_temperature", temp_stat,
-                                  period, feature="WD(temp)")
-            if v is not None:
-                vals.append(v)
-        if not vals:
-            return None
-        return max(vals) if temp_stat == "max" else min(vals)
 
     def _point_plan_for_row(self, plans: List[Dict], title: str, column: str,
                             row_index: int = 0):
@@ -2414,8 +2657,11 @@ class BridgeData:
             point_no = col
         elif not point_no:
             point_no = f"测点{row_index + 1}"
-        # 标题基座：去掉 方向 / 应变监测统计 等，再取核心段
-        base = re.sub(r"(上游|下游)", "", title)
+        # 标题基座：去掉 方向 / 应变监测统计 等，再取核心段。
+        # 先去掉带“侧”的完整方位词（上游侧/下游侧），再处理裸方位，
+        # 避免“上游侧”只去掉“上游”留下孤立“侧”污染核心段。
+        base = re.sub(r"(上游侧|下游侧)", "", title)
+        base = re.sub(r"(上游|下游)", "", base)
         base = re.sub(r"(结构)?(应变|振动).*$", "", base)
         base = base.replace("监测", "").replace("统计", "").strip()
         core = ""
@@ -2424,35 +2670,59 @@ class BridgeData:
             core = cm.group(1)
         elif len(base) >= 2:
             core = base
-        # 1) 严格匹配：基座核心 + 部位词 + 方向 都命中
-        for plan in plans:
-            pos = str(plan.get("断面位置") or "")
-            pn = _norm(pos)
-            if direction and direction not in pn:
-                continue
-            if part and part not in pn:
-                continue
-            if core and core not in pn:
-                continue
-            pts = plan.get("测点") or {}
-            sid = pts.get(point_no) if point_no else None
-            if sid:
-                return pos, str(sid)
-        # 2) 模糊匹配：difflib 相似度（如 顶部 vs 墩顶）
-        if core:
+
+        # 方向兼容：传感器登记用 左幅/右幅、报告表格用 上游/下游 的桥
+        # （如洣水河应变表“上游…应变监测统计”对应“…顶板左幅”测点）。
+        # 只作为别名候选：先按原方向精确匹配，无候选时才把
+        # 上游≈左幅、下游≈右幅 视为同侧，避免既有精确匹配被改写。
+        def _dir_ok(pn, alias):
+            if not direction:
+                return True
+            if direction in pn:
+                return True
+            if alias:
+                sides = _side_set(pn)
+                if (direction == "上游" and "L" in sides) \
+                        or (direction == "下游" and "R" in sides):
+                    return True
+            return False
+
+        def _search(alias, fuzzy):
             for plan in plans:
                 pos = str(plan.get("断面位置") or "")
                 pn = _norm(pos)
-                if direction and direction not in pn:
+                if not _dir_ok(pn, alias):
                     continue
                 if part and part not in pn:
                     continue
-                if difflib.SequenceMatcher(None, core, pn).ratio() < 0.5:
-                    continue
+                if core and core not in pn:
+                    if not (fuzzy and difflib.SequenceMatcher(
+                            None, core, pn).ratio() >= 0.5):
+                        continue
                 pts = plan.get("测点") or {}
                 sid = pts.get(point_no) if point_no else None
                 if sid:
                     return pos, str(sid)
+            return None
+
+        # 1) 严格匹配：基座核心 + 部位词 + 方向 都命中
+        found = _search(alias=False, fuzzy=False)
+        if found:
+            return found
+        # 2) 模糊匹配：difflib 相似度（如 顶部 vs 墩顶）
+        if core:
+            found = _search(alias=False, fuzzy=True)
+            if found:
+                return found
+        # 1b) 方向别名匹配（上游≈左幅、下游≈右幅）：
+        # 只有精确方向(含模糊核心)无候选时才启用，避免覆盖既有精确匹配
+        found = _search(alias=True, fuzzy=False)
+        if found:
+            return found
+        if core:
+            found = _search(alias=True, fuzzy=True)
+            if found:
+                return found
         return None
 
     def _resolve_cell_by_table(self, metric: str, column: str, stat: str,
@@ -2472,18 +2742,6 @@ class BridgeData:
                 found = self._point_plan_for_row(plans, t, column, row_index)
                 if found:
                     pos, sid = found
-                    # 剔除温度最大/最小：取该断面结构温度(WD(temp))的极值，
-                    # 不属于应变特征本身
-                    if stat in ("temp_rm_max", "temp_rm_min",
-                                "剔除温度最大值", "剔除温度最小值"):
-                        temp_stat = ("max" if stat in ("temp_rm_max", "剔除温度最大值")
-                                     else "min")
-                        tv = self._position_temp_stat(pos, temp_stat, period)
-                        if trace is not None:
-                            trace.update({"branch": "应变-剔除温度→结构温度极值",
-                                          "position": pos, "sensor_id": sid,
-                                          "column": column})
-                        return tv
                     if trace is not None:
                         trace.update({"branch": "测点映射表", "position": pos,
                                       "sensor_id": sid, "column": column})
@@ -2557,6 +2815,25 @@ class BridgeData:
                         trace.update({"branch": f"{mkey}", "position": pos,
                                       "sensor_id": sid, "column": column})
                     return self._sensor_stat(sid, metric, stat, period, feature=feat)
+
+        # 6) 地震监测表：位置 -> 编号（方向列按轴特征取对应特征）
+        if "地震" in t and "地震监测表" in self.table_map:
+            pos = self._match_position(column,
+                                       list(self.table_map["地震监测表"].keys()))
+            if pos:
+                ids = [str(x) for x in self.table_map["地震监测表"][pos]]
+                if not ids:
+                    return None
+                sid = ids[row_index % len(ids)]
+                feat = ""
+                axis = self._axis_features_at_position(pos, metric)
+                if axis:
+                    feat = axis[row_index % len(axis)]
+                if trace is not None:
+                    trace.update({"branch": "地震监测表", "position": pos,
+                                  "sensor_id": sid, "column": column})
+                return self._sensor_stat(sid, metric, stat, period,
+                                         feature=feat or None)
         return None
 
     def _period_daily(self, fstats: Dict, period: Dict) -> List[Dict]:
@@ -2781,6 +3058,32 @@ class BridgeData:
                                         "特征": _feat,
                                     },
                                 }
+                            # 行号取测点(column 含“测点N”)且主传感器既无逐
+                            # 传感器统计也无聚合统计时，整行填“—”，不再顺延
+                            # 到同位置其他传感器——否则缺数/坏测点会串成
+                            # 上一行同值（如 测点2 重复 测点1 的值）。
+                            if _pf is None and re.search(
+                                    r"测点\s*\d+", str(column)) and \
+                                    self._aggregate_sensor_stat(
+                                        _primary, metric, actual,
+                                        feature=_feat) is None:
+                                return None, {
+                                    "占位符": f"cell.{metric}.{column}.{stat}",
+                                    "结果": "未找到",
+                                    "原因": f"测点 {column} 对应传感器"
+                                            f"({_primary})无统计数据，"
+                                            f"整行填“—”",
+                                    "分支": "名称对照位置-按行取传感器(缺数不串行)",
+                                    "监测部位": pos,
+                                    "表格标题": table_title,
+                                    "表格行号": row_index + 1,
+                                    "传感器": {
+                                        "传感器编号": _primary,
+                                        "监测部位": self._position_for_sensor(
+                                            _primary),
+                                        "特征": _feat,
+                                    },
+                                }
                         if val is None:
                             for sid in order:
                                 d_try = self._stat_detail(sid, metric, actual, period)
@@ -2981,7 +3284,7 @@ class BridgeData:
                 loc = d.get("监测部位") or ""
                 break
         if not loc:
-            loc = self._agg_feature_location(feat_for_loc, actual)
+            loc = self._agg_feature_location(feat_for_loc, actual, period)
         if loc:
             detail["位置"] = loc
         return value, detail
@@ -3082,6 +3385,22 @@ class BridgeData:
                             break
                 if out:
                     return out
+        # 0b) 多墩组合位置（“3、4#墩承台”）-> 逐墩展开（3#墩承台 / 4#墩承台）
+        mm = re.match(r"^([\d、，,和及]+)#(?:柱)?墩(.*)$", loc_n)
+        if mm and len(re.findall(r"\d+", mm.group(1))) >= 2:
+            suffix = _norm(mm.group(2))
+            for d in re.findall(r"\d+", mm.group(1)):
+                for sid, info in self.sensor_map.items():
+                    if self._is_excluded(sid):
+                        continue
+                    names = [info.get("名称", ""), info.get("监测部位", "")]
+                    if any(n and f"{d}#墩" in _norm(n)
+                           and (not suffix or suffix in _norm(n))
+                           for n in names):
+                        out.append(sid)
+                        break
+            if out:
+                return out
         # 墩顶支座倾角表：位置含 '#墩' 时按墩号取 左X/右X
         if "墩" in loc_n:
             m = re.search(r"(\d+)#", location)
@@ -3103,18 +3422,45 @@ class BridgeData:
         # 包含匹配：收集该位置的全部传感器（按指标特征过滤），
         # 如“跨中断面” -> 第6跨主梁箱内、第7跨主梁箱内、第7跨桥面右侧
         feat = self.metrics.get(metric, {}).get("feature", "")
+        cat = self.metric_category.get(metric, "")
+        g0 = feature_group(feat) if feat else ""
+        pos_all = []
+        pos_cat = []
+        pos_feat = []
         for sid, info in self.sensor_map.items():
             if self._is_excluded(sid):
                 continue
-            if feat:
-                feats = self._sensor_features.get(sid, [])
-                if feat not in feats:
-                    continue
             names = [info.get("名称", ""), info.get("监测部位", "")]
             if any(n and len(n) >= 2 and (
                 (_norm(n) in loc_n) or (len(loc_n) >= 2 and loc_n in _norm(n))
             ) for n in names):
-                out.append(sid)
+                pos_all.append(sid)
+                if cat and (str(info.get("类别") or "") == cat
+                            or sid in (self._category_sensors.get(cat) or [])):
+                    pos_cat.append(sid)
+                if feat:
+                    feats = self._sensor_features.get(sid, [])
+                    if feat in feats or (g0 and any(
+                            feature_group(f) == g0 for f in feats)):
+                        pos_feat.append(sid)
+        # 类别优先：config 特征可能写错/过时（如地震配 DZJSD(xJsd)、实际
+        # SZJSD(xJsd/yJsd/zJsd)），同位置还常混有振动/空间变位传感器，
+        # 先限定监测类别，再在类别内做特征同族匹配；类别内无同族时整类返回
+        # （保证地震节取地震传感器、振动节取振动传感器）。
+        if cat and pos_cat:
+            if g0:
+                matched = [sid for sid in pos_cat
+                           if any(feature_group(f) == g0
+                                  for f in self._sensor_features.get(sid, []))]
+                out = matched or pos_cat
+            else:
+                out = pos_cat
+        elif pos_feat:
+            out = pos_feat
+        elif pos_all:
+            out = pos_all
+        else:
+            out = []
         return sorted(set(out), key=lambda x: int(x) if x.isdigit() else x)
 
     def _chart_sensor_id(self, chart_id: str, caption: str = "",
@@ -3140,6 +3486,18 @@ class BridgeData:
         pp = self._parse_position_chart_id(chart_id)
         if pp:
             metric, pos, _kind, n = pp
+            # 模板图表 ID 的指标可能与节上下文冲突：识别器把地震节的
+            # “304(xJsd)_时程曲线”生成成 vibration_…（xJsd 特征码被当成
+            # 振动）。地震/振动同族且上下文给出相反指标时，以节上下文为准，
+            # 否则 58# 地震会取到同位置的振动传感器（DZJSD）。
+            _ctx_text = " ".join(
+                [str(caption or "")] +
+                [str(x) for x in (ctx_texts or [])]).strip()
+            _ctx_metric = self._metric_alias_hit(_ctx_text)
+            if (_ctx_metric in ("earthquake_load", "vibration")
+                    and metric in ("earthquake_load", "vibration")
+                    and _ctx_metric != metric):
+                metric = _ctx_metric
             sids = self._sensors_at_position(pos, metric)
             if sids:
                 if side:
@@ -3267,6 +3625,26 @@ class BridgeData:
         if not chart_id or not self.name_dict:
             return None
         cands = self._position_candidates()
+        # 泛型 chart_<位置>_<kind>_<n>：识别器没识别出指标时用 “chart” 占位。
+        # 位置文本里带指标词（如 “炎陵侧边跨跨中截面振动” -> vibration）时
+        # 直接推断并转成标准 metric 前缀再解析；位置里没有指标词的
+        # （如 “chart_3#墩根部截面_trend_5”）返回 None，由图注/节上下文兜底。
+        if chart_id.startswith("chart_"):
+            _rest = chart_id[len("chart_"):]
+            _mp = re.match(r"^(?P<loc>.+?)_(?P<kind>[a-z_]+)_(?P<n>\d+)$",
+                           _rest)
+            if _mp:
+                _loc = _mp.group("loc")
+                _kind = _mp.group("kind")
+                _n = _mp.group("n")
+                _m = self._metric_alias_hit(_loc)
+                if not _m:
+                    _clean = _strip_loc_metric_suffix(_loc)
+                    _m = self._metric_alias_hit(_clean)
+                if _m:
+                    return self._parse_position_chart_id(
+                        f"{_m}_{_loc}_{_kind}_{_n}")
+            return None
         for metric in sorted(self.metrics, key=len, reverse=True):
             prefix = metric + "_"
             if not chart_id.startswith(prefix):
@@ -3290,29 +3668,45 @@ class BridgeData:
                 loc_raw = pos_part.group("loc")
                 kind = pos_part.group("kind")
                 n = int(pos_part.group("n"))
-                loc_words = _position_side_words(loc_raw)
+                # 章节号与墩号粘连（如 3.4.2.759#墩… 实为 3.4.2.7 + 59#墩…，
+                # 来自 Word 自动编号与标题文字无空格拼接）：逐级剥离章节号
+                # 后仍取剩余形如 N#墩 的变体参与匹配。
+                loc_variants = [loc_raw]
+                # 指标词后缀（如 “3#墩承台空间变位” -> “3#墩承台”，表格行
+                # 标签常把指标名拼进监测部位）
+                _clean = _strip_loc_metric_suffix(loc_raw)
+                if _clean and _clean != loc_raw:
+                    loc_variants.append(_clean)
+                for _mm in re.finditer(r"(\d{1,2})#(?:柱)?墩", loc_raw):
+                    _pre = loc_raw[:_mm.start(1)]
+                    if re.match(r"^\d+(?:\.\d+){1,3}$", _pre):
+                        _cand = loc_raw[_mm.start(1):]
+                        if _cand not in loc_variants:
+                            loc_variants.append(_cand)
                 best = None
                 best_score = 0.0
-                for pos in cands:
-                    cand_words = _position_side_words(pos)
-                    # 关键方位词必须一致：模板有“上游”候选必须有“上游”，
-                    # 模板没有的方位词候选也不得有(顶/底板除外，见下)
-                    if loc_words and cand_words:
-                        if not loc_words.issubset(cand_words):
+                for lc in loc_variants:
+                    loc_words = _position_side_words(lc)
+                    for pos in cands:
+                        cand_words = _position_side_words(pos)
+                        # 关键方位词必须一致：模板有“上游”候选必须有“上游”，
+                        # 模板没有的方位词候选也不得有(顶/底板除外，见下)
+                        if loc_words and cand_words:
+                            if not loc_words.issubset(cand_words):
+                                continue
+                        elif loc_words and not cand_words:
                             continue
-                    elif loc_words and not cand_words:
-                        continue
-                    elif not loc_words and cand_words:
-                        # 模板没提方位但候选带方位时仍可接受(去方位词派生)
-                        pass
-                    # 顶板/底板、左幅/右幅等部位词必须一致
-                    for kw in ("顶板", "底板", "左幅", "右幅"):
-                        if kw in loc_raw and kw not in pos:
-                            continue
-                    score = _position_similarity(loc_raw, pos)
-                    if score > best_score:
-                        best_score = score
-                        best = pos
+                        elif not loc_words and cand_words:
+                            # 模板没提方位但候选带方位时仍可接受(去方位词派生)
+                            pass
+                        # 顶板/底板、左幅/右幅等部位词必须一致
+                        for kw in ("顶板", "底板", "左幅", "右幅"):
+                            if kw in lc and kw not in pos:
+                                continue
+                        score = _position_similarity(lc, pos)
+                        if score > best_score:
+                            best_score = score
+                            best = pos
                 if best and best_score >= 0.72:
                     return metric, best, kind, n
         return None
@@ -3379,6 +3773,16 @@ class BridgeData:
         )
         if m and len(re.findall(r"\d+", m.group(1))) >= 2:
             return f"第{m.group(1).replace(' ', '')}跨{m.group('loc')}"
+        # 0b) 多墩组合位置（“3、4#墩承台空间变位…”）-> “3、4#墩承台”，
+        #     供 _location_sensors 逐墩展开（3#墩承台 / 4#墩承台）
+        m = re.search(
+            r"([\d、，,和及]+\s*#\s*(?:柱)?墩[^，。：\s]{0,8}?)"
+            r"(?=(?:空间变位|位移|挠度|应变|倾角|振动|地震|监测|"
+            r"时程|频率|分布|变化|统计|如下图所示|$))",
+            text,
+        )
+        if m and len(re.findall(r"\d+", m.group(1))) >= 2:
+            return m.group(1).replace(" ", "")
         # 1) 墩号定位（倾角/位移表）：如 “4#墩墩顶主梁支座倾角变化时程曲线图” -> “4#墩”
         m = re.search(r"(\d+)#\s*墩", text)
         if m:
@@ -3464,7 +3868,8 @@ class BridgeData:
 
     def resolve_chart_info(self, chart_id: str, caption: str = "", context=None,
                            metric_hint: str = "", sensor_hint: str = "",
-                           feature_hint: str = "") -> Optional[Dict]:
+                           feature_hint: str = "",
+                           unit_hint: str = "") -> Optional[Dict]:
         """解析图表，返回 {path, sensor_id, kind, display}；找不到返回 None。"""
         if not self.charts_dir:
             return None
@@ -3510,7 +3915,10 @@ class BridgeData:
             metric_feature = self.metrics[metric_from_id].get("feature", "")
         if not metric_feature and feature_hint:
             metric_feature = feature_hint
-        merged = self._merged_chart_path(sensor_id, kind, metric_feature)
+        # 显式特征提示(如 xJsd)时按提示为准，不再用表格提示覆盖
+        merged = self._merged_chart_path(
+            sensor_id, kind, metric_feature,
+            unit_hint=unit_hint if not feature_hint else "")
         if merged:
             display_metric = metric_hint or self._metric_alias_hit(
                 caption
@@ -3637,8 +4045,28 @@ class BridgeData:
         info = self.sensor_map.get(sid, {})
         return info.get("名称") or info.get("监测部位") or ""
 
+    def _group_has_sensor(self, dirpath: str, sensor_id: str) -> bool:
+        """合并图目录下的 预处理记录.json 是否包含该传感器。
+
+        用于“同一位置多个特征组”时按图库实际归属选图：如 58#墩墩顶截面上游
+        的 DZJSD 组只有 377(振动)、SZJSD 组只有 304(地震)，即使统计库/
+        名称对照把 304 的特征标成 DZJSD，也以图库自身记录为准取 SZJSD。
+        记录文件缺失时返回 False（由其它候选逻辑兜底）。
+        """
+        rec = os.path.join(dirpath, "预处理记录.json")
+        if not os.path.isfile(rec):
+            return False
+        try:
+            with open(rec, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return any(str(x.get("传感器")) == str(sensor_id)
+                       for x in (data.get("记录") or []))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _merged_chart_path(self, sensor_id: str, kind: str,
-                           metric_feature: str = "") -> Optional[str]:
+                           metric_feature: str = "",
+                           unit_hint: str = "") -> Optional[str]:
         """合并图库路径，按优先级查找：
           1) 图库/<监测部位>/<特征组>/<图型>.png（多传感器子图）
           2) 图库/<监测部位>/<特征组>/<特征>/<图型>.png（单传感器多特征复制布局）
@@ -3646,6 +4074,10 @@ class BridgeData:
          自动在位置目录下按传感器特征选特征组子目录。
          精确目录不存在时，在图库位置目录中做模糊匹配（关键方位词一致、
          容忍“内/侧”等修饰字差异），避免“名称对照多一个字”导致找不到图。
+         unit_hint 为邻近表格的列头/单位提示（如“纵桥向(X方向)横桥向(Y方向)
+         竖向(Z方向)m/s²”）：同一位置存在多个候选特征组（地震 DZJSD/SZJSD、
+         振动 DZJSD 等）时按“轴向覆盖 + 单位族”打分选图，避免地震节插错成
+         振动图；单个候选组或没有提示时不影响原有逻辑。
         找不到返回 None。"""
         if not self.charts_dir:
             return None
@@ -3656,18 +4088,76 @@ class BridgeData:
         base_dir = self._fuzzy_position_dir(pos)
         if metric_feature:
             g = feature_group(metric_feature)
-            p = _pick_chart_file(
-                os.path.join(base_dir, _safe_dir(g)), fname)
-            if not p:
-                # 特征提示(如 xJsd)与实际特征组目录(如 DZJSD)不一致时，
-                # 按传感器特征组逐个尝试
-                feats = self._sensor_features.get(str(sensor_id), []) or []
-                for f in feats:
-                    g2 = feature_group(f)
-                    if g2 == g:
-                        continue
+            feats = self._sensor_features.get(str(sensor_id), []) or []
+            g_actual = sorted(
+                {feature_group(f) for f in feats if feature_group(f)})
+            # 候选组：config 组 + 传感器实际特征组 + 位置目录组（去重）
+            groups = []
+            for gg in [g] + g_actual:
+                if gg and gg not in groups:
+                    groups.append(gg)
+            if os.path.isdir(base_dir):
+                for sub in sorted(os.listdir(base_dir)):
+                    if (os.path.isdir(os.path.join(base_dir, sub))
+                            and not sub.startswith("相关性")
+                            and sub not in groups):
+                        groups.append(sub)
+            # 同位置多特征组（DZJSD/SZJSD/GNSS…）：优先选“预处理记录含目标
+            # 传感器”的组——即使统计库把 304 标成 DZJSD，也按图库实际归属
+            # 取 SZJSD，避免地震节插进同位置的振动图。
+            owned = [gg for gg in groups
+                     if self._group_has_sensor(
+                         os.path.join(base_dir, _safe_dir(gg)),
+                         sensor_id)]
+            if owned:
+                groups = owned
+            p = None
+            # 表格单位/轴向校验：有提示且候选组不唯一时，按提示对候选组打分，
+            # 分数最高且目录真实存在者优先（如 3 轴地震表 -> SZJSD 而非 DZJSD）。
+            if unit_hint and len(groups) > 1:
+                hint_axes = _hint_axes(unit_hint)
+                hint_unit = _hint_unit(unit_hint)
+                scored = []
+                for gg in groups:
+                    score = 0.0
+                    axes = set()
+                    feats_g = [f for f in feats if feature_group(f) == gg]
+                    for f in feats_g:
+                        axes |= _feature_axis_set(f)
+                    if not axes:
+                        axes = _group_axis_guess(gg)
+                    if hint_axes:
+                        covered = len(hint_axes & axes)
+                        score += 3.0 if covered == len(hint_axes) \
+                            else float(covered)
+                    if hint_unit:
+                        if feats_g:
+                            unit_ok = any(
+                                _group_unit_family(feature_group(f))
+                                == hint_unit for f in feats_g)
+                        else:
+                            unit_ok = _group_unit_family(gg) == hint_unit
+                        if unit_ok:
+                            score += 2.0
+                    if gg == g:
+                        score += 0.5
+                    scored.append((score, gg))
+                scored.sort(key=lambda x: -x[0])
+                for _score, gg in scored:
                     p = _pick_chart_file(
-                        os.path.join(base_dir, _safe_dir(g2)), fname)
+                        os.path.join(base_dir, _safe_dir(gg)), fname)
+                    if p:
+                        break
+            if not p:
+                # 候选组（已按传感器归属收敛）逐个尝试；config 组优先，
+                # 但传感器实际特征组/图库归属组优先于过时的 config 特征。
+                ordered = []
+                for gg in groups:
+                    if gg not in ordered:
+                        ordered.append(gg)
+                for gg in ordered:
+                    p = _pick_chart_file(
+                        os.path.join(base_dir, _safe_dir(gg)), fname)
                     if p:
                         break
             if not p and os.path.isdir(base_dir):
@@ -3690,13 +4180,27 @@ class BridgeData:
                 if len(cands) == 1:
                     p = cands[0]
         else:
-            # 无指标特征：按传感器特征组逐个尝试，找不到再扫描位置目录
+            # 无指标特征：按“图库预处理记录归属”优先，再按传感器特征组
+            # 逐个尝试，找不到再扫描位置目录。同样要避免同位置多特征组
+            # （DZJSD/SZJSD…）时按陈旧统计取到其它传感器的图。
             p = None
             feats = self._sensor_features.get(str(sensor_id), []) or []
-            for f in feats:
-                g = feature_group(f)
+            groups = [feature_group(f) for f in feats if feature_group(f)]
+            if os.path.isdir(base_dir):
+                for sub in sorted(os.listdir(base_dir)):
+                    if (os.path.isdir(os.path.join(base_dir, sub))
+                            and not sub.startswith("相关性")
+                            and sub not in groups):
+                        groups.append(sub)
+            owned = [gg for gg in groups
+                     if self._group_has_sensor(
+                         os.path.join(base_dir, _safe_dir(gg)),
+                         sensor_id)]
+            if owned:
+                groups = owned
+            for gg in groups:
                 p = _pick_chart_file(
-                    os.path.join(base_dir, _safe_dir(g)), fname)
+                    os.path.join(base_dir, _safe_dir(gg)), fname)
                 if p:
                     break
             if not p and os.path.isdir(base_dir):
@@ -3709,11 +4213,12 @@ class BridgeData:
         if p:
             return p
         if metric_feature:
-            p2 = _pick_chart_file(
-                os.path.join(base_dir, _safe_dir(g),
-                             _safe_dir(metric_feature)), fname)
-            if p2:
-                return p2
+            for gg in groups:
+                p2 = _pick_chart_file(
+                    os.path.join(base_dir, _safe_dir(gg),
+                                 _safe_dir(metric_feature)), fname)
+                if p2:
+                    return p2
         return None
 
     def _fuzzy_position_dir(self, pos: str) -> str:

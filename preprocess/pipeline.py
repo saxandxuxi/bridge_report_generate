@@ -81,6 +81,19 @@ def period_tag(start="", end=""):
     return f"{d0.year}.{d0.month}~{d1.year}.{d1.month}"
 
 
+def _dir_has_daily(path: str) -> bool:
+    """日级目录是否存在且含实际 CSV 数据。"""
+    if not os.path.isdir(path):
+        return False
+    try:
+        for _r, _dirs, files in os.walk(path):
+            if any(fn.lower().endswith(".csv") for fn in files):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def read_latest_dirs():
     """从 status.json 读取最近一次生成的 图库/统计值 目录。"""
     try:
@@ -139,6 +152,9 @@ def main() -> int:
     ap.add_argument("--end", default="", help="结束日期 YYYY-MM-DD")
     ap.add_argument("--skip-preprocess", action="store_true")
     ap.add_argument("--skip-charts", action="store_true")
+    ap.add_argument("--skip-stats", action="store_true",
+                    help="跳过统计值，只生成图库(合并图)；用于“有统计库没图库”"
+                         "时只补图库")
     ap.add_argument("--stats-only", action="store_true",
                     help="跳过预处理和图库，只重建统计值(逐传感器+位置统计)与"
                          "季度/年度统计")
@@ -166,6 +182,20 @@ def main() -> int:
     limit = args.limit_sensors or int(cfg.get("limit_sensors", 0) or 0)
     start = args.start or cfg.get("start", "")
     end = args.end or cfg.get("end", "")
+
+    # 未显式指定 --period 时，按起止日期自动识别年度：
+    # 同一年 1月1日 ~ 12月31日 即为年度（daily 根目录应传桥根，不是
+    # daily_<年>.1~12），避免 web 旧进程/其他入口漏传 --period 拼错目录。
+    if args.period == "quarterly" and start and end:
+        try:
+            d0 = dt.date.fromisoformat(str(start).strip())
+            d1 = dt.date.fromisoformat(str(end).strip())
+            if d0.year == d1.year and d0.month == 1 and d0.day == 1 \
+                    and d1.month == 12 and d1.day == 31:
+                args.period = "yearly"
+                log.info("按起止日期自动识别为年度周期（%s ~ %s）", start, end)
+        except ValueError:
+            pass
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -223,12 +253,36 @@ def main() -> int:
             return 1
 
     # 2) 日级 -> 图库 + 统计值
-    if not args.skip_charts or stats_only:
+    if (not args.skip_charts or stats_only) or args.skip_stats:
         tag = period_tag(start, end)
-        daily_base = os.path.join(daily, args.bridge) if (daily and args.bridge) \
-            else daily
+        if daily and args.bridge:
+            try:
+                from report_agent.config import resolve_bridge_dir
+                daily_base = resolve_bridge_dir(daily, args.bridge)
+            except Exception:  # noqa: BLE001
+                daily_base = os.path.join(daily, args.bridge)
+        else:
+            daily_base = daily
         if args.period == "yearly" and daily_base:
             # 年度：daily 根目录传桥根，build_chart_library 自动汇总 daily_* 子目录
+            # 先校验四个季度日级数据齐全，缺哪个季度明确报出来
+            if start and len(start) >= 4:
+                year = start[:4]
+                missing_q = []
+                for q, qtag in ((1, f"{year}.1~3"), (2, f"{year}.4~6"),
+                                (3, f"{year}.7~9"), (4, f"{year}.10~12")):
+                    if not _dir_has_daily(os.path.join(daily_base,
+                                                       f"daily_{qtag}")):
+                        missing_q.append(qtag)
+                if missing_q:
+                    status["error"] = (
+                        "年度建库前校验：以下季度日级数据缺失或为空："
+                        + "、".join(missing_q)
+                        + "；请先生成对应季度的日级数据再跑年度")
+                    status["running"] = False
+                    save_status(status)
+                    log.error(status["error"])
+                    return 1
             daily_data = daily_base
         else:
             daily_data = ((os.path.join(daily_base, f"daily_{tag}") if tag
@@ -248,6 +302,9 @@ def main() -> int:
         if stats_only:
             # 只重建统计值，不生成任何图
             cmd += ["--skip-charts"]
+        elif args.skip_stats:
+            # 只补图库（统计值保留已有结果）
+            cmd += ["--skip-stats"]
         if args.period == "yearly" and start and len(start) >= 4:
             # 年度：让 build_chart_library 按年份汇总桥根下所有季度 daily_* 子目录
             cmd += ["--year", start[:4]]
@@ -271,7 +328,7 @@ def main() -> int:
             return 1
 
     # 2.5) 日级 -> 季度/年度统计值(按监测部位合并多传感器)
-    if not args.skip_charts or stats_only:
+    if (not args.skip_charts or stats_only) and not args.skip_stats:
         if args.period == "yearly" and daily_base:
             stats_daily_root = daily_base      # 桥根目录, 汇总所有 daily_*
         else:

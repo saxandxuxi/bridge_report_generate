@@ -25,6 +25,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -150,9 +151,15 @@ def _data_dirs_for(cwd: str, cfg: dict, dir_label: str) -> tuple:
             base = b if os.path.isabs(b) else os.path.normpath(
                 os.path.join(cwd, b))
             break
-    charts = os.path.join(base, f"图库_{dir_label}", bridge) if bridge \
+    try:
+        from report_agent.config import resolve_bridge_subdir
+    except Exception:  # noqa: BLE001
+        resolve_bridge_subdir = lambda p, _b: p
+    charts = resolve_bridge_subdir(
+        os.path.join(base, f"图库_{dir_label}"), bridge) if bridge \
         else os.path.join(base, f"图库_{dir_label}")
-    stats = os.path.join(base, f"统计值_{dir_label}", bridge) if bridge \
+    stats = resolve_bridge_subdir(
+        os.path.join(base, f"统计值_{dir_label}"), bridge) if bridge \
         else os.path.join(base, f"统计值_{dir_label}")
     return charts, stats
 
@@ -169,6 +176,57 @@ def _data_ready(charts_dir: str, stats_dir: str) -> bool:
         return False
     return any(fn.lower().endswith(".json")
                for _r, _d, files in os.walk(pos_dir) for fn in files)
+
+
+TRAFFIC_BRIDGES = {"赤石大桥", "矮寨大桥", "洞庭湖大桥"}
+_TRAFFIC_FILE_RE = re.compile(
+    r"车道统计_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.xls$")
+
+
+def _traffic_raw_complete(cwd: str, bridge: str, start: str,
+                          end: str) -> bool:
+    """inputs/<桥>_车道统计_<期> 原始 xls 是否覆盖 start~end。"""
+    if bridge not in TRAFFIC_BRIDGES:
+        return True
+    try:
+        s = dt.date.fromisoformat(str(start)[:10])
+        e = dt.date.fromisoformat(str(end)[:10])
+    except ValueError:
+        return False
+    inputs_dir = os.path.join(cwd, "inputs")
+    covered = set()
+    for d in os.listdir(inputs_dir) if os.path.isdir(inputs_dir) else []:
+        full = os.path.join(inputs_dir, d)
+        if not (os.path.isdir(full)
+                and f"{bridge}_车道统计_" in d):
+            continue
+        for fn in os.listdir(full):
+            m = _TRAFFIC_FILE_RE.match(fn)
+            if not m:
+                continue
+            a = dt.date.fromisoformat(m.group(1))
+            b = dt.date.fromisoformat(m.group(2))
+            d0, d1 = max(a, s), min(b, e)
+            day = d0
+            while day <= d1:
+                covered.add(day)
+                day += dt.timedelta(days=1)
+    return len(covered) >= (e - s).days + 1
+
+
+def _traffic_daily_ready(daily_root: str, bridge: str,
+                         dir_label: str) -> bool:
+    """交通荷载 daily（车道N/总共）是否已生成。"""
+    try:
+        from report_agent.config import resolve_bridge_dir
+        root = resolve_bridge_dir(daily_root, bridge) if bridge else daily_root
+    except Exception:  # noqa: BLE001
+        root = os.path.join(daily_root, bridge) if bridge else daily_root
+    tdir = os.path.join(root, f"daily_{dir_label}", "交通荷载")
+    if not os.path.isdir(tdir):
+        return False
+    return any(os.path.isdir(os.path.join(tdir, d))
+               for d in os.listdir(tdir))
 
 
 def _load_preprocess_config(cwd: str) -> dict:
@@ -272,7 +330,28 @@ def _ensure_report_data(cwd: str, cfg: dict, period: dict) -> None:
         return
     bridge = str(bd.get("bridge_name") or "").strip()
     charts_dir, stats_dir = _data_dirs_for(cwd, cfg, period["dir_label"])
-    if _data_ready(charts_dir, stats_dir):
+    # 交通荷载：原始数据不齐全时提醒（需人工开 VPN 下载）；齐全但交通
+    # daily 缺失时强制重跑预处理，否则报告会缺交通荷载章节
+    traffic_daily_ok = True
+    if bridge in TRAFFIC_BRIDGES:
+        raw_ok = _traffic_raw_complete(
+            cwd, bridge, period["start"], period["end"])
+        if not raw_ok:
+            log.warning(
+                "%s 交通荷载原始数据不齐全：请开启 VPN 后运行 "
+                "download_monitor_data.py --bridges %s --start %s --end %s，"
+                "否则本次报告不含交通荷载数据",
+                bridge, bridge, period["start"], period["end"])
+        else:
+            pcfg = _load_preprocess_config(cwd)
+            daily = str(pcfg.get("daily_dir") or "").strip()
+            if daily:
+                traffic_daily_ok = _traffic_daily_ready(
+                    daily, bridge, period["dir_label"])
+                if not traffic_daily_ok:
+                    log.info("%s 交通荷载 daily 缺失，将重跑预处理补齐",
+                             bridge)
+    if _data_ready(charts_dir, stats_dir) and traffic_daily_ok:
         return
     log.info("报告期 %s 图库/统计值缺失，准备自动预处理：%s、%s",
              period["label"], charts_dir, stats_dir)
@@ -287,7 +366,11 @@ def _ensure_report_data(cwd: str, cfg: dict, period: dict) -> None:
         log.warning("缺数据但未配置 preprocess/config.json 的 raw_data_dir/"
                     "daily_dir，跳过自动预处理")
         return
-    daily_root = os.path.join(daily, bridge) if bridge else daily
+    try:
+        from report_agent.config import resolve_bridge_dir
+        daily_root = resolve_bridge_dir(daily, bridge) if bridge else daily
+    except Exception:  # noqa: BLE001
+        daily_root = os.path.join(daily, bridge) if bridge else daily
 
     if period["mode"] == "yearly":
         year = period["year"]
@@ -314,7 +397,8 @@ def _ensure_report_data(cwd: str, cfg: dict, period: dict) -> None:
         # 日级已完整：只重建图库/统计值/总结
         _run_pipeline_cmd(cwd, raw, daily, charts_dir, stats_dir,
                           bridge, period["start"], period["end"],
-                          "quarterly", map_docx, skip_preprocess=True)
+                          "quarterly", map_docx,
+                          skip_preprocess=traffic_daily_ok)
     else:
         # 日级缺失或不完整：全量预处理（--resume 续跑已生成的日文件）
         _run_pipeline_cmd(cwd, raw, daily, charts_dir, stats_dir,

@@ -112,6 +112,26 @@ def resolve_bridge_subdir(path: str, bridge_name: str) -> str:
     return path
 
 
+def resolve_bridge_dir(root: str, bridge_name: str) -> str:
+    """在 root 下找与桥名模糊匹配的子目录（湘江特大桥 <-> 湘江特 <-> 湘江），
+    用于 daily 数据根目录等“目录名可能不带‘大桥/特大桥’后缀”的场景。
+    找到返回该子目录绝对路径；找不到返回 root/<bridge_name>（保持旧行为）。
+    """
+    if not bridge_name or not root:
+        return root
+    if bridge_dir_match(bridge_name, os.path.basename(root)):
+        return root
+    if os.path.isdir(root):
+        try:
+            for entry in sorted(os.listdir(root)):
+                cand = os.path.join(root, entry)
+                if os.path.isdir(cand) and bridge_dir_match(bridge_name, entry):
+                    return cand
+        except OSError:
+            pass
+    return os.path.join(root, bridge_name)
+
+
 def _apply_latest_bridge_dirs(cfg: dict, base: str) -> None:
     """用 preprocess/status.json 中最近一次生成的 图库/统计值 目录覆盖 bridge_data 路径。
 

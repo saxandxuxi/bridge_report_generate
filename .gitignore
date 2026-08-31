@@ -32,6 +32,8 @@ web/current_bridge.json
 data/*.csv
 !data/.gitkeep
 monitor_credentials.json
+sync_daily/sync_daily_receiver.json
+skills-lock.json
 
 # ---------- 桥数据预处理产物（可在服务器重新生成） ----------
 preprocess/图库*/

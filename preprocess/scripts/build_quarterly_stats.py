@@ -433,6 +433,15 @@ def main():
             "桥": {},
         }
         done = 0
+        # 多数传感器公共缺失时间段（build_chart_library 生成，小时级）
+        _common_missing = {}
+        _cm_path = os.path.join(stats_dir, "公共缺失时间段.json")
+        if os.path.isfile(_cm_path):
+            try:
+                with open(_cm_path, encoding="utf-8") as f:
+                    _common_missing = (json.load(f).get("特征") or {})
+            except Exception:
+                _common_missing = {}
         for feat, pos_tree in sorted(feat_tree.items()):
             pos_entries = {}      # 位置 -> 测点 -> 整体统计
             fault_period_pts = set()   # (位置, 测点) 剔除过故障时间段
@@ -561,6 +570,10 @@ def main():
                     md = float(st.get("缺失天数") or 0)
                 except (TypeError, ValueError):
                     return False
+                if period == "yearly":
+                    # 年度报告只报“缺失一个月以上”（30天=720h），
+                    # 数据缺失严重的传感器位置 不再混入 72h 级缺失
+                    return md > 30 or mh >= 720.0
                 return md > 0 or mh >= threshold
 
             # 位置级故障/缺失清单：同一位置多个测点时具体到测点
@@ -639,12 +652,15 @@ def main():
                 d = mx - mn
                 if _rmdiff_v is None or d > _rmdiff_v:
                     _rmdiff_v, _rmdiff_p = d, _pos
+            _avg_cov = _f("覆盖天数", lambda vs: sum(vs) / len(vs))
             stats = {
                 "起始日期": min((str(s.get("起始日期")) for _p, s in st_records
                                 if s.get("起始日期")), default=""),
                 "结束日期": max((str(s.get("结束日期")) for _p, s in st_records
                                 if s.get("结束日期")), default=""),
                 "覆盖天数": _f("覆盖天数", max) or 0,
+                "平均覆盖天数": round(_avg_cov, 1)
+                if _avg_cov is not None else None,
                 "有效小时数": _f("有效小时数", max) or 0,
                 "缺失小时数": _f("缺失小时数", max) or 0,
                 "平均值": _f("平均值", lambda vs: sum(vs) / len(vs)),
@@ -670,6 +686,9 @@ def main():
                 "绝对最大值位置": _abs_p or "",
                 "差值位置": _diff_p or "",
             }
+            _cm = _common_missing.get(feat)
+            if _cm:
+                stats["多数传感器缺失时间段"] = _cm
             if _rmx_v is not None:
                 stats["剔除温度最大值"] = _rmx_v
                 stats["剔除温度最大值位置"] = _rmx_p or ""

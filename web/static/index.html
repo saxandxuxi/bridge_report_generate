@@ -148,9 +148,20 @@
       </div>
       <div class="row">
         <label style="font-size:13px"><input type="checkbox" id="runAutoPre" checked> 缺数据时自动预处理（秒级→日级→图库/统计值）</label>
+        <label style="font-size:13px">
+          交通荷载数据
+          <select id="runTraffic" title="赤石/矮寨/洞庭湖 有车道统计；选“有”会在生成前检查原始数据是否齐全">
+            <option value="auto">自动检测</option>
+            <option value="yes">有</option>
+            <option value="no">无</option>
+          </select>
+        </label>
+        <button class="ghost" onclick="checkTraffic()">检查交通数据</button>
+        <button class="ghost" id="trafficDownloadBtn" onclick="startTrafficDownload()" style="display:none">下载交通数据（需开VPN）</button>
         <button class="ghost" onclick="checkPeriod()">检查该周期数据</button>
       </div>
       <div id="periodInfo" class="muted"></div>
+      <div id="trafficInfo" class="muted"></div>
       <div id="runStatus" class="muted"></div>
       <div id="runResult"></div>
     </div>
@@ -683,7 +694,8 @@ function startRun() {
   var body = {
     mode: $("runMode").value,
     date: $("runEnd").value || "",
-    template: $("runTemplate").value || ""
+    template: $("runTemplate").value || "",
+    traffic: $("runTraffic").value || "auto"
   };
   if (body.mode === "quarterly") {
     body.quarter = $("runQuarter").value || "1";
@@ -766,6 +778,78 @@ function loadReports() {
       tbody.appendChild(tr);
     });
   }).catch(function (e) { showMsg(String(e), "err"); });
+}
+
+function periodQuery() {
+  var mode = $("runMode").value;
+  var q = ["mode=" + encodeURIComponent(mode)];
+  if (mode === "quarterly") {
+    q.push("quarter=" + encodeURIComponent($("runQuarter").value || "1"));
+    q.push("year=" + encodeURIComponent($("runYear").value || String(new Date().getFullYear())));
+  } else if (mode === "yearly") {
+    q.push("year=" + encodeURIComponent($("runYear").value || String(new Date().getFullYear())));
+  }
+  if (mode === "manual") q.push("start=" + encodeURIComponent($("runStart").value || ""));
+  return q;
+}
+
+function currentPeriod() {
+  var mode = $("runMode").value;
+  var body = { mode: mode };
+  if (mode === "quarterly") { body.quarter = $("runQuarter").value || "1"; body.year = $("runYear").value || String(new Date().getFullYear()); }
+  else if (mode === "yearly") { body.year = $("runYear").value || String(new Date().getFullYear()); }
+  else if (mode === "manual") { body.start = $("runStart").value || ""; body.end = $("runEnd").value || ""; }
+  return body;
+}
+
+function checkTraffic() {
+  var bridgeId = currentBridgeId();
+  api("/api/bridges/" + bridgeId + "/traffic-status?" + periodQuery().join("&"), { method: "GET" })
+    .then(function (r) {
+      if (r.has_traffic === false) {
+        $("trafficInfo").textContent = "该桥无交通荷载数据";
+        $("trafficDownloadBtn").style.display = "none";
+        return;
+      }
+      var t = "交通荷载原始数据：" + (r.complete ? "齐全" : "不齐全")
+        + "（覆盖 " + (r.covered_days || 0) + "/" + (r.need_days || 0) + " 天"
+        + (r.missing && r.missing.length ? "，缺 " + r.missing.join(",") : "") + "）"
+        + "；交通 daily：" + (r.daily_ready ? "已生成" : "未生成");
+      $("trafficInfo").textContent = t;
+      $("trafficDownloadBtn").style.display = r.complete ? "none" : "inline-block";
+    })
+    .catch(function (e) { $("trafficInfo").textContent = "交通状态检查失败: " + e; });
+}
+
+function startTrafficDownload() {
+  var bridgeId = currentBridgeId();
+  var body = currentPeriod();
+  api("/api/bridges/" + bridgeId + "/traffic-download", { method: "POST", body: JSON.stringify(body) })
+    .then(function (r) {
+      showMsg(r.tip || "已启动下载，请在弹出的浏览器里完成验证码", "ok");
+      pollTrafficDownload(bridgeId);
+    })
+    .catch(function (e) { showMsg(String(e), "err"); });
+}
+
+function pollTrafficDownload(bridgeId) {
+  if (STATE.trafficTimer) clearInterval(STATE.trafficTimer);
+  STATE.trafficTimer = setInterval(function () {
+    api("/api/bridges/" + bridgeId + "/traffic-download/status").then(function (r) {
+      if (!r.running) {
+        clearInterval(STATE.trafficTimer);
+        STATE.trafficTimer = null;
+        if (r.error) { showMsg("下载失败: " + r.error, "err"); }
+        else { showMsg("交通数据下载完成（" + (r.done || []).join(",") + "）", "ok"); }
+        $("trafficInfo").textContent = "交通荷载原始数据：" + (r.raw_complete ? "已齐全" : "仍不齐全")
+          + "（覆盖 " + (r.covered_days || 0) + "/" + (r.need_days || 0) + " 天）";
+        checkTraffic();
+        return;
+      }
+      $("trafficInfo").textContent = "正在下载交通数据…当前 " + (r.current || "") +
+        "（已完成 " + (r.done || []).join(",") + "）；请完成浏览器验证码。";
+    }).catch(function () {});
+  }, 3000);
 }
 
 function previewReport(bridgeId, name) {

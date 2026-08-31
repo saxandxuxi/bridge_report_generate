@@ -291,6 +291,7 @@ def _metric_from_chart_text(text: str) -> str:
         ("裂缝", "crack"),
         ("风速", "wind_speed"),
         ("风向", "wind_dir"),
+        ("地震", "earthquake_load"),
         ("振动", "vibration"),
         ("应力", "stress"),
         ("沉降", "settlement"),
@@ -1281,9 +1282,15 @@ def parse_docx(path: str) -> dict:
             kind = ("histogram" if ("直方" in m3.group(3) or "频率" in m3.group(3))
                     else "time_series")
             chart_id = "trend" if kind == "time_series" else "histogram"
-            metric_en = (FEATURE_METRIC.get(_norm(feature_raw), "")
-                         or _metric_from_chart_text(t)
-                         or "chart")
+            _fn = _norm(feature_raw)
+            if _fn in ("xjsd", "yjsd", "zjsd"):
+                # 轴分量特征码同时用于 振动(DZJSD)/地震(SZJSD)：
+                # 不能直接定成振动，交给节上下文/表格标题定指标
+                metric_en = "chart"
+            else:
+                metric_en = (FEATURE_METRIC.get(_fn, "")
+                             or _metric_from_chart_text(t)
+                             or "chart")
             chart_texts.append({
                 "paragraph": i,
                 "kind": kind,
@@ -2101,10 +2108,51 @@ def _chart_block_locations(paragraph, cell_ref_paras: Dict[int, tuple],
     return uniq
 
 
+def _strip_section_no(title: str) -> str:
+    """去掉开头的章节号；兼容章节号与墩号粘连的场景。
+
+    Word 自动编号的章节号（如 3.4.2.7）与标题文字之间没有空格时，提取结果
+    会变成 “3.4.2.759#墩根部截面…”（3.4.2.7 + 59#墩…）。普通剥离正则
+    “^\\d+(\\.\\d+){0,3}” 会因章节号后紧跟数字“5”而失败。这里直接找
+    形如 N#墩 的墩号，若其前面整段是章节号（至少含一个点）则剥离，并保留
+    墩号最长（2 位内）的分割（12#墩 优于 2#墩，59# 优于 9#）。
+    """
+    t = str(title or "")
+    # 常规：章节号后是空格或非数字（3.4.2.7 59#墩 / 3.4.2.7上游…）
+    t2 = re.sub(r"^\d+(?:\.\d+){0,3}(?![.\d#])\s*", "", t)
+    if t2 != t:
+        return t2
+    best, best_dun = None, ""
+    for mm in re.finditer(r"(\d{1,2})#(?:柱)?墩", t):
+        pre = t[:mm.start(1)]
+        if re.match(r"^\d+(?:\.\d+){1,3}$", pre) \
+                and len(mm.group(1)) > len(best_dun):
+            best, best_dun = t[mm.start(1):], mm.group(1)
+    return best or t
+
+
+def _split_glued_heading(text: str) -> str:
+    """章节号与墩号粘连的标题补空格：3.4.2.759#墩… -> 3.4.2.7 59#墩…。
+
+    与 _strip_section_no 同一套判定：找到 N#墩 且其前整段是章节号的位置，
+    取墩号最长（2 位内）的分割，在章节号与墩号之间补一个空格。
+    """
+    t = str(text or "")
+    best, best_dun = None, ""
+    for mm in re.finditer(r"(\d{1,2})#(?:柱)?墩", t):
+        pre = t[:mm.start(1)]
+        if re.match(r"^\d+(?:\.\d+){1,3}$", pre) \
+                and len(mm.group(1)) > len(best_dun):
+            best, best_dun = mm.start(1), mm.group(1)
+    if best is None:
+        return ""
+    return t[:best] + " " + t[best:]
+
+
 def _position_from_title(title: str) -> str:
     """从节标题/表标题提取监测位置（去掉章节号、指标词、监测/统计等）。"""
     # 只剥掉章节号（如 3.3.6.1），不能吃掉墩号数字（如 “2#墩…” 开头的 2）
-    t = re.sub(r"^\d+(?:\.\d+){0,3}(?![.\d#])\s*", "", str(title or ""))
+    t = _strip_section_no(title)
     for w in ("结构应变监测", "环境湿度监测", "环境温度监测", "结构温度监测",
               "挠度监测", "位移监测", "倾角监测", "裂缝监测", "索力监测",
               "风速风向监测", "风速监测", "支座位移监测", "交通监测",
@@ -2132,7 +2180,7 @@ def _cell_position_from_title(title: str) -> str:
         “上游随州侧边跨跨中箱梁结构温度监测统计” -> “上游随州侧边跨跨中箱梁”
         “随州侧边跨跨中截面环境温度监测统计” -> “随州侧边跨跨中截面”
     """
-    t = re.sub(r"^\d+(?:\.\d+){0,3}(?![.\d#])\s*", "", str(title or ""))
+    t = _strip_section_no(title)
     for w in ("结构温度监测", "环境温度监测", "环境湿度监测", "应变监测",
               "挠度监测", "位移监测", "倾角监测", "振动监测", "地震监测",
               "索力监测", "裂缝监测", "风速监测", "风向监测",
@@ -2264,8 +2312,11 @@ def _expand_chart_blocks(analysis: dict, cell_ref_paras: Dict[int, tuple],
                     if pos:
                         locations = [pos]
                         title_fallback = True
-                        if "结构温度" in t:
-                            metric = "structure_temperature"
+                        _tm = _metric_from_chart_text(t)
+                        if _tm != "chart":
+                            # 节标题（如 “3.3.4.2 3#墩根部截面振动”）推断指标，
+                            # 避免生成 chart_<位置>_trend_N 这种泛型占位符
+                            metric = _tm
                         break
         _DIRECTION_NORM = {"左侧", "右侧", "上游", "下游", "上游侧", "下游侧",
                            "左", "右", "左x", "右x", "左y", "右y",
@@ -3021,6 +3072,12 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
         for i, t in enumerate(analysis.get("texts", []) or []):
             if original in t:
                 text_targets.setdefault(i, []).append((original, replacement))
+    # 章节号与标题文字粘连（Word 自动编号与正文无空格）：
+    # “3.4.2.759#墩根部截面挠度监测” -> “3.4.2.7 59#墩根部截面挠度监测”
+    for i, t in enumerate(analysis.get("texts", []) or []):
+        fixed = _split_glued_heading(str(t))
+        if fixed and fixed != str(t):
+            text_targets.setdefault(i, []).append((str(t), fixed))
     replaced_numbers = 0
     skipped_numbers = 0
     replaced_images = 0
@@ -3033,6 +3090,8 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     # 4.1 监测结论 条目段：整体由 {{conclusions}}（LLM 综合各分项小结）替代，
     # 第一条保留占位符，其余清空，避免旧值/旧位置写死进模板
     conclusion_paras = detect_conclusion_item_paras(texts_all)
+    removed_conclusion_els = []   # 被清空的结论条目段落（遍历后整段删除，
+    #                             避免（1）…（N）替换后中间留大片空行）
 
     # 交通荷载跨车道图：“交通荷载图1/图2”类图题 -> {{chart.traffic_...}}
     traffic_chart_targets = {}
@@ -3076,11 +3135,15 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
             if idx == conclusion_paras[0]:
                 _flatten_omml(p._p)
                 _replace_whole_paragraph(p, "{{conclusions}}")
+                # 结论段落：左对齐、去底色（原文可能居中/黄色高亮）
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _clear_run_highlight(p)
                 replaced_texts += 1
                 return
             if idx in conclusion_paras[1:]:
                 _flatten_omml(p._p)
                 _clear_paragraph_text(p)
+                removed_conclusion_els.append(p._p)
                 return
         if idx in cleared_sensor_lines:
             # 清空整段前先转换公式节点，避免 oMath 悬空渲染
@@ -3214,6 +3277,12 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
             process_paragraph(p, idx)
             idx += 1
 
+    # 结论条目（2）…（N）已清空：直接删除空段，避免结论区大片空行
+    for el in removed_conclusion_els:
+        parent = el.getparent()
+        if parent is not None:
+            parent.remove(el)
+
     # 图表块展开需要额外插入的占位段落（统一在遍历后插入，避免干扰段落迭代）
     for anchor_el, markers in pending_inserts:
         for marker in reversed(markers):
@@ -3247,6 +3316,19 @@ def _replace_whole_paragraph(p, marker: str) -> None:
             r.text = ""
     else:
         p.add_run(marker)
+
+
+def _clear_run_highlight(p) -> None:
+    """清除段落所有 run 的高亮/底色（w:highlight），用于结论等正文段。"""
+    from docx.oxml.ns import qn as _qn
+    for r in p.runs:
+        rPr = r._r.find(_qn("w:rPr"))
+        if rPr is None:
+            continue
+        for tag in ("w:highlight", "w:shd"):
+            el = rPr.find(_qn(tag))
+            if el is not None:
+                rPr.remove(el)
 
 
 def _clear_paragraph_text(p) -> None:

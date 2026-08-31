@@ -41,6 +41,8 @@ from docx.shared import Inches, Pt
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
+from .bridge_source import format_report_number
+
 log = logging.getLogger("report-agent.report_builder")
 
 # 占位符正则：key + 可选格式说明符 + 可选默认值
@@ -331,26 +333,20 @@ def build_value_resolver(stats: Dict, period: Dict,
 
 
 def _format_cell_value(stat: str, value: float) -> str:
-    """格式化表格单元格值。"""
+    """格式化表格单元格值。
+
+    统一走 format_report_number（0 以上两位小数、0 以下三位有效数字、
+    极小量科学计数法三位有效数字）；相关性系数保留 3 位小数，
+    避免 0.996/0.997 被舍成 1.00。"""
     if isinstance(value, bool):
         return "是" if value else "否"
     if isinstance(value, int):
         return str(value)
+    # 相关性系数：保留 3 位小数（无量纲，2 位会丢信息）
+    if stat in ("corr", "相关性系数") and isinstance(value, float):
+        return f"{value:.3f}"
     if isinstance(value, float):
-        # 整数化的值（如 0.0）显示为整数
-        if value == int(value) and abs(value) < 1e9:
-            return str(int(value))
-        # 只有真正极小（绝对值 < 1e-4，如 9.7e-05）才用科学计数法；
-        # 0.0001~0.1 之间的小量（如 -2.810e-04、1.357e-03）用普通小数
-        # 展示，避免表格里 0.000281 这类数据写成科学计数。
-        if abs(value) < 1e-4 and value != 0.0:
-            return f"{value:.3e}"
-        if abs(value) < 0.1:
-            return f"{value:.4g}"
-        # 标准差用 2 位小数
-        if stat in ("std", "均方根", "rms"):
-            return f"{value:.2f}"
-        return f"{value:.2f}"
+        return format_report_number(value)
     return str(value)
 
 
@@ -362,13 +358,9 @@ def _format_stat_value(key: str, value) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        if key.endswith(".std"):
-            return f"{value:.2f}"
-        if abs(value) < 1e-4 and value != 0.0:
-            return f"{value:.3e}"
-        if abs(value) < 0.1:
-            return f"{value:.4g}"
-        return f"{value:.1f}"
+        if key.endswith((".std", ".corr", ".相关性系数")):
+            return f"{value:.2f}" if key.endswith(".std") else f"{value:.3f}"
+        return format_report_number(value)
     return str(value)
 
 
@@ -430,10 +422,79 @@ def _fill_paragraph(paragraph: Paragraph, resolver: Callable[[str], str],
         last = m.end()
     parts.append(full[last:])
 
-    runs[0].text = "".join(parts)
-    for r in runs[1:]:
-        r.text = ""
+    final_text = "".join(parts)
+    is_conclusions = any(
+        m.group(1) == "conclusions" or m.group(1).startswith("conclusions.")
+        for m in matches)
+    if "\n" in final_text:
+        # 多行占位符（4.1 结论/多特征小结）：拆成独立段落，新段落继承原段
+        # pPr（含首行缩进），而不是行内换行——行内换行不会带首行缩进
+        lines = final_text.split("\n")
+        if is_conclusions:
+            # LLM 结论可能带空行（\n\n），空行拆出的空段落会造成大片留白
+            lines = [x for x in lines if x.strip()]
+        created = _split_paragraph_into_lines(
+            paragraph, lines)
+        if is_conclusions:
+            for pp in [paragraph] + created:
+                pp.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                _clear_run_highlight(pp)
+    else:
+        runs[0].text = final_text
+        for r in runs[1:]:
+            r.text = ""
+        if is_conclusions:
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            _clear_run_highlight(paragraph)
     return replaced
+
+
+def _split_paragraph_into_lines(paragraph: Paragraph,
+                                lines: list) -> list:
+    """把一段文字按行拆成多个段落。
+
+    后续段落深拷贝首段 pPr（保留 首行缩进/行距/对齐 等），首段保留原格式；
+    返回新建的 Paragraph 列表。
+    """
+    from copy import deepcopy
+    from docx.text.paragraph import Paragraph as _Para
+    lines = [str(x) for x in (lines or [])]
+    if not lines:
+        lines = [""]
+    first_p = paragraph._p
+    parent = paragraph._parent
+    runs = paragraph.runs
+    if runs:
+        runs[0].text = lines[0]
+        for r in runs[1:]:
+            r.text = ""
+    else:
+        paragraph.add_run(lines[0])
+    created = []
+    anchor = first_p
+    for seg in lines[1:]:
+        new_p = deepcopy(first_p)
+        for r in new_p.findall(qn("w:r")):
+            new_p.remove(r)
+        anchor.addnext(new_p)
+        np_para = _Para(new_p, parent)
+        np_para.add_run(seg)
+        created.append(np_para)
+        anchor = new_p
+    return created
+
+
+def _clear_run_highlight(paragraph: Paragraph) -> None:
+    """清除段落所有 run 的高亮/底色（w:highlight/w:shd）。"""
+    from docx.oxml.ns import qn as _qn
+    for r in paragraph.runs:
+        rPr = r._r.find(_qn("w:rPr"))
+        if rPr is None:
+            continue
+        for tag in ("w:highlight", "w:shd"):
+            el = rPr.find(_qn(tag))
+            if el is not None:
+                rPr.remove(el)
 
 
 def _paragraph_text(paragraph: Paragraph) -> str:
@@ -801,6 +862,179 @@ def _enable_update_fields(doc: Document) -> None:
         settings.append(el)
 
 
+def _merge_body_sections(doc: Document) -> bool:
+    """把正文区末尾两个连续分节合并为最后一节（页面尺寸一致时）。
+
+    源报告常见：封面/目录一节 + 正文一节（引言起，页码从 1 重启）+
+    正文续接一节（3.监测数据分析 起，不重启）。这样“共N页”用 NUMPAGES
+    会算整个文档，而不是从引言起算。把正文两节合并成最后一节后，页脚
+    可用 SECTIONPAGES 得到正文总页数（引言=第1页）。合并时把前节的
+    页码起始/页眉/页脚引用迁移到末节，避免页眉丢失。
+    返回是否发生合并。
+    """
+    body = doc.element.body
+    para_sectprs = []
+    for p in body.iter(qn("w:p")):
+        ps = p.find(qn("w:pPr"))
+        sp = ps.find(qn("w:sectPr")) if ps is not None else None
+        if sp is not None:
+            para_sectprs.append((p, sp))
+    body_final = body.find(qn("w:sectPr"))
+    if body_final is None or not para_sectprs:
+        return False
+    last_p, last_sp = para_sectprs[-1]
+
+    def _pg_size(sp):
+        sz = sp.find(qn("w:pgSz"))
+        if sz is None:
+            return None
+        return (sz.get(qn("w:w")), sz.get(qn("w:h")),
+                sz.get(qn("w:orient")))
+
+    # 末节与前节页面尺寸不一致（如横版）时不合并，避免破坏版式
+    if _pg_size(last_sp) != _pg_size(body_final):
+        return False
+    # 末节若自行重启页码，说明是独立编号节，不合并
+    bf_pg = body_final.find(qn("w:pgNumType"))
+    if bf_pg is not None and bf_pg.get(qn("w:start")):
+        return False
+
+    import copy as _copy
+    # 迁移：页码起始 / 页眉引用 / 页脚引用（header/footer 引用按 schema
+    # 顺序位于 sectPr 末尾，直接 append 即可）
+    src_pg = last_sp.find(qn("w:pgNumType"))
+    if src_pg is not None:
+        if bf_pg is None:
+            bf_pg = OxmlElement("w:pgNumType")
+            cols = body_final.find(qn("w:cols"))
+            if cols is not None:
+                cols.addprevious(bf_pg)
+            else:
+                body_final.append(bf_pg)
+        if src_pg.get(qn("w:start")):
+            bf_pg.set(qn("w:start"), src_pg.get(qn("w:start")))
+    for tag in ("w:headerReference", "w:footerReference"):
+        el = last_sp.find(qn(tag))
+        if el is None:
+            continue
+        old = body_final.find(qn(tag))
+        if old is not None:
+            body_final.remove(old)
+        body_final.append(_copy.deepcopy(el))
+
+    # 去掉前节的段落级分节符；空段直接删除
+    ps = last_p.find(qn("w:pPr"))
+    sp2 = ps.find(qn("w:sectPr")) if ps is not None else None
+    if sp2 is not None:
+        ps.remove(sp2)
+    txt = "".join(t.text or "" for t in last_p.iter(qn("w:t"))).strip()
+    if not txt:
+        parent = last_p.getparent()
+        if parent is not None:
+            parent.remove(last_p)
+    return True
+
+
+def _fix_footer_total_pages(doc: Document,
+                            use_section_pages: bool = False) -> int:
+    """把页脚里写死的“共N页”转成总页数域。
+
+    源报告页脚常把总页数写死（如“第{PAGE}页/共76页”，76 是纯文本），
+    Word 不会刷新，生成后总页数对不上。这里把所有页脚部件里的
+    “共N页”替换为 共 + NUMPAGES/SECTIONPAGES 域 + 页，配合 settings 里的
+    updateFields，Word/WPS 打开时自动按真实排版计算总页数。
+    use_section_pages=True 时用 SECTIONPAGES（正文合并为最后一节后，
+    即从引言起算的正文总页数）；否则用 NUMPAGES（整篇总页数）。
+    返回替换的页脚数。
+    """
+    fld_name = "SECTIONPAGES" if use_section_pages else "NUMPAGES"
+    fixed = 0
+    import copy as _copy
+    for part in doc.part.package.parts:
+        pn = str(part.partname)
+        if not pn.endswith(".xml") or "/footer" not in pn:
+            continue
+        root = part._element
+        # 已有总页数域（NUMPAGES）：需要时改为 SECTIONPAGES 并补 rPr
+        if use_section_pages:
+            for it in root.iter(qn("w:instrText")):
+                if str(it.text or "").strip().upper().startswith("NUMPAGES"):
+                    it.text = "SECTIONPAGES   \\* MERGEFORMAT"
+                    fixed += 1
+            # 给域内缺少 rPr 的 run 补上与相邻文本一致的 rPr
+            runs = list(root.iter(qn("w:r")))
+            rpr_src = None
+            for r_ in runs:
+                if r_.find(qn("w:rPr")) is not None \
+                        and r_.find(qn("w:t")) is not None:
+                    rpr_src = r_.find(qn("w:rPr"))
+                    break
+            if rpr_src is not None:
+                for r_ in runs:
+                    if r_.find(qn("w:rPr")) is None \
+                            and (r_.find(qn("w:fldChar")) is not None
+                                 or r_.find(qn("w:instrText")) is not None
+                                 or r_.find(qn("w:t")) is not None):
+                        r_.insert(0, _copy.deepcopy(rpr_src))
+        # 写死的“共N页”纯文本 -> 总页数域
+        for r in list(root.iter(qn("w:r"))):
+            texts = [t.text or "" for t in r.iter(qn("w:t"))]
+            full = "".join(texts)
+            m = re.search(r"(共\s*)(\d+)(\s*页)", full)
+            if not m:
+                continue
+            ts = list(r.iter(qn("w:t")))
+            pre = full[:m.start()]
+            tail = full[m.end():]
+            rpr = r.find(qn("w:rPr"))
+            if ts:
+                ts[0].text = pre + "共"
+                for t in ts[1:]:
+                    t.text = ""
+            else:
+                t = OxmlElement("w:t")
+                t.text = pre + "共"
+                r.append(t)
+            # 依次插入 NUMPAGES 域：begin / instrText / separate / 缓存值 / end
+            anchor = r
+            for ftype, payload in (
+                ("begin", None),
+                (None, fld_name + "   \\* MERGEFORMAT"),
+                ("separate", None),
+                (None, "1"),
+                ("end", None),
+            ):
+                nr = OxmlElement("w:r")
+                if rpr is not None:
+                    nr.append(_copy.deepcopy(rpr))
+                if ftype:
+                    fc = OxmlElement("w:fldChar")
+                    fc.set(qn("w:fldCharType"), ftype)
+                    nr.append(fc)
+                else:
+                    if payload.startswith("NUMPAGES"):
+                        it = OxmlElement("w:instrText")
+                        it.set(qn("xml:space"), "preserve")
+                        it.text = payload
+                        nr.append(it)
+                    else:
+                        tv = OxmlElement("w:t")
+                        tv.text = payload
+                        nr.append(tv)
+                anchor.addnext(nr)
+                anchor = nr
+            # “页”及后续文字
+            nr_tail = OxmlElement("w:r")
+            if rpr is not None:
+                nr_tail.append(_copy.deepcopy(rpr))
+            tt = OxmlElement("w:t")
+            tt.text = "页" + tail
+            nr_tail.append(tt)
+            anchor.addnext(nr_tail)
+            fixed += 1
+    return fixed
+
+
 def _flatten_rgba_in_docx(path: str) -> int:
     """把 docx 包内所有 RGBA/调色板 PNG 原位转成 RGB（WPS/Word 兼容性兜底）。
 
@@ -1113,6 +1347,12 @@ def build_report(
     if period:
         fixed = _apply_period_text_fixes(doc, period)
     _enable_update_fields(doc)
+    merged_body = _merge_body_sections(doc)
+    _n_page = _fix_footer_total_pages(doc, use_section_pages=merged_body)
+    if _n_page:
+        log.info("页脚总页数转 %s 域：%d 处%s",
+                 "SECTIONPAGES" if merged_body else "NUMPAGES",
+                 _n_page, "（正文分节已合并，总页数从引言起算）" if merged_body else "")
     if fixed:
         log.info("报告期文字修正 %d 处（页眉/落款日期/季度）", fixed)
 
@@ -1163,6 +1403,7 @@ def _normalize_unit_spacing(text: str) -> str:
     if not text:
         return text
     t = re.sub(r" {2,}", " ", text)
+    t = re.sub(r"。{2,}", "。", t)   # 收尾：连续句号压成一个
     t = _UNIT_SPACE_RE.sub(
         lambda m: f"{m.group('num')} {m.group('unit')}", t)
     t = _UNIT_TRAIL_RE.sub(r"\1", t)

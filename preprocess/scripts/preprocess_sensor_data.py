@@ -131,7 +131,7 @@ def _find_traffic_dirs(traffic_root, bridge):
         m = TRAFFIC_DIR_RE.match(d)
         if not m:
             continue
-        if bridge and bridge not in m.group(1):
+        if bridge and not _bridge_dir_match(bridge, m.group(1)):
             continue
         out.append(full)
     return out
@@ -285,6 +285,37 @@ def resolve_output_root():
         return OUTPUT_ROOT
     parent = os.path.dirname(DATA_ROOT.rstrip("/\\"))
     return os.path.join(parent, "results")
+
+
+def _strip_bridge_suffix(name: str) -> str:
+    for s in ("特大桥", "大桥"):
+        if str(name or "").endswith(s):
+            return str(name)[: -len(s)]
+    return str(name or "")
+
+
+def _bridge_dir_match(a: str, b: str) -> bool:
+    """桥名与目录名兼容：湘江特大桥 <-> 湘江特 <-> 湘江 都算匹配。"""
+    a2, b2 = _strip_bridge_suffix(a), _strip_bridge_suffix(b)
+    return bool(a2 and b2) and (a2 in b2 or b2 in a2)
+
+
+def _resolve_bridge_output_root(root: str, bridge: str) -> str:
+    """输出根目录下的桥名子目录模糊匹配：已存在 湘江特 则复用，
+    避免桥名写法不一致（湘江特大桥）导致整季重新预处理。"""
+    if not bridge or not root:
+        return root
+    if _bridge_dir_match(bridge, os.path.basename(root)):
+        return root
+    if os.path.isdir(root):
+        try:
+            for entry in sorted(os.listdir(root)):
+                cand = os.path.join(root, entry)
+                if os.path.isdir(cand) and _bridge_dir_match(bridge, entry):
+                    return cand
+        except OSError:
+            pass
+    return os.path.join(root, bridge)
 
 
 def parse_ts(text):
@@ -1199,7 +1230,7 @@ def main():
     DATA_ROOT = args.data_root
     OUTPUT_ROOT = args.output_root or resolve_output_root()
     if args.bridge:
-        OUTPUT_ROOT = os.path.join(OUTPUT_ROOT, args.bridge)
+        OUTPUT_ROOT = _resolve_bridge_output_root(OUTPUT_ROOT, args.bridge)
     BUCKET_SECONDS = args.bucket
     WORKERS = args.workers
     MEDIAN_MODE = args.median_mode

@@ -18,6 +18,53 @@ log = logging.getLogger("report-agent.agent")
 from .period_utils import last_completed_quarter, quarter_range  # noqa: E402
 
 
+_UNIT_HINT_HEADING_RE = re.compile(r"^\d+(?:\.\d+){1,3}\s*\S.*$")
+
+
+def _chart_unit_hint(chart_texts: List[Dict], para, texts=None) -> str:
+    """取图表段邻近表格的列头（单位/轴向）作为图片插入校验提示。
+
+    规则：向下找最近的表格（同表标题连续、中间不能跨节标题）；向下
+    没有时向上找。返回列头文本拼接，如
+    “纵桥向(X方向) 横桥向(Y方向) 竖向(Z方向) 平均/（m/s²）”。
+    """
+    if not isinstance(para, int) or not chart_texts:
+        return ""
+    refs = [
+        r for r in chart_texts
+        if str(r.get("kind", "")).startswith("cell")
+        and isinstance(r.get("paragraph"), int)
+        and str(r.get("col_header", "")).strip()
+    ]
+    if not refs:
+        return ""
+    below = sorted((r for r in refs if r["paragraph"] >= para),
+                   key=lambda r: r["paragraph"])
+    above = sorted((r for r in refs if r["paragraph"] < para),
+                   key=lambda r: -r["paragraph"])
+    candidates = below or above
+    if not candidates:
+        return ""
+    p_first = candidates[0]["paragraph"]
+    # 图表与表格之间不能跨节标题（如“3.2.3作用监测小结”），否则表格属于下一节
+    lo, hi = (para + 1, p_first) if below else (p_first + 1, para)
+    if texts:
+        for pno in range(lo, hi):
+            t = str(texts[pno]).strip() if 0 <= pno < len(texts) else ""
+            if (t and len(t) <= 40 and _UNIT_HINT_HEADING_RE.match(t)
+                    and re.search(r"监测|分析|小结", t)):
+                return ""
+    title = candidates[0].get("table_title", "")
+    headers = []
+    for r in candidates:
+        if r.get("table_title") != title:
+            break
+        h = str(r.get("col_header", "")).strip()
+        if h and h not in headers:
+            headers.append(h)
+    return " ".join(headers)
+
+
 def resolve_period(
     mode: str,
     report_date: Optional[dt.date] = None,
@@ -119,6 +166,47 @@ def _is_other_registered_bridge_name(name: str, current: str) -> bool:
     return any(_bridge_key(b.get("name")) == nk for b in bridges)
 
 
+def _fix_period_dirs(cfg: dict, bridge_cfg: dict, period: Dict) -> None:
+    """把 bridge_data 的 charts_dir/stats_dir 修正到当前报告期目录。
+
+    季度报告期 -> 图库_<label>/统计值_<label>（如 图库_2026.4~6）；
+    年度报告期 -> 图库_<年>.1~12/统计值_<年>.1~12（如 图库_2025.1~12）。
+    仅在配置目录是标准“图库_/统计值_”布局时生效；自定义目录不覆盖。
+    """
+    cd = str(bridge_cfg.get("charts_dir") or "")
+    sd = str(bridge_cfg.get("stats_dir") or "")
+    if "图库" not in cd and "统计值" not in sd:
+        return
+    bridge = str(bridge_cfg.get("bridge_name") or "")
+    base = ""
+    for marker in ("图库_", "图库"):
+        idx = cd.find(marker)
+        if idx >= 0:
+            base = cd[:idx].rstrip("/")
+            break
+    if not base:
+        return
+    label = str(period.get("label") or "")
+    dir_label = re.sub(r"^(\d{4})年$", r"\1.1~12", label) or label
+    if not dir_label:
+        return
+    from report_agent.config import resolve_bridge_subdir
+
+    def _leaf(p):
+        return os.path.join(p, bridge) if bridge else p
+
+    charts = resolve_bridge_subdir(
+        _leaf(os.path.join(base, f"图库_{dir_label}")), bridge)
+    stats = resolve_bridge_subdir(
+        _leaf(os.path.join(base, f"统计值_{dir_label}")), bridge)
+    if "图库" in cd and os.path.normpath(cd) != os.path.normpath(charts):
+        bridge_cfg["charts_dir"] = charts
+        log.info("修正图库目录 -> %s（报告期 %s）", charts, label)
+    if "统计值" in sd and os.path.normpath(sd) != os.path.normpath(stats):
+        bridge_cfg["stats_dir"] = stats
+        log.info("修正统计值目录 -> %s（报告期 %s）", stats, label)
+
+
 def _quarterly_digest(agg: Dict) -> Dict:
     """把季度/年度统计压缩成“特征 -> 全桥统计”摘要（去掉逐位置明细）。
 
@@ -162,6 +250,11 @@ class ReportAgent:
         missing_sinks: List[str] = []
         bridge_cfg = self.cfg.get("bridge_data", {}) or {}
         if bridge_cfg.get("enabled", False):
+            # 修正 图库/统计值 目录指向当前报告期（季度/年度）目录：
+            # 配置可能残留上一期（如 2026.1~3），直接命令行跑年度/季度时会
+            # 用到旧期图库（如年度报告插进第一季度图片）
+            if mode in ("quarterly", "yearly"):
+                _fix_period_dirs(self.cfg, bridge_cfg, period)
             from .bridge_source import BridgeData
             base_dir = os.path.dirname(os.path.abspath(self.cfg.get("_config_path", "config.json")))
             bridge = BridgeData(bridge_cfg, base_dir=base_dir)
@@ -288,15 +381,20 @@ class ReportAgent:
                         if 0 <= pno < len(texts) and texts[pno]:
                             body_texts.append(str(texts[pno]))
                     # 指标判断：节上下文(正文)优先于图注原文（图注原文可能有笔误，如结构温度节写成“环境温度”）
-                    metric_hint = (
-                        bridge._metric_alias_hit(" ".join(body_texts))
-                        or bridge._metric_alias_hit(ct.get("text", ""))
-                        or ""
-                    )
+                metric_hint = (
+                    bridge._metric_alias_hit(" ".join(body_texts))
+                    or bridge._metric_alias_hit(ct.get("text", ""))
+                    or ""
+                )
+                unit_hint = _chart_unit_hint(
+                    chart_texts_for_runtime, ct.get("paragraph"),
+                    self.cfg.get("_texts", []) or [],
+                )
                 info = bridge.resolve_chart_info(cid, ct.get("text", ""), context=ctx_texts,
                                                  metric_hint=metric_hint,
                                                  sensor_hint=str(ct.get("sensor_id") or ""),
-                                                 feature_hint=str(ct.get("feature") or ""))
+                                                 feature_hint=str(ct.get("feature") or ""),
+                                                 unit_hint=unit_hint)
                 if info:
                     chart_images[cid] = info["path"]
                     chart_captions[cid] = info["display"]
@@ -323,9 +421,16 @@ class ReportAgent:
                      resolved_bridge, len(pending_charts))
 
             # ---- 缺图推断：按本节约应有的监测部位数 vs 实际图表数 ----
-            chart_gaps = self._detect_chart_gaps(
-                bridge, chart_items, chart_sensors, chart_kinds, chart_para
-            )
+            # 防御：服务器 agent.py 版本不一致时（缺少该方法）不崩溃，
+            # 只跳过缺图补齐并告警（完整同步后自动恢复）
+            if hasattr(self, "_detect_chart_gaps"):
+                chart_gaps = self._detect_chart_gaps(
+                    bridge, chart_items, chart_sensors, chart_kinds, chart_para
+                )
+            else:
+                log.warning("当前 agent.py 缺少 _detect_chart_gaps，"
+                            "跳过缺图补齐（请用最新版本完整覆盖 report_agent/）")
+                chart_gaps = []
             extra_charts: Dict[str, List[Dict]] = {}
             if chart_gaps and (bridge_cfg.get("auto_fill_missing_charts", True)):
                 for gap in chart_gaps:
@@ -548,7 +653,24 @@ class ReportAgent:
         # 联合识别该段应覆盖的指标，缺哪个 {{summary.<metric>}} 就补哪个，
         # 保证总结段落囊括全部指标的季度总结内容（极值 + 故障/缺失位置）。
         tpl_path = self.cfg.get("template", "")
+        _orig_tpl = tpl_path
         if bridge is not None:
+            # 清理上次运行残留的临时模板（tpl_summary_*.docx）：
+            # 报告中途异常退出时循环后的清理不会执行，这里先清掉避免累积
+            try:
+                _tpl_dir = os.path.dirname(os.path.abspath(tpl_path))
+                if os.path.isdir(_tpl_dir):
+                    for _fn in os.listdir(_tpl_dir):
+                        if _fn.startswith("tpl_summary_") \
+                                and _fn.endswith(".docx"):
+                            _stale = os.path.join(_tpl_dir, _fn)
+                            try:
+                                os.remove(_stale)
+                                log.info("清理上次残留临时模板: %s", _stale)
+                            except OSError:
+                                pass
+            except OSError:
+                pass
             enriched = self._enrich_template_summaries(
                 tpl_path, bridge, period)
             if enriched and enriched != tpl_path:
@@ -666,6 +788,16 @@ class ReportAgent:
                          rnd, len(rp.get("applied", [])))
                 continue
             break
+
+        # 临时模板（templates/tpl_summary_*.docx）用完即删，
+        # 避免每次生成报告都残留垃圾文件
+        if tpl_path and tpl_path != _orig_tpl \
+                and os.path.isfile(tpl_path):
+            try:
+                os.remove(tpl_path)
+                log.info("临时模板已清理: %s", tpl_path)
+            except OSError as exc:
+                log.warning("临时模板清理失败: %s", exc)
 
         # 审查/修复完整记录落盘，web 面板可看每轮与最终待人工项
         review_path = os.path.join(
@@ -838,7 +970,13 @@ class ReportAgent:
                        and self._metric_summary_ok(bridge, m, period)]
             if not missing:
                 continue
-            ph = "".join(f"{{{{summary.{m}}}}}" for m in missing)
+            # 多特征小结之间用换行分隔，避免 地震+结构温度 等挤成一大段；
+            # 若后面紧跟已有 {{summary.*}}，也补一个换行分隔
+            ph = "\n".join(f"{{{{summary.{m}}}}}" for m in missing)
+            after = target.text[target.text.find("。") + 1:] \
+                if "。" in target.text else ""
+            if after.lstrip().startswith("{{summary."):
+                ph += "\n"
             # 插到段落第一句（如“依据《…》…未出现异常。”）之后，阅读更顺
             inserted = False
             for r in target.runs:
@@ -854,6 +992,10 @@ class ReportAgent:
                     target.add_run(ph)
             added += len(missing)
             log.info("模板小结段补全 %s -> %s", target.text[:40], missing)
+        # 小结段里已被 {{summary.*}} 覆盖的“最高/最低/绝对最大/差值 + 对应测点
+        # 位置”固定句会与总结重复（如 3.2.3 的地震、结构温度），删除这些含
+        # {{stats.<指标>.<统计>.loc}} 的分句，避免同一数据出现两遍。
+        _strip_redundant_loc_clauses(doc)
         if not added:
             return template_path
         import tempfile as _tf
@@ -895,9 +1037,6 @@ class ReportAgent:
         except Exception:  # noqa: BLE001
             return False
 
-    # ------------------------------------------------------------------
-    # 缺图推断：按本节约应有的监测部位数 vs 实际图表数
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _metric_for_chart(cid: str, bridge) -> str:
@@ -991,21 +1130,52 @@ class ReportAgent:
         """按节标题里的位置词过滤监测部位，避免补图时把同指标其它节的位置也补进来。"""
         body = re.sub(r"^\d+(\.\d+){1,3}\s*", "", section_title)
         for w in ("环境温度", "环境湿度", "结构温度", "风速", "风向", "风荷载", "挠度", "应变",
-                  "位移", "倾角", "转角", "索力", "裂缝", "振动", "监测", "统计",
+                  "位移", "空间变位", "变位", "倾角", "转角", "索力", "裂缝", "振动",
+                  "监测", "统计",
                   "数据分析", "结构", "主梁"):
             body = body.replace(w, "")
         body = body.strip()
         if not body:
             return positions  # 节标题没有位置词（如“风荷载监测数据分析”）-> 全量
         norm_body = _norm(body)
+        # 方位感知：节标题带方位（上游/下游/左幅/右幅…）时只匹配同方位位置；
+        # 节标题不带方位时，不把带方位的位置拉进来（如标题“跨中1/2截面环境
+        # 温度”只应有 跨中1/2截面 的图，不能补出 跨中1/2截面上游/下游）。
+        _SIDES = ("上游侧", "下游侧", "左侧", "右侧", "上游", "下游",
+                  "左幅", "右幅")
+        body_sides = [s for s in _SIDES if s in norm_body]
         positions_norm = {_norm(p): p for p, _ in positions}
+        def _base(s):
+            return re.sub("|".join(_SIDES), "", s)
+
         out = []
+        # 第一轮：去方位基座匹配。标题带方位时只收同方位位置；标题不带
+        # 方位时只收无方位位置（避免“跨中1/2截面环境温度”补出上游/下游图）。
         for np, pos in positions_norm.items():
-            # 位置词必须是完整片段（前后是顿号/逗号/开头/结尾），
-            # 避免 “4#、5#墩底部” 里只把 “5#墩底部” 当整段匹配
-            if norm_body == np or norm_body in np or re.search(
-                    rf"(^|[、，,和及]){re.escape(np)}([、，,和及]|$)", norm_body):
+            if body_sides:
+                if not any(s in np for s in body_sides):
+                    continue
+            elif any(s in np for s in _SIDES):
+                continue
+            if (_base(np) == norm_body
+                    or (len(norm_body) >= 2 and norm_body in _base(np))
+                    or (len(_base(np)) >= 2 and _base(np) in norm_body)):
                 out.append(pos)
+        if not out and not body_sides:
+            # 标题无方位且没有无方位位置（如“2#墩墩顶空间变位”表里只有
+            # 左幅/右幅）：回退到含方位位置的基座匹配
+            for np, pos in positions_norm.items():
+                if (_base(np) == norm_body
+                        or (len(norm_body) >= 2 and norm_body in _base(np))
+                        or (len(_base(np)) >= 2 and _base(np) in norm_body)):
+                    out.append(pos)
+        if not out:
+            # 原逻辑兜底：位置词完整片段匹配（前后是顿号/逗号/开头/结尾）
+            for np, pos in positions_norm.items():
+                if norm_body == np or norm_body in np or re.search(
+                        rf"(^|[、，,和及]){re.escape(np)}([、，,和及]|$)",
+                        norm_body):
+                    out.append(pos)
         # 列表式墩号位置（如 “4#、5#墩底部”）-> 展开为 4#墩底部、5#墩底部
         m_list = re.match(r"^(\d+#(?:[、，,和及]\d+#)+)(.+)$", norm_body)
         if m_list:
@@ -1171,6 +1341,77 @@ class ReportAgent:
                 "missing": missing_items,
             })
         return gaps
+
+
+def _strip_redundant_loc_clauses(doc) -> int:
+    """删除小结段里含 {{stats.<指标>.<统计>.loc}} 的重复分句。
+
+    仅作用于含 {{summary.<指标>}} 的段落；按 ；。 切分，去掉那些夹着
+    “…最高/最低/绝对最大…为{{stats.X.Y}}…对应测点位置为{{stats.X.Y.loc}}”
+    的整句（总结里已给出极值与位置）。
+    """
+    _STAT_WORDS = re.compile(r"最大|最小|绝对|差值|变化|平均|均值|最高|最低")
+    _STALE_CLAIM_RE = re.compile(
+        # 前缀排除 “{ }”，避免匹配串穿进 {{summary.*}} 占位符把占位符吞掉
+        r"(?:监测数据结果表明，)?[^。；\n{}]{0,30}"
+        r"(?:监测数据|监测结果|测点状态)"
+        r"(?:连续稳定|良好稳定|正常稳定|状态正常|表现良好)")
+    _METRIC_LABELS = {
+        "strain": ("应变",), "displacement": ("位移", "变位", "GNSS"),
+        "vibration": ("振动",), "deflection": ("挠度",),
+        "structure_temperature": ("结构温度",), "temperature": ("温度",),
+        "humidity": ("湿度",), "cable_force": ("索力",), "crack": ("裂缝",),
+        "rotation": ("倾角", "转角"), "bearing_displacement": ("支座位移",),
+        "wind_speed": ("风速",),
+    }
+    removed = 0
+    for para in doc.paragraphs:
+        t = para.text
+        if "{{summary." not in t:
+            continue
+        summary_metrics = set(re.findall(
+            r"\{\{summary\.([a-zA-Z_]+)\}\}", t))
+        new_parts = []
+        for clause in re.split(r"(?<=[。；\n])", t):
+            # 1) 只删除“XX监测数据/监测结果…连续稳定/良好稳定”旧话术子串，
+            #    保留前面的 {{summary.*}} 占位符（否则整句删除会连占位符一起删掉）
+            c2 = _STALE_CLAIM_RE.sub("", clause)
+            if c2 != clause:
+                removed += 1
+            clause = c2
+            # 含 summary 占位符的残留句不再整句删除
+            if "{{summary." in clause:
+                new_parts.append(clause)
+                continue
+            locs = re.findall(r"\{\{stats\.([a-zA-Z_]+)\.\w+\.loc\}\}",
+                              clause)
+            if locs and any(m in summary_metrics for m in locs):
+                removed += 1
+                continue
+            # 非 .loc 的重复数值句（如 3.3.5 “最大应变差值为{{stats.strain.max}}”、
+            # “GNSS…X方向最大位移为{{stats.displacement_x.max}}mm”）：分句含
+            # 指标词+统计词，且该指标已有总结占位符，删除避免同一数据出现两遍
+            plain = re.findall(r"\{\{stats\.([a-zA-Z_]+)\.\w+\}\}", clause)
+            if plain and _STAT_WORDS.search(clause):
+                hit = False
+                for m in plain:
+                    base = re.sub(r"_(x|y|z)$", "", m)
+                    if base in summary_metrics and any(
+                            lb in clause for lb in _METRIC_LABELS.get(base, ())):
+                        hit = True
+                        break
+                if hit:
+                    removed += 1
+                    continue
+            new_parts.append(clause)
+        new_t = "".join(new_parts)
+        # 清理占位符后残留的多余句号（{{summary.X}}。。 -> {{summary.X}}）
+        new_t = re.sub(r"(\}\})\。+", r"\1", new_t)
+        if new_t != t and para.runs:
+            para.runs[0].text = new_t
+            for r in para.runs[1:]:
+                r.text = ""
+    return removed
 
 
 def run_once(

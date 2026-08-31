@@ -92,7 +92,50 @@ CATEGORY_FEATURES = {
     "空间变位": ["GNSS(Δx)", "GNSS(Δy)", "GNSS(Δz)"],
     "风荷载": ["FSFX2(spfs)", "FSFX2(spfx)", "FSFX2(szfs)", "FSFX2(szfx)"],
     "风速": ["FSFX2(spfs)", "FSFX2(spfx)", "FSFX2(szfs)", "FSFX2(szfx)"],
+    "支座位移": ["WY(Δx)"],
+    "转角": ["EZJD(xJd)", "EZJD(yJd)"],
+    "伸缩缝": ["WY(Δx)"],
+    "索夹": ["SL(sl)"],
 }
+
+# 类别段落 -> 标准监测类别（源文档个别类别名不规范/带备注）
+CATEGORY_NORMALIZE = {
+    "表桥址区环境温度表": "温湿度",   # 矮寨第二张温湿度表的表标题被当成了类别
+    "主梁倾角": "倾角",
+    "北斗": "空间变位",              # 北斗/GNSS X/Y/Z(mm)
+    "锚碇": "空间变位",              # 洞庭湖锚碇表实为 GNSS 位移(mm)
+    "转角（有误）": "转角",
+    "转角(有误)": "转角",
+}
+
+# 组合类别 -> 按行监测部位关键词细分（如 支座，伸缩缝 含 支座/伸缩缝/吊索索夹）
+CATEGORY_SPLIT = {
+    "支座，伸缩缝": (
+        ("支座", "支座位移"),
+        ("伸缩缝", "伸缩缝"),
+        ("索夹", "索夹"),
+    ),
+}
+
+# 个别传感器在源文档中按“位置列”前向填充了方位，但实际不分上下游/左右幅。
+# 键: (桥名, 编号) -> 独立监测部位（不带方位），解析时覆盖文档分组。
+POSITION_OVERRIDE = {
+    ("湘江特大桥", "368"): "跨中1/2截面",   # 温湿度：368 不分上下游
+}
+
+
+def _is_category_para(text):
+    """判断正文段落是否为监测类别名（桥名/表标题/图标题/数字等除外）。"""
+    if len(text) > 16 or text in NOT_CATEGORY:
+        return False
+    if re.fullmatch(r"\d+", text):
+        return False
+    if text in CATEGORY_NORMALIZE:
+        return True
+    # 表标题/图标题/序号等不是类别
+    if text.startswith(("表", "图", "序", "附")):
+        return False
+    return True
 
 
 def cell_text(tc):
@@ -118,9 +161,8 @@ def parse_docx(path):
             if text in BRIDGE_NAMES:
                 current_bridge = text
                 current_category = ""
-            elif (len(text) <= 14 and text not in NOT_CATEGORY
-                  and not re.fullmatch(r"\d+", text)):
-                current_category = text
+            elif _is_category_para(text):
+                current_category = CATEGORY_NORMALIZE.get(text, text)
         elif child.tag == W + "tbl":
             current_side = ""   # 每个表格重新开始，"位置"列按组前向填充
             current_direction = ""
@@ -149,6 +191,12 @@ def parse_docx(path):
                                  if c != location and c not in
                                  (location, "上游", "下游", "左幅", "右幅"))
                 name = location or (current_bridge + "-" + current_category)
+                # 组合类别按行监测部位细分（支座，伸缩缝 -> 支座位移/伸缩缝/索夹）
+                row_cat = current_category
+                for kw, c in CATEGORY_SPLIT.get(current_category, ()):
+                    if kw in name:
+                        row_cat = c
+                        break
                 # "测点1/测点2..."只是同一位置不同传感器的索引，不属于位置名称；
                 # 去掉结尾的测点编号后，同一位置的多传感器归为一组，
                 # 测点序号由 enrich_entries 按组内顺序重新编号(测点1、测点2...)
@@ -159,16 +207,23 @@ def parse_docx(path):
                 if current_side and current_side not in name:
                     name = name + current_side
                 for num in nums:
+                    ov_name = POSITION_OVERRIDE.get((current_bridge, num))
+                    s_name = ov_name if ov_name else name
+                    s_side = "" if ov_name else current_side
                     if num not in sensors:
                         sensors[num] = {
                             "桥名": current_bridge,
-                            "类别": current_category,
-                            "位置": current_side,
+                            "类别": row_cat,
+                            "位置": s_side,
                             "方向": current_direction,
-                            "监测部位": name,
+                            "监测部位": s_name,
                             "附加": extra,
-                            "名称": name,
+                            "名称": s_name,
                         }
+                    else:
+                        print(f"[警告] 重复编号 {num}（{current_bridge}/"
+                              f"{row_cat}，{name}），保留首次出现",
+                              flush=True)
     return sensors
 
 
@@ -323,6 +378,15 @@ def build_table_map(sensors, bridge_full, data_feats):
             struct_temp.setdefault(info.get("监测部位", ""), []).append(num)
     if struct_temp:
         tm["结构温度表"] = struct_temp
+
+    eq = {}
+    for num, info in sensors.items():
+        if bridge_of(info) != bridge_full:
+            continue
+        if info.get("类别") == "地震":
+            eq.setdefault(info.get("监测部位", ""), []).append(num)
+    if eq:
+        tm["地震监测表"] = eq
     return tm
 
 

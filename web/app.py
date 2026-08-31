@@ -16,6 +16,7 @@
   set REPORT_WEB_TOKEN=xxx && python web/app.py
 """
 
+import calendar
 import datetime as dt
 import json
 import logging
@@ -80,8 +81,14 @@ _parsing: Dict[str, Dict] = {}   # 模板解析状态（LLM 识别较慢，后�
 
 # 每个桥的“运行中”状态
 _running: Dict[str, Dict] = {}
+_traffic_tasks: Dict[str, Dict] = {}   # 交通荷载下载任务状态（后台 Playwright）
 _run_lock = threading.Lock()
 _schedulers: Dict[str, Dict] = {}
+
+# 有交通荷载（车辆车道统计）数据的桥：原始数据在 inputs/<桥>_车道统计_<期>
+TRAFFIC_BRIDGES = {"赤石大桥", "矮寨大桥", "洞庭湖大桥"}
+_TRAFFIC_FILE_RE = re.compile(
+    r"车道统计_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})\.xls$")
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +237,18 @@ def _dir_nonempty(path: str) -> bool:
     return False
 
 
+def _file_tail(path: str, n: int = 20) -> str:
+    """读取文件末尾 n 行（用于日志轮询展示）。"""
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        return "\n".join(lines[-n:])
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _stats_ready(stats_dir: str) -> bool:
     """统计值就绪 = 目录非空且存在“位置统计”子目录（含 json）。
 
@@ -241,6 +260,99 @@ def _stats_ready(stats_dir: str) -> bool:
         return False
     pos_dir = os.path.join(stats_dir, "位置统计")
     return os.path.isdir(pos_dir) and _dir_nonempty(pos_dir)
+
+
+def _period_quarters(period: Dict) -> list:
+    """报告期 -> 需要的季度标签列表（如 2026.4~6 -> ['2026Q2']；
+    2025年 -> ['2025Q1'..'2025Q4']）。"""
+    try:
+        s = dt.date.fromisoformat(str(period.get("start") or "")[:10])
+        e = dt.date.fromisoformat(str(period.get("end") or "")[:10])
+    except ValueError:
+        return []
+    out = []
+    y, q = s.year, (s.month - 1) // 3 + 1
+    ey, eq = e.year, (e.month - 1) // 3 + 1
+    while (y, q) <= (ey, eq):
+        out.append(f"{y}Q{q}")
+        q += 1
+        if q > 4:
+            q, y = 1, y + 1
+    return out
+
+
+def _traffic_raw_status(bridge: str, period: Dict) -> Dict:
+    """检查交通荷载原始数据是否齐全：inputs/<桥>_车道统计_<期>/ 下
+    车道统计_*.xls 是否覆盖报告期起止日期。"""
+    info = {
+        "has_traffic": bridge in TRAFFIC_BRIDGES,
+        "quarters": _period_quarters(period),
+        "raw_dirs": [],
+        "complete": False,
+        "missing": [],
+        "covered_days": 0,
+        "need_days": 0,
+    }
+    if not info["has_traffic"]:
+        info["complete"] = True
+        return info
+    inputs_dir = os.path.join(ROOT, "inputs")
+    try:
+        s = dt.date.fromisoformat(str(period.get("start") or "")[:10])
+        e = dt.date.fromisoformat(str(period.get("end") or "")[:10])
+    except ValueError:
+        return info
+    covered = set()
+    for q in info["quarters"]:
+        d = os.path.join(inputs_dir, f"{bridge}_车道统计_{q}")
+        files = []
+        if os.path.isdir(d):
+            files = [f for f in os.listdir(d)
+                     if _TRAFFIC_FILE_RE.match(f)]
+        info["raw_dirs"].append(
+            {"quarter": q, "dir": d, "files": len(files)})
+        for fn in files:
+            m = _TRAFFIC_FILE_RE.match(fn)
+            a = dt.date.fromisoformat(m.group(1))
+            b = dt.date.fromisoformat(m.group(2))
+            d0 = max(a, s)
+            d1 = min(b, e)
+            day = d0
+            while day <= d1:
+                covered.add(day)
+                day += dt.timedelta(days=1)
+    need = (e - s).days + 1
+    info["need_days"] = need
+    info["covered_days"] = len(covered)
+    info["missing"] = [q for q, rd in zip(info["quarters"], info["raw_dirs"])
+                       if rd["files"] == 0]
+    info["complete"] = (not info["missing"]
+                        and len(covered) >= need)
+    return info
+
+
+def _traffic_daily_ready(bridge: str, period: Dict) -> bool:
+    """交通荷载 daily（车道N/总共）是否已生成。"""
+    pcfg = {}
+    if os.path.isfile(PREPROCESS_CONFIG):
+        try:
+            with open(PREPROCESS_CONFIG, "r", encoding="utf-8") as f:
+                pcfg = json.load(f)
+        except Exception:  # noqa: BLE001
+            pcfg = {}
+    daily_root = pcfg.get("daily_dir",
+                          os.path.join(PREPROCESS_DIR, "日级数据"))
+    from report_agent.config import resolve_bridge_dir
+    bridge_root = resolve_bridge_dir(daily_root, bridge)
+    if not bridge_root:
+        return False
+    label = str(period.get("label") or "")
+    dir_label = re.sub(r"^(\d{4})年$", r"\1.1~12", label) or label
+    tdir = os.path.join(bridge_root, f"daily_{dir_label}", "交通荷载")
+    if not os.path.isdir(tdir):
+        return False
+    return any(os.path.isdir(os.path.join(tdir, d))
+               for d in os.listdir(tdir))
 
 
 def _period_daily_ready(bridge: str, period: Dict) -> bool:
@@ -260,9 +372,11 @@ def _period_daily_ready(bridge: str, period: Dict) -> bool:
                 pcfg = json.load(f)
         except Exception:  # noqa: BLE001
             pcfg = {}
+    from report_agent.config import resolve_bridge_dir
     daily_root = pcfg.get("daily_dir",
                           os.path.join(PREPROCESS_DIR, "日级数据"))
-    bridge_root = os.path.join(daily_root, bridge)
+    # 桥名模糊匹配：daily 目录可能是 湘江特 而桥名是 湘江特大桥
+    bridge_root = resolve_bridge_dir(daily_root, bridge)
     if not os.path.isdir(bridge_root):
         return False
     if not os.path.isfile(os.path.join(bridge_root, "summary.csv")):
@@ -1481,7 +1595,10 @@ def _canon_bridge_name(name: str) -> str:
 
 def _run_pipeline(period: Dict, charts_dir: str, stats_dir: str,
                   st: Dict, bridge: str = "",
-                  skip_preprocess: bool = False) -> int:
+                  skip_preprocess: bool = False,
+                  period_mode: str = "quarterly",
+                  stats_only: bool = False,
+                  charts_only: bool = False) -> int:
     """调用 pipeline.py 完成 秒级->日级->图库/统计值->对照表。
     返回子进程退出码。"""
     pcfg = {}
@@ -1498,6 +1615,11 @@ def _run_pipeline(period: Dict, charts_dir: str, stats_dir: str,
            "--raw", raw, "--daily", daily,
            "--charts", charts_dir, "--stats", stats_dir,
            "--start", period["start"], "--end", period["end"]]
+    if period_mode == "yearly":
+        # 年度：daily 根目录传桥根，build_chart_library 汇总其下各季度 daily_*，
+        # 而不是拼 daily_<年>.1~12（那个目录不存在）
+        cmd.append("--period")
+        cmd.append("yearly")
     if bridge:
         cmd += ["--bridge", bridge]
     if map_docx:
@@ -1505,6 +1627,12 @@ def _run_pipeline(period: Dict, charts_dir: str, stats_dir: str,
     if skip_preprocess:
         # daily 已就绪：跳过 秒级->日级，直接 日级->图库/统计值
         cmd.append("--skip-preprocess")
+    if stats_only:
+        # 图库已有、统计缺：只补统计值
+        cmd.append("--stats-only")
+    if charts_only:
+        # 统计已有、图库缺：只补图库（合并图）
+        cmd.append("--skip-stats")
     # 断点续跑必须默认开启（预处理时跳过已生成的 daily 文件）
     cmd.append("--resume")
     st["pipeline_cmd"] = " ".join(cmd)
@@ -1660,6 +1788,150 @@ def api_bridge_period(bridge_id):
     })
 
 
+@app.route("/api/bridges/<bridge_id>/traffic-status")
+def api_bridge_traffic_status(bridge_id):
+    auth = _require_token()
+    if auth:
+        return auth
+    b = get_bridge(bridge_id, REGISTRY)
+    if not b:
+        return jsonify({"error": f"未找到桥梁 {bridge_id}"}), 404
+    bridge = str(b.get("name") or bridge_id)
+    start = str(request.args.get("start") or "")
+    end = str(request.args.get("end") or "")
+    if not (start and end):
+        mode = str(request.args.get("mode") or "quarterly")
+        quarter = str(request.args.get("quarter") or "")
+        year = str(request.args.get("year") or "")
+        try:
+            period = _period_from_mode(mode, "", quarter, year)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        start, end = period["start"], period["end"]
+    period = {"start": start, "end": end}
+    st = _traffic_raw_status(bridge, period)
+    st["daily_ready"] = _traffic_daily_ready(bridge, period)
+    st["bridge"] = bridge
+    return jsonify(st)
+
+
+@app.route("/api/bridges/<bridge_id>/traffic-download", methods=["POST"])
+def api_bridge_traffic_download(bridge_id):
+    auth = _require_token()
+    if auth:
+        return auth
+    b = get_bridge(bridge_id, REGISTRY)
+    if not b:
+        return jsonify({"error": f"未找到桥梁 {bridge_id}"}), 404
+    bridge = str(b.get("name") or bridge_id)
+    if bridge not in TRAFFIC_BRIDGES:
+        return jsonify({"error": f"{bridge} 无交通荷载数据"}), 400
+    data = request.get_json(silent=True) or {}
+    start = str(data.get("start") or "")
+    end = str(data.get("end") or "")
+    if not (start and end):
+        mode = str(data.get("mode") or "quarterly")
+        quarter = str(data.get("quarter") or "")
+        year = str(data.get("year") or "")
+        try:
+            period = _period_from_mode(mode, "", quarter, year)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        start, end = period["start"], period["end"]
+    if not (start and end):
+        return jsonify({"error": "缺少 start/end"}), 400
+    qs = _period_quarters({"start": start, "end": end})
+    if not qs:
+        return jsonify({"error": "报告期解析失败"}), 400
+    existing = _traffic_tasks.get(bridge_id) or {}
+    if existing.get("running"):
+        return jsonify({"error": "交通数据下载任务已在运行"}), 409
+    # 每个季度一次：年度报告自动依次下载 Q1~Q4（需开 VPN + 手动验证码）
+    cmds = []
+    for q in qs:
+        year, qn = int(q[:4]), int(q[-1])
+        ms = (qn - 1) * 3 + 1
+        me = qn * 3
+        s2 = dt.date(year, ms, 1).isoformat()
+        e2 = dt.date(year, me,
+                     calendar.monthrange(year, me)[1]).isoformat()
+        cmds.append([
+            sys.executable,
+            os.path.join(ROOT, "download_monitor_data.py"),
+            "--bridges", bridge, "--start", s2, "--end", e2,
+        ])
+    logs_dir = os.path.join(ROOT, "outputs", "logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    log_path = os.path.join(logs_dir, f"traffic_download_{bridge_id}.log")
+    task = {
+        "running": True,
+        "bridge": bridge,
+        "quarters": qs,
+        "current": "",
+        "done": [],
+        "error": "",
+        "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "period_start": start,
+        "period_end": end,
+        "log_path": log_path,
+    }
+    _traffic_tasks[bridge_id] = task
+
+    def _worker():
+        log_fh = None
+        try:
+            log_fh = open(log_path, "wb")
+            for q, cmd in zip(qs, cmds):
+                task["current"] = q
+                r = subprocess.run(cmd, cwd=ROOT,
+                                   env=_subprocess_env(),
+                                   stdout=log_fh, stderr=subprocess.STDOUT)
+                if r.returncode != 0:
+                    task["error"] = f"{q} 下载失败(返回码 {r.returncode})"
+                    break
+                task["done"].append(q)
+        except Exception as exc:  # noqa: BLE001
+            task["error"] = str(exc)
+        finally:
+            task["running"] = False
+            task["current"] = ""
+            if log_fh is not None:
+                log_fh.close()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return jsonify({"started": True, "quarters": qs,
+                    "log": log_path,
+                    "tip": "请先开启 VPN，下载过程中浏览器会弹出并需要"
+                           "手动输入验证码；可查看日志轮询进度"})
+
+
+@app.route("/api/bridges/<bridge_id>/traffic-download/status")
+def api_bridge_traffic_download_status(bridge_id):
+    auth = _require_token()
+    if auth:
+        return auth
+    task = _traffic_tasks.get(bridge_id) or {}
+    if not task:
+        return jsonify({"running": False, "started": False})
+    b = get_bridge(bridge_id, REGISTRY)
+    bridge = str((b or {}).get("name") or bridge_id)
+    period = {"start": task.get("period_start"),
+              "end": task.get("period_end")}
+    raw = _traffic_raw_status(bridge, period) if task.get("period_start") else {}
+    return jsonify({
+        "running": task.get("running", False),
+        "quarters": task.get("quarters", []),
+        "current": task.get("current", ""),
+        "done": task.get("done", []),
+        "error": task.get("error", ""),
+        "started_at": task.get("started_at", ""),
+        "log_tail": _file_tail(task.get("log_path", ""), 20),
+        "raw_complete": raw.get("complete", False),
+        "covered_days": raw.get("covered_days", 0),
+        "need_days": raw.get("need_days", 0),
+    })
+
+
 @app.route("/api/bridges/<bridge_id>/run", methods=["POST"])
 def api_bridge_run(bridge_id):
     auth = _require_token()
@@ -1682,6 +1954,9 @@ def api_bridge_run(bridge_id):
     end = str(data.get("end") or "").strip()
     auto_preprocess = bool(data.get("auto_preprocess"))
     template = str(data.get("template") or "").strip() or None
+    traffic = str(data.get("traffic") or "auto").strip().lower()
+    if traffic not in ("auto", "yes", "no"):
+        traffic = "auto"
 
     if start and end:
         period = {"start": start, "end": end,
@@ -1710,22 +1985,80 @@ def api_bridge_run(bridge_id):
             st["charts_dir"] = charts_dir
             st["stats_dir"] = stats_dir
             st["data_ready"] = data_ready
+            bridge_name = ((cfg.get("bridge_data") or {})
+                           .get("bridge_name") or "")
+            traffic_need = (bridge_name in TRAFFIC_BRIDGES
+                            and traffic != "no")
+            traffic_daily_ok = True
+            if traffic_need:
+                traffic_raw = _traffic_raw_status(bridge_name, period)
+                st["traffic"] = traffic_raw
+                if not traffic_raw.get("complete", False):
+                    # 交通原始数据不齐全：提醒开 VPN / 下载，不继续生成
+                    st["traffic_blocked"] = True
+                    st["error"] = (
+                        f"{bridge_name} 交通荷载原始数据不齐全"
+                        f"（已覆盖 {traffic_raw.get('covered_days', 0)}/"
+                        f"{traffic_raw.get('need_days', 0)} 天，"
+                        f"缺 {traffic_raw.get('missing') or '部分日期'}）。"
+                        f"请先开启 VPN，在页面点击“下载交通数据”"
+                        f"（或运行 download_monitor_data.py --bridges "
+                        f"{bridge_name} --start {period.get('start')} "
+                        f"--end {period.get('end')}）后再重新生成。")
+                    return
+                traffic_daily_ok = _traffic_daily_ready(bridge_name, period)
+                st["traffic_daily_ready"] = traffic_daily_ok
             if auto_preprocess:
-                if not data_ready:
-                    bridge_name = ((cfg.get("bridge_data") or {})
-                                   .get("bridge_name") or "")
+                if not data_ready or (traffic_need and not traffic_daily_ok):
                     daily_ready = _period_daily_ready(bridge_name, period)
                     st["daily_ready"] = daily_ready
+                    charts_ok = _dir_nonempty(charts_dir)
+                    stats_ok = _stats_ready(stats_dir)
+                    st["charts_ok"] = charts_ok
+                    st["stats_ok"] = stats_ok
+                    force_pre = bool(traffic_need and not traffic_daily_ok)
                     if daily_ready:
                         log.info(
                             "桥 %s 日级数据已就绪（%s），跳过 秒级->日级，"
-                            "直接生成图库/统计值", bridge_id,
-                            period.get("label") or "")
+                            "直接生成图库/统计值%s",
+                            bridge_id,
+                            period.get("label") or "",
+                            "（交通 daily 缺失，需重跑预处理）" if force_pre
+                            else "")
                     st["preprocess"] = "running"
-                    rc = _run_pipeline(
-                        period, charts_dir, stats_dir, st,
-                        bridge=bridge_name,
-                        skip_preprocess=daily_ready)
+                    if force_pre:
+                        # 传感器图库/统计值已就绪，但交通 daily 缺失：
+                        # 重跑预处理（--resume 只补缺的交通数据）+ 图库/统计值
+                        log.info("交通荷载 daily 缺失，重跑预处理生成")
+                        rc = _run_pipeline(
+                            period, charts_dir, stats_dir, st,
+                            bridge=bridge_name,
+                            skip_preprocess=False,
+                            period_mode=mode)
+                    elif daily_ready and charts_ok and not stats_ok:
+                        # 有图库没统计库：只补对应时间的统计值
+                        log.info("图库已存在、统计库缺失，只重建统计值")
+                        rc = _run_pipeline(
+                            period, charts_dir, stats_dir, st,
+                            bridge=bridge_name,
+                            skip_preprocess=True,
+                            period_mode=mode,
+                            stats_only=True)
+                    elif daily_ready and stats_ok and not charts_ok:
+                        # 有统计库没图库：只补对应时间的图库
+                        log.info("统计库已存在、图库缺失，只重建图库")
+                        rc = _run_pipeline(
+                            period, charts_dir, stats_dir, st,
+                            bridge=bridge_name,
+                            skip_preprocess=True,
+                            period_mode=mode,
+                            charts_only=True)
+                    else:
+                        rc = _run_pipeline(
+                            period, charts_dir, stats_dir, st,
+                            bridge=bridge_name,
+                            skip_preprocess=daily_ready,
+                            period_mode=mode)
                     st["preprocess"] = (
                         "skipped_daily" if (rc == 0 and daily_ready)
                         else ("done" if rc == 0 else "failed"))
