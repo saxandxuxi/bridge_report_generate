@@ -3133,6 +3133,25 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
             markers.append("{{chart.traffic_ratio_trend_2}}")
         if markers:
             traffic_chart_targets[i] = markers
+    # 交通荷载跨车道图描述句（没有“交通荷载图1/图2”图题，但句子里
+    # 同时提到 左图/右图 与 累计通过数量/比例，如“……左图展示各车道
+    # 车辆累计通过数量，右图展示各车道通过数量比例……”）：保留原句，
+    # 在句后插入 数量/比例 两张跨车道图的占位符
+    traffic_desc_targets = {}
+    for i, t in enumerate(texts_all or []):
+        t2 = str(t)
+        if i in traffic_chart_targets:
+            continue
+        if ("累计通过数量" not in t2 and "车辆累计" not in t2):
+            continue
+        if not any(w in t2 for w in ("比例", "占比", "百分比")):
+            continue
+        if not any(w in t2 for w in ("左图", "右图", "如图所示", "如下图",
+                                     "如下图所示")):
+            continue
+        traffic_desc_targets[i] = [
+            "{{chart.traffic_cumulative_trend_1}}",
+            "{{chart.traffic_ratio_trend_2}}"]
 
     def _clean_chart_para(para) -> None:
         """去掉图名(af3)样式并居中，避免图片段样式不一致导致 Word 渲染重叠。"""
@@ -3145,6 +3164,9 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
 
     def process_paragraph(p, idx):
         nonlocal replaced_numbers, skipped_numbers, replaced_images, replaced_texts, replaced_chart_texts, replaced_cell_refs, replaced_summaries
+        # 交通荷载跨车道图描述句：保留原文，两张图插到句后
+        if idx in traffic_desc_targets:
+            pending_inserts.append((p._p, traffic_desc_targets[idx]))
         # 交通荷载跨车道图：图题行 -> {{chart.traffic_...}} 占位符
         if idx in traffic_chart_targets:
             _flatten_omml(p._p)

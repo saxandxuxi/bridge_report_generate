@@ -158,6 +158,9 @@ def main() -> int:
     ap.add_argument("--stats-only", action="store_true",
                     help="跳过预处理和图库，只重建统计值(逐传感器+位置统计)与"
                          "季度/年度统计")
+    ap.add_argument("--traffic-only", action="store_true",
+                    help="只处理交通荷载：原始数据(如有) -> 日级 -> 图库/统计值"
+                         "-> 季度/年度统计；不触碰其它传感器与对照表")
     ap.add_argument("--skip-sensor-map", action="store_true")
     ap.add_argument("--skip-per-sensor", action="store_true",
                     help="生成图库/统计值时跳过逐传感器图，只生成按监测部位"
@@ -221,17 +224,26 @@ def main() -> int:
 
     # 1) 秒级 -> 日级
     if not skip_pre:
-        if not raw or not os.path.isdir(raw):
-            status["error"] = f"秒级原始数据目录不存在: {raw}"
-            status["running"] = False
-            save_status(status)
-            log.error(status["error"])
-            return 1
-        os.makedirs(daily, exist_ok=True)
-        cmd1 = [
-            py, os.path.join(ROOT, "scripts", "preprocess_sensor_data.py"),
-            "--mode", "preprocess", "--data-root", raw, "--output-root", daily,
-        ]
+        if args.traffic_only:
+            # 只处理交通荷载：不要求秒级原始数据目录，直接由 inputs 转日级
+            cmd1 = [
+                py, os.path.join(ROOT, "scripts", "preprocess_sensor_data.py"),
+                "--traffic-only", "--output-root", daily,
+                "--traffic-root", os.path.join(os.path.dirname(ROOT), "inputs"),
+            ]
+        else:
+            if not raw or not os.path.isdir(raw):
+                status["error"] = f"秒级原始数据目录不存在: {raw}"
+                status["running"] = False
+                save_status(status)
+                log.error(status["error"])
+                return 1
+            os.makedirs(daily, exist_ok=True)
+            cmd1 = [
+                py, os.path.join(ROOT, "scripts", "preprocess_sensor_data.py"),
+                "--mode", "preprocess", "--data-root", raw,
+                "--output-root", daily,
+            ]
         if args.bridge:
             cmd1 += ["--bridge", args.bridge]
         if args.resume:
@@ -257,6 +269,9 @@ def main() -> int:
         tag = period_tag(start, end)
         if daily and args.bridge:
             try:
+                # 从命令行/任意 cwd 运行时也能导入 report_agent
+                if os.path.dirname(ROOT) not in sys.path:
+                    sys.path.insert(0, os.path.dirname(ROOT))
                 from report_agent.config import resolve_bridge_dir
                 daily_base = resolve_bridge_dir(daily, args.bridge)
             except Exception:  # noqa: BLE001
@@ -299,6 +314,9 @@ def main() -> int:
         # 建图库固定跳过逐传感器图，只生成按监测部位合并的图（更省时，
         # 报告只用合并图）
         cmd += ["--skip-per-sensor"]
+        if args.traffic_only:
+            # 只生成交通荷载图库/统计值，不覆盖 总览/公共缺失时间段
+            cmd += ["--traffic-only"]
         if stats_only:
             # 只重建统计值，不生成任何图
             cmd += ["--skip-charts"]
@@ -342,6 +360,10 @@ def main() -> int:
         ]
         if args.bridge:
             cmd_q += ["--bridge", args.bridge]
+        if args.stats:
+            # 与 build_chart_library 的 --stats-dir 对齐：显式指定时
+            # build_quarterly_stats 不再按 lib-root 推导统计值目录
+            cmd_q += ["--stats-dir", args.stats]
         if start:
             cmd_q += ["--start", start]
         if end:
@@ -354,7 +376,8 @@ def main() -> int:
             return 1
 
     # 3) 测点编号表格 -> 传感器对照表
-    if not args.skip_sensor_map and map_docx and os.path.isfile(map_docx):
+    if (not args.skip_sensor_map and not args.traffic_only
+            and map_docx and os.path.isfile(map_docx)):
         # 传感器对照表是固定产物（不随季度变化），统一放在 preprocess/传感器对照/
         # 注意：ROOT 本身已是 preprocess/ 目录，不能再拼一层 preprocess
         map_dir = os.path.join(ROOT, "传感器对照")

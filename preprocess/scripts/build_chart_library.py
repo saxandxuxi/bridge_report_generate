@@ -42,6 +42,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -109,10 +110,43 @@ VRANGE_MIN_RATIO = 0.98  # 物理范围仅当 >=98% 数据落在区间内才生�
 
 
 def feature_range(feature):
-    """按特征名(如 WSD(rh)/GNSS(Δx))取物理合理范围，取不到返回 None。"""
-    m = re.search(r"\(([^)]+)\)$", feature)
-    code = m.group(1) if m else feature
-    return FEATURE_RANGES.get(code)
+    """按特征名(如 WSD(rh)/GNSS(Δx))取物理合理范围，取不到返回 None。
+    轴码大小写/别名不统一（Δx/Ax/x、xJsd/yJsd/zJsd、XJSD 等）时，
+    按特征族归一取范围：加速度(JSD 族)/倾角(JD 族)/位移(轴 x/y/z)
+    各自共用同一量程；风速按 _is_wind_speed_code 规则。"""
+    s = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", s)
+    code = m.group(1) if m else s
+    module = s[:s.rfind("(")].strip() if "(" in s else ""
+    cl = str(code).lower()
+    for k, v in FEATURE_RANGES.items():
+        if k.lower() == cl:
+            return v
+    # 风速符号随服务器不同（FSFX2(s) 等），按风速规则回退到水平风速范围
+    if _is_wind_speed_code(feature) and "spfs" in FEATURE_RANGES:
+        return FEATURE_RANGES["spfs"]
+    mu = module.upper()
+    # JSD 族：加速度（DZJSD/SZJSD/EZJSD…，x/y/z 各向同量程）
+    if "JSD" in mu:
+        return FEATURE_RANGES.get("xJsd")
+    # JD 族：倾角（EZJD(xJd/yJd)）
+    if "JD" in mu:
+        return FEATURE_RANGES.get("xJd")
+    # 位移/空间变位：Δx/Ax/x 等轴写法
+    if _axis_canon(code):
+        return FEATURE_RANGES.get("Δx")
+    return None
+
+
+def _is_wind_speed_code(feature):
+    """风速判定（跨服务器符号不统一）：轴码 spfs/szfs、以 fs 结尾，
+    或风模块(FSFX*)下轴码 s，都按风速处理；风向(spfx/szfx)不算。"""
+    s = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", s)
+    inner = (m.group(1) if m else s).lower()
+    module = s[:s.rfind("(")].strip() if "(" in s else ""
+    return (inner in ("spfs", "szfs") or inner.endswith("fs")
+            or (inner == "s" and module.upper().startswith("FSFX")))
 
 
 def feature_code(feature):
@@ -120,11 +154,30 @@ def feature_code(feature):
     return m.group(1) if m else feature
 
 
+# 轴写法归一（大小写/别名不统一：Δx/Ax/x、XJSD/yJsd…的括号内轴码）
+_AXIS_CANON = {
+    "Δx": "x", "Δy": "y", "Δz": "z",
+    "δx": "x", "δy": "y", "δz": "z",
+    "x": "x", "y": "y", "z": "z",
+    "ax": "x", "ay": "y", "az": "z",
+}
+
+
+def _axis_canon(code):
+    """把各种轴写法统一成 x/y/z；不是轴返回空串。"""
+    c = str(code or "")
+    if c in _AXIS_CANON:
+        return _AXIS_CANON[c]
+    return _AXIS_CANON.get(c.lower(), "")
+
+
 def feature_display(feature):
     """把 WSD(rh) 之类的特征名补上中文说明。"""
     m = re.search(r"\(([^)]+)\)$", feature)
-    if m and m.group(1) in FEATURE_CN:
-        return f"{feature}（{FEATURE_CN[m.group(1)]}）"
+    if m:
+        for k, v in FEATURE_CN.items():
+            if k.lower() == m.group(1).lower():
+                return f"{feature}（{v}）"
     return feature
 
 
@@ -133,6 +186,108 @@ def feature_display(feature):
 TRAFFIC_SENSOR = "交通荷载"
 TRAFFIC_STAT_FEATURE = "交通荷载"
 TRAFFIC_TOTAL_FEATURE = "总共"
+TRAFFIC_CHART_NAMES = (
+    "各车道车辆累计通过数量图.png",
+    "各车道通过数量比例图.png",
+    "各车道频率分布图.png",
+)
+
+
+def _traffic_outputs_exist(chart_dir, stats_dir):
+    """图库/统计值是否已包含交通荷载产物（跨车道图 + 位置统计 JSON）。"""
+    chart_ok = any(
+        os.path.isfile(os.path.join(chart_dir, TRAFFIC_SENSOR, fn))
+        for fn in TRAFFIC_CHART_NAMES)
+    stats_ok = os.path.isfile(os.path.join(
+        stats_dir, "位置统计", TRAFFIC_SENSOR, "交通荷载.json"))
+    return chart_ok and stats_ok
+
+
+def _traffic_period_quarters(tag):
+    """由期号标签(2026.1~3 / 2026.1~12)推导需要的季度标签列表。"""
+    m = re.match(r"^(\d{4})\.(\d{1,2})~(\d{1,2})$", str(tag or ""))
+    if not m:
+        return []
+    year, qs, qe = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    out = []
+    for q in range((qs - 1) // 3 + 1, (qe - 1) // 3 + 2):
+        if q <= 4:
+            out.append(f"{year}Q{q}")
+    return out
+
+
+def _ensure_traffic_daily(args, bridge, tag):
+    """交通荷载 原始数据(xls) -> 日级数据 兜底：
+    - inputs/<桥>_车道统计_<期> 无原始数据 -> 打印提醒（不报错）；
+    - 有原始数据但 daily 缺 交通荷载/车道N -> 调用 preprocess_sensor_data.py
+      --traffic-only 生成日级；
+    - 已有日级 -> 跳过。返回 True 表示已有（或已生成）交通日级数据。
+    """
+    if not bridge:
+        return False
+
+    def _has_daily():
+        roots = args.daily_root if isinstance(args.daily_root, (list, tuple)) \
+            else [args.daily_root]
+        for root in roots:
+            tdir = os.path.join(str(root or ""), TRAFFIC_SENSOR)
+            if os.path.isdir(tdir) and any(
+                    os.path.isdir(os.path.join(tdir, d))
+                    for d in os.listdir(tdir)):
+                return True
+        return False
+
+    if _has_daily():
+        return True
+
+    # 检查 inputs 原始数据（项目根目录的 inputs/）
+    proj_root = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+    inputs_dir = os.path.join(proj_root, "inputs")
+    quarters = _traffic_period_quarters(tag)
+    raw_dirs = []
+    for q in quarters:
+        d = os.path.join(inputs_dir, f"{bridge}_车道统计_{q}")
+        if os.path.isdir(d) and any(
+                re.match(r"车道统计_\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}\.xls$",
+                         fn) for fn in os.listdir(d)):
+            raw_dirs.append(d)
+    if not raw_dirs:
+        print("[提醒] 未找到交通荷载原始数据 "
+              f"inputs/{bridge}_车道统计_{'、'.join(quarters) or tag}。"
+              "请先在 web“数据处理-交通荷载预处理”里下载（需开 VPN），"
+              "或命令行运行 download_monitor_data.py 后再处理。")
+        return False
+
+    # 有原始数据但没日级 -> 调用 preprocess_sensor_data.py --traffic-only
+    if isinstance(args.daily_root, (list, tuple)):
+        bridge_root = (os.path.dirname(str(args.daily_root[0]))
+                       if args.daily_root else "")
+    else:
+        bridge_root = os.path.dirname(str(args.daily_root or ""))
+    if not bridge_root:
+        return False
+    py = sys.executable
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "preprocess_sensor_data.py")
+    cmd = [py, script, "--traffic-only", "--bridge", bridge,
+           "--output-root", bridge_root,
+           "--traffic-root", inputs_dir, "--resume"]
+    if args.start:
+        cmd += ["--start", args.start]
+    if args.end:
+        cmd += ["--end", args.end]
+    print("[交通荷载] 原始数据已就绪，生成日级数据: " + " ".join(cmd),
+          flush=True)
+    try:
+        r = subprocess.run(cmd, cwd=os.path.dirname(script), timeout=7200)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[警告] 交通荷载日级预处理失败: {exc}", flush=True)
+        return False
+    if r.returncode != 0:
+        print(f"[警告] 交通荷载日级预处理失败，返回码 {r.returncode}", flush=True)
+        return False
+    return _has_daily()
 
 
 def _true_runs(mask):
@@ -741,8 +896,14 @@ def read_hourly_series(feature_dir):
 
 
 def _is_second_level_feature(feature: str) -> bool:
-    """振动类特征(DZJSD(xJsd)/yJsd/zJsd 等)为秒级全量数据，按天出图。"""
-    return feature_code(feature).lower().endswith("jsd")
+    """振动/地震类特征(JSD 族)为秒级全量数据，按天出图。
+    符号随服务器不同（DZJSD(xJsd)/SZJSD(yJsd)/…JSD(裸轴) 等）：
+    括号内轴码以 jsd 结尾，或模块名含 JSD，都按秒级处理。"""
+    s = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", s)
+    inner = (m.group(1) if m else s).lower()
+    module = s[:s.rfind("(")].strip() if "(" in s else ""
+    return inner.endswith("jsd") or "jsd" in module.lower()
 
 
 def read_daily_file(path):
@@ -1041,6 +1202,18 @@ def _bucket_label(bucket_seconds: int) -> str:
     return f"{bucket_seconds}秒均值"
 
 
+def _granularity_label(panels) -> str:
+    """由面板序列的实际时间间隔反推图标题粒度文案。
+    风速 daily 是 10 分钟、振动/地震是秒级、普通传感器是小时，
+    不能再写死“小时均值”（否则 10 分钟数据画的图会标成小时均值）。"""
+    hours = next((s["hours"] for _, sub in panels for s in sub
+                  if s.get("hours")), [])
+    b = _series_bucket_seconds(hours) if hours else 3600
+    return {3600: "小时均值", 1800: "半小时均值", 600: "10分钟均值",
+            300: "5分钟均值", 60: "1分钟均值", 1: "秒级均值"}.get(
+        b, f"{b}秒均值")
+
+
 def _unwrap_circular(values, period=360.0, jump=180.0):
     """把 0~360 的圆形量展开成连续序列（仅用于绘图）。
     消除 350°->10° 这种 0<->360 的伪跳变（物理上只差 20°）。"""
@@ -1148,6 +1321,8 @@ ZERO_OK_MIN_HOURS = 24.0 * 7
 
 def zero_min_hours(feature, default=24.0):
     """恒 0 标注阈值：普通特征 24h；0 为正常值的特征放宽到一周。"""
+    if _is_wind_speed_code(feature):
+        return ZERO_OK_MIN_HOURS   # 静风时风速为 0 属正常
     code = feature_code(feature)
     if code in ZERO_OK_CODES:
         return ZERO_OK_MIN_HOURS
@@ -1214,6 +1389,37 @@ def _mask_zero_run_hours(hours, means, maxs, mins, runs):
         xo.append(maxs[i])
         no.append(mins[i])
     return ho, mo, xo, no
+
+
+def _mask_zero_fault_hours(hours, means, maxs, mins, feature):
+    """统计极值用：剔除恒0故障段（含短于 24h 的段）。
+
+    绘图标注只对 >=24h（0为正常值特征 168h）的段标“可能故障”；统计极值
+    若也只剔 24h 段，几小时/十几小时的传感器掉零会把应变“最小值”打成 0。
+    因此这里对“0不是正常值”的特征，额外按 小时最小/最大序列 检测
+    >=6h 的连续恒0段，一并从 均值/最大/最小 序列剔除后再算极值
+    （平均值/中位数同步排除，与极值口径一致）。
+    风速/挠度/裂缝等“0为正常值”的特征保持原 168h 规则，不做短段剔除。
+    返回 (剔除后 hours, means, maxs, mins, 故障段列表)。
+    """
+    code = feature_code(feature)
+    prefix_m = re.match(r"^[A-Za-z0-9]+", str(feature or ""))
+    zero_ok = (code in ZERO_OK_CODES
+               or (prefix_m
+                   and prefix_m.group(0).upper() in ZERO_OK_PREFIXES))
+    runs = detect_zero_runs(hours, means,
+                            min_hours=zero_min_hours(feature))
+    if not zero_ok:
+        # 短时恒0段：按 最小/最大 序列检测（传感器掉零时 min=max=mean=0）
+        runs_min = detect_zero_runs(hours, mins, min_hours=6.0)
+        runs_max = detect_zero_runs(hours, maxs, min_hours=6.0)
+        for r in runs_min + runs_max:
+            if r not in runs:
+                runs.append(r)
+        runs.sort(key=lambda r: str(r.get("起始时间") or ""))
+    if not runs:
+        return hours, means, maxs, mins, []
+    return _mask_zero_run_hours(hours, means, maxs, mins, runs) + (runs,)
 
 
 def plot_time_series(sensor_id, sensor_name, feature, times, means,
@@ -1695,8 +1901,11 @@ def _is_axis_triple(pairs):
         if not m:
             return False
         inners.append(m.group(1))
-    return all(i in AXIS_INNER or i.lower() in AXIS_INNER
-               or i.lower().endswith(("jd", "jsd")) for i in inners)
+    canon = [_axis_canon(i) for i in inners]
+    if (all(a in ("x", "y", "z") for a in canon)
+            and len(set(canon)) == 3):
+        return True
+    return all(i.lower().endswith(("jd", "jsd")) for i in inners)
 
 
 def feature_group(feature: str) -> str:
@@ -1709,7 +1918,7 @@ def feature_group(feature: str) -> str:
     if not m:
         return feature
     prefix, inner = m.group(1), m.group(2)
-    if inner in AXIS_INNER or inner.lower() in AXIS_INNER:
+    if _axis_canon(inner):
         return prefix
     if inner.lower().endswith(("jd", "jsd")):
         return prefix
@@ -1942,6 +2151,9 @@ def _build_merged_series(daily_root, gf_pairs, start, end, spike_threshold,
 def _build_merged_daily_charts(args, pos, g, gf_pairs, out_dir, issues):
     """振动(秒级)合并图：按天生成 时间序列图_日期.png(横轴 0~24 小时，
     标题含年月日)；频率分布图按季度逐日累积；每天只加载当天数据。"""
+    # 秒级按天图只选“单日有效数据足够多”的天（至少 1 小时），避免传感器
+    # 几乎没数据时选到只有几行样本的天，画出几乎为空/凌晨就断的图
+    day_chart_min_seconds = 3600
     try:
         os.makedirs(out_dir, exist_ok=True)
         day_set = set()
@@ -2005,10 +2217,13 @@ def _build_merged_daily_charts(args, pos, g, gf_pairs, out_dir, issues):
                         shifts_d = _cap_shifts(blocks, args.max_shifts)
                 gaps_d = []
                 if len(hours_d) > 1:
+                    # 秒级数据：相邻两个有效点间隔超过 30 秒即视为缺口
+                    # （1s 粒度下 5 分钟阈值太粗，分钟级掉数也要标注）
+                    gap_thr = 30.0 / 3600.0
                     for a in range(len(hours_d) - 1):
                         gaph = (hours_d[a + 1] - hours_d[a]
                                 ).total_seconds() / 3600.0
-                        if gaph > 5.0 / 60.0:
+                        if gaph > gap_thr:
                             gaps_d.append({
                                 "起始时间": hours_d[a].strftime(
                                     "%Y-%m-%d %H:%M"),
@@ -2038,13 +2253,23 @@ def _build_merged_daily_charts(args, pos, g, gf_pairs, out_dir, issues):
                     "清洗记录": recs, "数据缺失时段": gaps_d,
                     "突变区间": shifts_d,
                 })
-            # 选定出图日：--vibration-date 优先，否则取有效秒数最多的一天
-            if series and (args.vibration_date == day
-                           or (not args.vibration_date
-                               and day_total_secs > best_total_secs)):
-                best_total_secs = day_total_secs
-                chart_series = series
-                chart_day = day
+            # 选定出图日：--vibration-date 优先；否则只在单日有效秒数达到
+            # 下限的天里取最多的一天（避免选到只有几行样本的天）
+            if series:
+                if args.vibration_date and args.vibration_date == day:
+                    best_total_secs = day_total_secs
+                    chart_series = series
+                    chart_day = day
+                elif (not args.vibration_date
+                        and day_total_secs >= day_chart_min_seconds
+                        and day_total_secs > best_total_secs):
+                    best_total_secs = day_total_secs
+                    chart_series = series
+                    chart_day = day
+        if days and not chart_series:
+            issues.append(
+                f"{pos}/{g}: 各日有效数据过少（单日均 <"
+                f"{day_chart_min_seconds} 秒），未生成按天时间序列图")
         if chart_series:
             plot_group_time_series(
                 pos, g, chart_series,
@@ -2493,13 +2718,14 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
         axes[j].axis("off")
 
     _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
+    _gran = _granularity_label(panels)
     if day_mode:
         fig.suptitle(
-            f"{position}｜{group} 小时均值时间序列（{n} 个测点）｜"
+            f"{position}｜{group} {_gran}时间序列（{n} 个测点）｜"
             f"{_fmt_cn_date(day_date)}{_chunk_txt}", fontsize=19)
     else:
         fig.suptitle(
-            f"{position}｜{group} 小时均值时间序列（{n} 个测点）{_chunk_txt}",
+            f"{position}｜{group} {_gran}时间序列（{n} 个测点）{_chunk_txt}",
             fontsize=19)
     if global_handles:
         uniq_sensor_count = len({s["sensor"] for _, sub in panels
@@ -2937,6 +3163,11 @@ def main():
     ap.add_argument("--features", default="",
                     help="只生成指定特征(逗号分隔，如 DZJSD(xJsd),YB(rsg))；"
                          "留空=全部。用于对不满意的特征选择性重新生成")
+    ap.add_argument("--traffic-only", action="store_true",
+                    help="只处理交通荷载(车道统计)：检查 inputs 原始数据、"
+                         "必要时先转日级，再生成 交通荷载 图库/统计值；"
+                         "不写 总览.json/公共缺失时间段.json，避免覆盖"
+                         "该期其它传感器的统计产物")
     ap.add_argument("--vibration-date", default="",
                     help="振动(秒级)出图日期 YYYY-MM-DD；不指定时自动取"
                          "数据最完整/最新的一天(只出一张时间序列图)")
@@ -3093,6 +3324,17 @@ def main():
     if tag:
         print(f"本期年月范围: {tag}")
 
+    # ---------- 交通荷载：跳过已存在 / 原始数据检查 / 日级兜底 ----------
+    # 普通全量跑：图库/统计值已有交通荷载产物时跳过，避免每次重复处理；
+    # --traffic-only（web“交通荷载预处理”）强制重建。
+    skip_traffic = (not args.traffic_only
+                    and _traffic_outputs_exist(chart_dir, stats_dir))
+    if not skip_traffic:
+        _ensure_traffic_daily(args, bridge, tag)
+    else:
+        print("[提示] 图库/统计值已包含交通荷载数据，跳过交通荷载处理"
+              "（如需强制重建请加 --traffic-only）", flush=True)
+
     # ---------- 选择数据源 ----------
     sensor_feats = discover_sensor_features(args.daily_root)
     if not sensor_feats:
@@ -3104,12 +3346,19 @@ def main():
     # 收集 (传感器, 特征) 列表
     pairs = [(s, f) for s, feats in sorted(sensor_feats.items())
              for f in feats]
-    if args.features:
+    if args.traffic_only:
+        # 只处理交通荷载（车道N/总共）
+        pairs = [(s, f) for s, f in pairs if s == TRAFFIC_SENSOR]
+    elif args.features:
         want_traffic = _traffic_selected(args.features)
         pairs = [(s, f) for s, f in pairs
                  if _feature_selected(f, args.features)
                  or (want_traffic and s == TRAFFIC_SENSOR)]
     sensors = sorted({p[0] for p in pairs})
+    if args.traffic_only and TRAFFIC_SENSOR not in sensors:
+        print("[提醒] 未找到交通荷载日级数据（inputs 无原始数据或尚未预处理），"
+              "请先下载/预处理交通荷载数据", flush=True)
+        return
     if args.limit_sensors:
         sensors = sensors[:args.limit_sensors]
         pairs = [p for p in pairs if p[0] in set(sensors)]
@@ -3132,6 +3381,10 @@ def main():
               "直接生成合并图")
         _sensor_iter = []
     for idx, sensor in enumerate(_sensor_iter, 1):
+        if sensor == TRAFFIC_SENSOR and skip_traffic:
+            print(f"[跳过] 交通荷载统计已存在，跳过 {sensor}"
+                  "（--traffic-only 可强制重建）", flush=True)
+            continue
         info = sensor_map.get(sensor, {})
         sensor_name = info.get("名称", "") or sensor
         bridge = info.get("桥名", "")
@@ -3294,19 +3547,18 @@ def main():
                             sensor, sensor_name, feature, hist_bins,
                             hist_counts, os.path.join(fout, "频率分布图.png"))
                     if not args.skip_stats:
-                        # 连续恒0故障段（与图库“可能故障”标注同一规则）：剔除后
-                        # 算极值，并记录 疑似故障时间段 供季度统计/总结引用
-                        zero_runs = detect_zero_runs(
-                            native_hours, native_means,
-                            min_hours=zero_min_hours(feature)) \
-                            if native_hours else []
-                        _n_hours, _n_means, _n_maxs, _n_mins = \
-                            native_hours, native_means, native_maxs, native_mins
-                        if zero_runs:
+                        # 恒0故障段（含 <24h 短段）：剔除后算极值，并记录
+                        # 疑似故障时间段 供季度统计/总结引用
+                        if native_hours:
+                            (_n_hours, _n_means, _n_maxs, _n_mins,
+                             zero_runs) = _mask_zero_fault_hours(
+                                native_hours, native_means,
+                                native_maxs, native_mins, feature)
+                        else:
                             _n_hours, _n_means, _n_maxs, _n_mins = \
-                                _mask_zero_run_hours(
-                                    native_hours, native_means,
-                                    native_maxs, native_mins, zero_runs)
+                                native_hours, native_means, \
+                                native_maxs, native_mins
+                            zero_runs = []
                         stats, day_dates, day_means, day_maxs, day_mins = \
                             compute_feature_stats(
                                 day_dates, day_means, day_maxs, day_mins,
@@ -3393,12 +3645,6 @@ def main():
                     max_spikes=args.max_spikes, dist_k=args.dist_k,
                     max_dist_outliers=args.max_dist_outliers,
                     max_total_removals=args.max_removals)
-                # 缓存清洗后小时序列（均值/最大/最小）供 应变-温度回归/绘图
-                # 使用（与结构温度曲线图同一套清洗，不用原始序列）
-                if actual_feature in ("YB(rsg)", "WD(temp)", "WSD(temp)"):
-                    _corr_hourly[(str(sensor), actual_feature)] = (
-                        list(hours), list(hmeans),
-                        list(hmaxs), list(hmins))
                 spike_rec = r1 + r2 + r3
                 # 图上只标均值序列的剔除点；最大/最小序列的清洗记录仍写入 JSON
                 spike_idx = sorted(ix1)
@@ -3450,16 +3696,22 @@ def main():
                 day_miss = [_raw_miss.get(d, 0) for d in day_dates]
                 stats = None
                 if not args.skip_stats:
-                    # 连续恒0故障段剔除（与图库“可能故障”标注同一规则）
-                    zero_runs = detect_zero_runs(
-                        hours, hmeans, min_hours=zero_min_hours(feature)) \
-                        if hours else []
-                    _n_hours, _n_means, _n_maxs, _n_mins = \
-                        hours, hmeans, hmaxs, hmins
-                    if zero_runs:
+                    # 恒0故障段（含 <24h 短段）剔除后算极值
+                    if hours:
+                        (_n_hours, _n_means, _n_maxs, _n_mins,
+                         zero_runs) = _mask_zero_fault_hours(
+                            hours, hmeans, hmaxs, hmins, feature)
+                    else:
                         _n_hours, _n_means, _n_maxs, _n_mins = \
-                            _mask_zero_run_hours(
-                                hours, hmeans, hmaxs, hmins, zero_runs)
+                            hours, hmeans, hmaxs, hmins
+                        zero_runs = []
+                    # 缓存“恒0故障段剔除后”的清洗小时序列（均值/最大/最小）
+                    # 供 应变-温度回归/剔除温度极值 使用（与统计口径一致，
+                    # 短时掉零段不会把 剔除温度最小 打成 0）
+                    if actual_feature in ("YB(rsg)", "WD(temp)", "WSD(temp)"):
+                        _corr_hourly[(str(sensor), actual_feature)] = (
+                            list(_n_hours), list(_n_means),
+                            list(_n_maxs), list(_n_mins))
                     stats, day_dates, day_means, day_maxs, day_mins = \
                         compute_feature_stats(
                             day_dates, day_means, day_maxs, day_mins,
@@ -3705,7 +3957,7 @@ def main():
         # 小时缺失，把连续小时合并为时间段（小时级精度），写入
         # 统计值_<期>/<桥名>/公共缺失时间段.json，供季度/年度统计和
         # 总结段落引用（如“环境湿度基本上都是在 1.18 10~1.19 14 … 缺失”）。
-        if _feature_hour_cov:
+        if _feature_hour_cov and not args.traffic_only:
             _common_missing = {}
             try:
                 _d0 = (dt.date.fromisoformat(str(args.start)[:10])
@@ -3827,19 +4079,22 @@ def main():
                     print(f"[警告] 写回应变-温度统计失败 {sid}: {exc}")
         print(f"  位置统计库已写出: {pos_stats_dir} "
               f"({len(pos_stats)} 个位置)")
-        with open(os.path.join(stats_dir, "总览.json"), "w",
-                  encoding="utf-8") as f:
-            json.dump({
-                "说明": "全部传感器-特征图库总览",
-                "生成时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "传感器数量": len(overview),
-                "传感器": overview,
-            }, f, ensure_ascii=False, indent=2)
+        if not args.traffic_only:
+            with open(os.path.join(stats_dir, "总览.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({
+                    "说明": "全部传感器-特征图库总览",
+                    "生成时间": dt.datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"),
+                    "传感器数量": len(overview),
+                    "传感器": overview,
+                }, f, ensure_ascii=False, indent=2)
 
     # ---------- 交通荷载：跨车道合并图（累计数量/比例/频率分布） ----------
     # 与普通特征不同：不生成 车道N 子文件夹，直接在 交通荷载/ 下出三张图；
     # --features 交通荷载 时只出该桥交通荷载相关目录
-    if not args.skip_charts and TRAFFIC_SENSOR in sensor_feats:
+    if not args.skip_charts and not skip_traffic \
+            and TRAFFIC_SENSOR in sensor_feats:
         if (not args.features or _traffic_selected(args.features)
                 or any(f.strip().startswith("车道")
                        for f in str(args.features or "").split(","))):
@@ -4036,6 +4291,14 @@ def main():
                     )]
 
             for pos, pairs in sorted(pos_map.items()):
+                if args.traffic_only:
+                    # 交通荷载传感器不在对照表/pos_map 里：合并图循环只应
+                    # 处理交通传感器，其它位置(如 EZJSD 振动/应变)一律跳过，
+                    # 避免“处理交通荷载”却把整桥的合并图也生成出来(功能杂糅)
+                    pairs = [(s, f) for s, f in pairs
+                             if s == TRAFFIC_SENSOR]
+                    if not pairs:
+                        continue
                 if allowed is not None:
                     pairs = [(s, f) for s, f in pairs if s in allowed]
                 if args.features:

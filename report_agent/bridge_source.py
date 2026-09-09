@@ -185,7 +185,7 @@ def _pick_chart_file(dirpath: str, base_name: str) -> Optional[str]:
 
 
 # 轴/方向分量 -> 同一特征组（与 build_chart_library.feature_group 保持一致）
-_AXIS_INNER = {"Δx", "Δy", "Δz", "x", "y", "z"}
+_AXIS_INNER = {"Δx", "Δy", "Δz", "x", "y", "z", "ax", "ay", "az"}
 
 
 def _axis_inner(feature: str) -> str:
@@ -344,6 +344,10 @@ def format_report_number(value) -> str:
         v = float(value)
     except (TypeError, ValueError):
         return str(value)
+    if not math.isfinite(v):
+        # NaN/Inf：数据无效（如统计值里混入的 NaN），填“—”而不是
+        # int(NaN) 崩溃，保证报告流程不中断
+        return "—"
     if v == 0.0:
         return "0"
     if v == int(v) and abs(v) < 1e9:
@@ -2325,8 +2329,13 @@ class BridgeData:
             return False
         m = re.search(r"\(([^)]+)\)$", str(feature or ""))
         code = (m.group(1) if m else "").lower()
+        # 风速符号随服务器不同（FSFX2(spfs)/FSFX2(szfs)/FSFX2(s)/裸码）：
+        # 轴码以 fs 结尾、或风模块(FSFX*)下轴码 s 都按“0为正常值”处理
+        module = str(feature or "").split("(", 1)[0].strip()
         zero_ok = (code in ("nd", "spfs", "szfs")
-                   or str(feature or "").upper().startswith("LF"))
+                   or str(feature or "").upper().startswith("LF")
+                   or code.endswith("fs")
+                   or (code == "s" and module.upper().startswith("FSFX")))
         if zero_ok:
             return False
         if abs(mx - mn) <= 1e-9:
@@ -2596,7 +2605,11 @@ class BridgeData:
         for _pos, points in (data or {}).items():
             if not isinstance(points, dict):
                 continue
-            rec = points.get(str(lane))
+            # 列名可能是 车道1 / 交通分析车道1 / 车道1(交通分析) 等，
+            # 统一取 “车道N” 与 位置统计/交通荷载/交通荷载.json 的键对齐
+            m = re.search(r"车道\s*(\d+)", str(lane or ""))
+            lane_key = f"车道{m.group(1)}" if m else str(lane)
+            rec = points.get(lane_key)
             if isinstance(rec, dict):
                 st = rec.get("统计") or {}
                 return st if isinstance(st, dict) else None
@@ -2691,8 +2704,12 @@ class BridgeData:
             direction = col
         elif re.match(r"^测点\s*\d+$", col):
             point_no = col
-        elif not point_no:
-            point_no = f"测点{row_index + 1}"
+        # 列名是“完整位置+测点N”且没有 顶板/底板 前缀时（如“吉首侧主塔
+        # 中部截面测点1”），上面都提取不到，从列名尾部补提取；否则按行号
+        if not point_no:
+            _m3 = re.search(r"测点\s*(\d+)$", col)
+            point_no = (f"测点{_m3.group(1)}"
+                        if _m3 else f"测点{row_index + 1}")
         # 标题基座：去掉 方向 / 应变监测统计 等，再取核心段。
         # 先去掉带“侧”的完整方位词（上游侧/下游侧），再处理裸方位，
         # 避免“上游侧”只去掉“上游”留下孤立“侧”污染核心段。
@@ -2743,6 +2760,14 @@ class BridgeData:
                     return pos, str(sid)
             return None
 
+        # 0) 无方位表两侧拼接：标题/列名没有方位、核心位置只有 左幅/右幅
+        # (或上游/下游) 变体、没有无方位断面时，整表按 左/上游 → 右/下游
+        # 拼接（测点编号偏移），避免“吉首侧主塔中部截面测点1..8”整表串到
+        # 同一侧或后半段重复上一行。
+        if not direction:
+            _merged = self._merged_point_plan(plans, core, part, point_no)
+            if _merged:
+                return _merged
         # 1) 严格匹配：基座核心 + 部位词 + 方向 都命中
         found = _search(alias=False, fuzzy=False)
         if found:
@@ -2762,6 +2787,83 @@ class BridgeData:
             if found:
                 return found
         return None
+
+    def _merged_point_plan(self, plans: List[Dict], core: str, part: str,
+                           point_no: str):
+        """无方位表两侧拼接（测点映射用）：核心位置只有 左幅/右幅
+        (或上游/下游) 变体、没有无方位断面时，把两侧测点合并成一张表——
+        左/上游 测点1..N 原样保留，右/下游 测点1..N 偏移到 N+1.. 之后，
+        返回 point_no 对应的 (断面位置组合标签, 传感器编号)；否则 None。
+        """
+        if not core or not point_no:
+            return None
+        left_pts, right_pts = {}, {}
+        side_names = []
+        for plan in plans or []:
+            p = str(plan.get("断面位置") or "")
+            if part and part not in p:
+                continue
+            if core not in p:
+                continue
+            sides = _side_set(p)
+            pts = plan.get("测点") or {}
+            if not sides:
+                return None   # 存在无方位断面，不拼接
+            if sides & {"L", "U"}:
+                left_pts.update(pts)
+                side_names.append(p)
+            elif sides & {"R", "D"}:
+                right_pts.update(pts)
+                side_names.append(p)
+        if not left_pts or not right_pts:
+            return None
+        merged = dict(left_pts)
+        offset = 0
+        for k in left_pts:
+            m = re.search(r"(\d+)", str(k))
+            if m:
+                offset = max(offset, int(m.group(1)))
+        for k, v in right_pts.items():
+            m = re.search(r"(\d+)", str(k))
+            if m:
+                merged[f"测点{offset + int(m.group(1))}"] = v
+        if point_no in merged:
+            return "、".join(sorted(side_names)), str(merged[point_no])
+        return None
+
+    def _merged_side_ids(self, mkey: str, pos: str):
+        """表格无方位时，把 位置 的方位变体(左幅/右幅、上游/下游、左侧/右侧)
+        的测点按 左/上游 → 右/下游 拼接（如 吉首侧索塔中截面测点1..8 =
+        左幅4 + 右幅4）。
+        仅当该核心没有“无方位键”、且确实存在两侧键时返回拼接列表；
+        否则返回 None（保持原按行取号逻辑）。
+        """
+        keys = list((self.table_map.get(mkey) or {}).keys())
+        if pos not in keys or not _position_side_words(pos):
+            return None
+
+        def _core(k):
+            c = re.sub(
+                r"[（(]?(?:左幅|右幅|上游|下游|左侧|右侧|左|右)[）)]?",
+                "", str(k))
+            return c.replace("（）", "").replace("()", "").strip()
+
+        core = _core(pos)
+        if not core:
+            return None
+        variants = [k for k in keys if _core(k) == core]
+        if core in variants:
+            return None  # 存在无方位键，应精确命中，不拼接
+        left, right = [], []
+        for k in variants:
+            ids = [str(x) for x in self.table_map[mkey][k]]
+            if any(w in k for w in ("左幅", "左侧", "上游")):
+                left.extend(ids)
+            elif any(w in k for w in ("右幅", "右侧", "下游")):
+                right.extend(ids)
+        if not left or not right:
+            return None
+        return left + right
 
     def _resolve_cell_by_table(self, metric: str, column: str, stat: str,
                                period: Dict, title: str,
@@ -2844,6 +2946,14 @@ class BridgeData:
                 if pos:
                     ids = [str(x) for x in self.table_map[mkey][pos]]
                     feat = "WD(temp)" if mkey == "结构温度表" else ""
+                    # 表格无方位、但匹配到的位置键带方位（左幅/右幅等），且
+                    # 没有无方位键时：把两侧测点拼接后按行取（如 吉首侧索塔
+                    # 中截面测点1..8 = 左幅4 + 右幅4），避免整表填成同一侧
+                    if (not _position_side_words(column)
+                            and _position_side_words(pos)):
+                        merged = self._merged_side_ids(mkey, pos)
+                        if merged:
+                            ids = merged
                     if not ids:
                         return None
                     # 一个监测部位有多个传感器时，按表格行号取对应传感器

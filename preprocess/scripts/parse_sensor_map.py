@@ -184,6 +184,15 @@ def parse_docx(path):
                               and c not in DIRECTION_WORDS]
                 cjk_cells = [c for c in text_cells
                              if re.search(r"[\u4e00-\u9fff]", c)]
+                # 一行有多个中文单元格时，排除“类别标签单元格”（含当前
+                # 监测类别的单元格，如 类别“风荷载” -> “大桥环境风荷载”），
+                # 否则第一行会因标签最长被当成位置（矮寨风荷载表 873 被归
+                # 到“大桥环境风荷载”而非“吉首侧上横梁”）。
+                # 注意：整行只有一个中文单元格时（如“吉首侧塔顶上横梁
+                # （横向振动）”）它就是位置本身，不能因含类别词而排除。
+                if current_category and len(cjk_cells) > 1:
+                    cjk_cells = [c for c in cjk_cells
+                                 if current_category not in c]
                 location = (max(cjk_cells, key=len) if cjk_cells
                             else (max(text_cells, key=len)
                                   if text_cells else ""))

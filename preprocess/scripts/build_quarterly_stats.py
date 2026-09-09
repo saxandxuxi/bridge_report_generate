@@ -23,7 +23,7 @@
     python build_quarterly_stats.py [--daily-root ...] [--lib-root ...]
                                     [--bridge 桥名] [--period quarterly|yearly]
                                     [--start ...] [--end ...]
-    年度统计时 --daily-root 传桥根目录(如 D:\preprocess_sensor_data\湘江特)，
+    年度统计时 --daily-root 传桥根目录(如 D:/preprocess_sensor_data/湘江特)，
     脚本会汇总其下所有 daily_* 子目录的数据。
 """
 
@@ -69,6 +69,20 @@ def _derive_period_tag(daily_root="", start="", end=""):
     except (ValueError, AttributeError):
         pass
     return ""
+
+
+def _zero_ok_feature(feature):
+    """“0为正常值”特征：挠度(nd)/裂缝(LF)/风速。
+    风速符号随服务器不同（FSFX2(spfs)/FSFX2(szfs)/FSFX2(s)/裸码），
+    轴码以 fs 结尾、或风模块(FSFX*)下轴码 s 都按风速处理。"""
+    f = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", f)
+    code = (m.group(1) if m else "").lower()
+    module = f[:f.rfind("(")].strip() if "(" in f else ""
+    return (code in ("nd", "spfs", "szfs")
+            or f.upper().startswith("LF")
+            or code.endswith("fs")
+            or (code == "s" and module.upper().startswith("FSFX")))
 
 
 def load_sensor_map(path):
@@ -319,6 +333,10 @@ def main():
     ap = argparse.ArgumentParser(description="季度统计值(小时级, 按监测部位合并)")
     ap.add_argument("--daily-root", default=DEFAULT_DAILY_ROOT)
     ap.add_argument("--lib-root", default=DEFAULT_LIB_ROOT)
+    ap.add_argument("--stats-dir", default="",
+                    help="统计值目录(默认 <lib-root>/统计值_<期>/<桥名>；"
+                         "与 build_chart_library 的 --stats-dir 对齐，"
+                         "显式指定时不再按 lib-root 推导)")
     ap.add_argument("--sensor-map", default="",
                     help="传感器编号名称.json 路径(默认 preprocess/传感器对照/"
                          "传感器编号名称.json)")
@@ -366,7 +384,14 @@ def main():
                 break
         if not resolved:
             args.daily_root = os.path.join(base, bridge, daily_name)
-    stats_dir = os.path.join(stats_dir0, bridge) if bridge else stats_dir0
+    if args.stats_dir:
+        stats_dir = args.stats_dir
+        # 与 build_chart_library 一致：stats 目录叶子不是桥名时自动补桥名子目录
+        leaf = os.path.basename(os.path.normpath(str(stats_dir)))
+        if bridge and leaf not in bcl._bridge_variants(bridge):
+            stats_dir = os.path.join(stats_dir, bridge)
+    else:
+        stats_dir = os.path.join(stats_dir0, bridge) if bridge else stats_dir0
     os.makedirs(stats_dir, exist_ok=True)
 
     if args.mode == "stats":
@@ -469,10 +494,7 @@ def main():
                         _mn0 = float(st.get("最小值") or 0)
                     except (TypeError, ValueError):
                         _mx0 = _mn0 = None
-                    _zcode = re.search(r"\(([^)]+)\)$", str(feat or ""))
-                    _zcode = (_zcode.group(1) if _zcode else "").lower()
-                    _zero_ok = _zcode in ("nd", "spfs", "szfs") \
-                        or str(feat or "").upper().startswith("LF")
+                    _zero_ok = _zero_ok_feature(feat)
                     zero_suspect = not _zero_ok \
                         and (_mn0 == 0.0 or _mx0 == 0.0)
                     if zero_suspect:
@@ -545,10 +567,7 @@ def main():
                     mn = float(st.get("最小值") or 0)
                 except (TypeError, ValueError):
                     return False
-                m = re.search(r"\(([^)]+)\)$", str(feature or ""))
-                code = (m.group(1) if m else "").lower()
-                zero_ok = code in ("nd", "spfs", "szfs") \
-                    or str(feature or "").upper().startswith("LF")
+                zero_ok = _zero_ok_feature(feature)
                 if zero_ok:
                     return False
                 if abs(mx - mn) <= 1e-9:

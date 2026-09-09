@@ -9,3 +9,6 @@ requests>=2.28.0
 numpy>=1.24,<2
 pandas>=1.5.0
 paramiko>=3.4.0
+# traffic download (download_monitor_data.py) needs playwright;
+# after pip install, run once: playwright install chromium
+playwright>=1.40.0

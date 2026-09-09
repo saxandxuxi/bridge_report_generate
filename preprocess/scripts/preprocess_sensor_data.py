@@ -220,17 +220,37 @@ def period_tag(start="", end=""):
     return f"{d0.year}.{d0.month}~{d1.year}.{d1.month}"
 
 
+def _is_wind_speed_feature(feature):
+    """判断特征是否为 风速(水平/竖向)。不同服务器/传感器风速符号不统一：
+    可能是 FSFX2(spfs)/FSFX2(szfs)、FSFX2(s)，也可能是裸码 spfs/szfs。
+    规则：轴码等于 spfs/szfs、或以 fs 结尾（风+速）；或风模块(FSFX*)下
+    轴码为 s。风向类(spfx/szfx/x 等)不算风速。
+    """
+    s = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", s)
+    inner = (m.group(1) if m else s).lower()
+    module = s[:s.rfind("(")].strip() if "(" in s else ""
+    if inner in ("spfs", "szfs") or inner.endswith("fs"):
+        return True
+    if inner == "s" and module.upper().startswith("FSFX"):
+        return True
+    return False
+
+
 def bucket_seconds_for(feature):
     """特征专用聚合粒度：
-      - 风速 FSFX2(spfs)/FSFX2(szfs) -> 600 秒（10 分钟一个均值）
-      - 振动 DZJSD(xJsd)/yJsd/zJsd  -> 1 秒（保留全天秒级全量数据）
+      - 风速（符号随服务器不同：FSFX2(spfs)/FSFX2(szfs)/FSFX2(s)/裸码）-> 600 秒
+      - 振动/地震 JSD 族（DZJSD(xJsd)/SZJSD(yJsd)/…JSD(裸轴 x) 等）-> 1 秒
       - 其余特征 -> BUCKET_SECONDS（默认 1 小时）
     """
-    m = re.search(r"\(([^)]+)\)$", feature or "")
-    inner = (m.group(1) if m else (feature or "")).lower()
-    if inner in ("spfs", "szfs"):
+    if _is_wind_speed_feature(feature):
         return 600
-    if inner.endswith("jsd"):
+    s = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", s)
+    inner = (m.group(1) if m else s).lower()
+    module = s[:s.rfind("(")].strip() if "(" in s else ""
+    # 轴码以 jsd 结尾，或模块名含 JSD（裸轴写法 DZJSD(x) 等），都按秒级
+    if inner.endswith("jsd") or "jsd" in module.lower():
         return 1
     return BUCKET_SECONDS
 
@@ -262,7 +282,12 @@ VAL_NAMES = {"value", "val", "v", "measurement", "measured", "data",
 
 
 def setup_logging(log_path):
-    """初始化日志：同时输出到控制台和文件(带时间戳)，文件为追加模式。"""
+    """初始化日志：同时输出到控制台和文件(带时间戳)，文件为追加模式。
+
+    文件被其它进程占用（如残留的预处理进程还开着 preprocess.log）时，
+    回退到带进程号的文件，避免整个预处理因日志文件被锁而崩溃
+    （否则 web“交通荷载预处理”会显示空日志直接失败）。
+    """
     global logger
     logger.setLevel(logging.INFO)
     for h in list(logger.handlers):
@@ -270,11 +295,22 @@ def setup_logging(log_path):
         h.close()
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s",
                             datefmt="%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
+    fh = None
+    try:
+        fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    except OSError:
+        alt = f"{log_path}.{os.getpid()}.log"
+        try:
+            fh = logging.FileHandler(alt, mode="a", encoding="utf-8")
+            logger.warning("日志文件被占用(%s)，本次日志改用 %s",
+                           log_path, alt)
+        except OSError:
+            fh = None
+    if fh is not None:
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
-    logger.addHandler(fh)
     logger.addHandler(sh)
     logger.propagate = False
 
@@ -1066,6 +1102,12 @@ def run_preprocess(tasks):
         logger.info("没有符合条件的任务。")
         return 0
     workers = WORKERS if WORKERS > 0 else max(1, (os.cpu_count() or 1) - 1)
+    if os.name == "nt":
+        # Windows WaitForMultipleObjects 最多等 64 个句柄（multiprocessing
+        # 限制为 63），每个 worker 占 1 个、pool 内部还占 2 个：63 个进程
+        # 会直接 ValueError 崩溃。封顶 56 留足余量，避免不同 Python 版本
+        # 句柄占用差异再次踩线。
+        workers = min(workers, 56)
     n_total = len(tasks)
     spw = max(1, SENSORS_PER_WORKER)
     batches = build_batches(tasks, spw)

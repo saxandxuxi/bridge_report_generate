@@ -3,6 +3,14 @@
 .venv_web/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 .idea/
 .vscode/
 .DS_Store
@@ -10,6 +18,8 @@ Thumbs.db
 Desktop.ini
 ~$*
 *.bak
+*.tmp
+*.swp
 
 # ---------- 本地工具/环境 ----------
 .workbuddy/
@@ -35,6 +45,16 @@ monitor_credentials.json
 sync_daily/sync_daily_receiver.json
 skills-lock.json
 
+# ---------- 压缩包/备份（体积大且可重建，不提交） ----------
+*.tar
+*.gz
+*.tar.gz
+*.zip
+*.rar
+*.7z
+*.bak.*
+bridge.tar.gz
+
 # ---------- 桥数据预处理产物（可在服务器重新生成） ----------
 preprocess/图库*/
 preprocess/统计值*/
@@ -47,3 +67,5 @@ preprocess/sensor_ids.txt
 
 .venv_web/
 docs/
+*.bak
+bridge.tar.gz

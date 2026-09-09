@@ -148,20 +148,9 @@
       </div>
       <div class="row">
         <label style="font-size:13px"><input type="checkbox" id="runAutoPre" checked> 缺数据时自动预处理（秒级→日级→图库/统计值）</label>
-        <label style="font-size:13px">
-          交通荷载数据
-          <select id="runTraffic" title="赤石/矮寨/洞庭湖 有车道统计；选“有”会在生成前检查原始数据是否齐全">
-            <option value="auto">自动检测</option>
-            <option value="yes">有</option>
-            <option value="no">无</option>
-          </select>
-        </label>
-        <button class="ghost" onclick="checkTraffic()">检查交通数据</button>
-        <button class="ghost" id="trafficDownloadBtn" onclick="startTrafficDownload()" style="display:none">下载交通数据（需开VPN）</button>
         <button class="ghost" onclick="checkPeriod()">检查该周期数据</button>
       </div>
       <div id="periodInfo" class="muted"></div>
-      <div id="trafficInfo" class="muted"></div>
       <div id="runStatus" class="muted"></div>
       <div id="runResult"></div>
     </div>
@@ -241,6 +230,35 @@
         <span id="ppStatus" class="muted"></span>
       </div>
       <pre id="ppLog" style="margin-top:10px">—</pre>
+    </div>
+
+    <div class="panel">
+      <h3>交通荷载预处理（车道统计 → 日级 → 图库/统计值 → 季度统计）</h3>
+      <p class="muted">独立于报告生成。点击后先检查 inputs 下
+        <b>&lt;桥名&gt;_车道统计_&lt;期&gt;</b> 原始数据是否齐全：不齐全会自动调用
+        download_monitor_data.py 下载（需开 VPN + 浏览器验证码），然后预处理成
+        日级数据，并生成 图库/统计值 下的交通荷载产物、更新季度统计文件。</p>
+      <div class="row">
+        <select id="tpMode" title="处理周期">
+          <option value="quarterly">季度</option>
+          <option value="yearly">年度</option>
+        </select>
+        <select id="tpQuarter" title="季度号 1~4">
+          <option value="1">第1季度</option>
+          <option value="2">第2季度</option>
+          <option value="3">第3季度</option>
+          <option value="4">第4季度</option>
+        </select>
+        <input type="number" id="tpYear" min="2020" max="2100" step="1"
+               title="年份" style="width:90px">
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="checkTraffic()">检查交通数据</button>
+        <button onclick="startTrafficProcess()">处理交通荷载数据</button>
+        <span id="trafficInfo" class="muted"></span>
+      </div>
+      <div id="trafficProcStatus" class="muted"></div>
+      <pre id="trafficProcLog" style="margin-top:10px">—</pre>
     </div>
   </section>
 
@@ -521,15 +539,15 @@ function loadCurrentBridge() {
     }
     var active = document.querySelector("nav button.active");
     if (active) showTab(active.dataset.tab);
-    if ($("runTraffic") && currentBridgeId()) checkTraffic();
+    if (currentBridgeId()) checkTraffic();
   }).catch(function (e) { showMsg(String(e), "err"); });
 }
 
 function wirePeriodTraffic() {
-  // 周期/桥参数变化时自动刷新交通数据状态，让“下载交通数据”按钮及时出现
-  ["runMode", "runQuarter", "runYear", "runEnd", "runStart"].forEach(function (id) {
+  // 交通荷载预处理面板：周期/桥参数变化时自动刷新交通数据状态
+  ["tpMode", "tpQuarter", "tpYear"].forEach(function (id) {
     var el = $(id);
-    if (el) el.addEventListener("change", function () { if ($("runTraffic")) checkTraffic(); });
+    if (el) el.addEventListener("change", function () { checkTraffic(); });
   });
 }
 
@@ -703,8 +721,7 @@ function startRun() {
   var body = {
     mode: $("runMode").value,
     date: $("runEnd").value || "",
-    template: $("runTemplate").value || "",
-    traffic: $("runTraffic").value || "auto"
+    template: $("runTemplate").value || ""
   };
   if (body.mode === "quarterly") {
     body.quarter = $("runQuarter").value || "1";
@@ -761,6 +778,16 @@ function pollRun(bridgeId) {
           };
           $("runResult").innerHTML = "<pre>" + esc(JSON.stringify(s, null, 2)) + "</pre>";
         }
+        if (st.running && st.running.traffic_warning) {
+          $("runStatus").textContent = "完成（注意：交通荷载未处理）";
+          $("runResult").innerHTML +=
+            '<br><span class="err">' + esc(st.running.traffic_warning) + "</span>";
+        }
+        if (st.running && st.running.data_warning) {
+          $("runStatus").textContent = "完成（注意：本期数据不完整）";
+          $("runResult").innerHTML +=
+            '<br><span class="err">' + esc(st.running.data_warning) + "</span>";
+        }
         loadCurrentBridge();
         loadReports();
         checkPeriod();
@@ -811,31 +838,99 @@ function currentPeriod() {
   return body;
 }
 
+function trafficPeriodQuery() {
+  var mode = $("tpMode").value || "quarterly";
+  var q = ["mode=" + encodeURIComponent(mode)];
+  if (mode === "quarterly") {
+    q.push("quarter=" + encodeURIComponent($("tpQuarter").value || "1"));
+    q.push("year=" + encodeURIComponent($("tpYear").value || String(new Date().getFullYear())));
+  } else {
+    q.push("year=" + encodeURIComponent($("tpYear").value || String(new Date().getFullYear())));
+  }
+  return q;
+}
+
+function trafficPeriod() {
+  var mode = $("tpMode").value || "quarterly";
+  var body = { mode: mode };
+  if (mode === "quarterly") {
+    body.quarter = $("tpQuarter").value || "1";
+    body.year = $("tpYear").value || String(new Date().getFullYear());
+  } else {
+    body.year = $("tpYear").value || String(new Date().getFullYear());
+  }
+  return body;
+}
+
 function checkTraffic() {
   var bridgeId = currentBridgeId();
-  api("/api/bridges/" + bridgeId + "/traffic-status?" + periodQuery().join("&"), { method: "GET" })
+  if (!bridgeId) { $("trafficInfo").textContent = ""; return; }
+  api("/api/bridges/" + bridgeId + "/traffic-status?" + trafficPeriodQuery().join("&"), { method: "GET" })
     .then(function (r) {
       if (r.has_traffic === false) {
         $("trafficInfo").textContent = "该桥无交通荷载数据";
-        $("trafficDownloadBtn").style.display = "none";
-        return;
-      }
-      if (r.download_ready === false) {
-        $("trafficInfo").innerHTML =
-          '<span class="err">交通荷载数据不齐全，且当前 web 环境缺少 playwright（'
-          + esc(r.download_python || "python") + '）。请用装有 playwright 的 python '
-          + "启动 web（如 .venv_web），或先手动在命令行运行下载。</span>";
-        $("trafficDownloadBtn").style.display = "none";
         return;
       }
       var t = "交通荷载原始数据：" + (r.complete ? "齐全" : "不齐全")
         + "（覆盖 " + (r.covered_days || 0) + "/" + (r.need_days || 0) + " 天"
         + (r.missing && r.missing.length ? "，缺 " + r.missing.join(",") : "") + "）"
         + "；交通 daily：" + (r.daily_ready ? "已生成" : "未生成");
-      $("trafficInfo").textContent = t;
-      $("trafficDownloadBtn").style.display = r.complete ? "none" : "inline-block";
+      if (r.complete) {
+        // 数据已齐全：不需要下载，也不再提示 playwright
+        $("trafficInfo").textContent = t;
+        return;
+      }
+      if (r.download_ready === false) {
+        // 数据不齐全 + 缺少 playwright：分开提示，并给出可复制的手动命令
+        $("trafficInfo").innerHTML = t
+          + '<br><span class="err">数据不齐全，且当前 web 环境缺少 playwright（'
+          + esc(r.download_python || "python") + '），无法从网页下载。'
+          + "请用装有 playwright 的 python 启动 web（如 .venv_web），"
+          + "或先手动在命令行运行：python download_monitor_data.py "
+          + "--bridges " + esc(r.bridge || "") + " --start "
+          + esc(r.need_start || "") + " --end " + esc(r.need_end || "") + "</span>";
+        return;
+      }
+      $("trafficInfo").innerHTML = t
+        + '<br><span class="ok">点“处理交通荷载数据”会自动下载缺失部分并预处理。</span>';
     })
     .catch(function (e) { $("trafficInfo").textContent = "交通状态检查失败: " + e; });
+}
+
+function startTrafficProcess() {
+  var bridgeId = currentBridgeId();
+  if (!bridgeId) { showMsg("请先选择桥梁", "err"); return; }
+  api("/api/bridges/" + bridgeId + "/traffic-process",
+      { method: "POST", body: JSON.stringify(trafficPeriod()) })
+    .then(function (r) {
+      showMsg(r.tip || "已启动交通荷载预处理", "ok");
+      $("trafficProcStatus").textContent = "已启动，等待完成…";
+      $("trafficProcLog").textContent = "—";
+      pollTrafficProcess(bridgeId);
+    })
+    .catch(function (e) { showMsg(String(e), "err"); $("trafficProcStatus").textContent = ""; });
+}
+
+function pollTrafficProcess(bridgeId) {
+  if (STATE.tpTimer) clearInterval(STATE.tpTimer);
+  STATE.tpTimer = setInterval(function () {
+    api("/api/bridges/" + bridgeId + "/traffic-process/status").then(function (st) {
+      if (!st.running) {
+        clearInterval(STATE.tpTimer);
+        STATE.tpTimer = null;
+        if (st.error) { showMsg("交通荷载预处理失败: " + st.error, "err"); }
+        else { showMsg("交通荷载预处理完成", "ok"); }
+        $("trafficProcStatus").textContent = st.error ? ("失败: " + st.error) : "完成";
+        if (st.log_tail) $("trafficProcLog").textContent = st.log_tail;
+        checkTraffic();
+        return;
+      }
+      $("trafficProcStatus").textContent = "处理中…" + (st.step || "") + " "
+        + (st.current || "")
+        + (st.done && st.done.length ? "（已完成下载 " + st.done.join(",") + "）" : "");
+      if (st.log_tail) $("trafficProcLog").textContent = st.log_tail;
+    }).catch(function () {});
+  }, 4000);
 }
 
 function startTrafficDownload() {

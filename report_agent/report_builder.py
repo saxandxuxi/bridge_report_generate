@@ -801,6 +801,8 @@ def _period_text_replacements(period: Dict):
         (re.compile(rf"{x2}月{x2}日"), f"{m}月{d}日"),
         # 签字表等处的裸月/日占位（顺序在范围之后，避免误伤）
         (re.compile(rf"{x2}月"), f"{m}月"),
+        # 单个 X 的月份占位（如标题“2026年X月”），在 x2 之后避免误伤 xx月
+        (re.compile(rf"[xX×]月"), f"{m}月"),
         (re.compile(rf"{x2}日"), f"{d}日"),
         # 上一年度的“第X季度” -> 当前报告期（正文字面量，如“2025年第一季度”）
         (re.compile(r"(20\d{2})年(第[一二三四1-4]季度)"), _prev_year_quarter),
