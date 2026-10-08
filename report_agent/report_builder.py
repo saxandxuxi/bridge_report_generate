@@ -26,6 +26,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -41,7 +42,30 @@ from docx.shared import Inches, Pt
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-from .bridge_source import format_report_number
+try:
+    from .bridge_source import format_report_number
+except Exception:  # noqa: BLE001
+    # 兼容旧版 bridge_source.py（半同步场景）：旧版没有该函数时用等价实现，
+    # 避免整个报告因 ImportError 无法启动。
+    def format_report_number(value) -> str:
+        """报告数值统一格式（与 bridge_source.format_report_number 等价）：
+        0 以上两位小数；0 以下三位有效数字；|x|<0.01 科学计数法；
+        整数原样；NaN/Inf 填“—”。"""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if not math.isfinite(v):
+            return "—"
+        if v == 0.0:
+            return "0"
+        if v == int(v) and abs(v) < 1e9:
+            return str(int(v))
+        if abs(v) < 0.01:
+            return f"{v:.3e}"
+        if v > 0:
+            return f"{v:.2f}"
+        return f"{v:.3g}"
 
 log = logging.getLogger("report-agent.report_builder")
 
@@ -301,7 +325,11 @@ def build_value_resolver(stats: Dict, period: Dict,
         # 4.1 监测结论：{{conclusions}} —— LLM 综合各分项小结生成
         if key == "conclusions" or key.startswith("conclusions."):
             if bridge is not None:
-                text = bridge.build_conclusions(period, llm_cfg=llm_cfg)
+                try:
+                    text = bridge.build_conclusions(period, llm_cfg=llm_cfg)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("生成监测结论失败，填入缺失标记: %s", exc)
+                    text = ""
                 if text:
                     _log({
                         "占位符": key,
@@ -313,7 +341,11 @@ def build_value_resolver(stats: Dict, period: Dict,
                 if missing_sink is not None:
                     missing_sink.append(key)
                 return missing_marker
-            raise KeyError(f"不支持的结论占位符: {key}")
+            # 非桥模式/桥数据未加载：不再中断整份报告，记入待补并填缺失标记
+            if missing_sink is not None:
+                missing_sink.append(key)
+            log.warning("监测结论占位符 %s 无桥数据可生成，填入缺失标记", key)
+            return missing_marker
         # 通用数据占位符：回填 annotate_docx 阶段保存的原始值
         if key.startswith("data."):
             if data_values and key in data_values:

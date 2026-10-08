@@ -16,6 +16,8 @@ from report_agent.report_builder import (
     _apply_period_text_fixes,
     _expand_row_tables,
     _unique_cells,
+    build_value_resolver,
+    format_report_number,
     verify_table_columns,
 )
 from report_agent.template_analyzer import analyze_template
@@ -219,6 +221,53 @@ class ChartLayoutTest(unittest.TestCase):
         for ax in axes.reshape(-1):
             self.assertFalse(_ov(su, ax.title.get_window_extent(r)))
         plt.close(fig)
+
+
+class ConclusionsFallbackTest(unittest.TestCase):
+    """{{conclusions}} 不得因桥数据缺失/异常而中断报告。"""
+
+    def _period(self):
+        return {"start": dt.date(2026, 1, 1),
+                "end": dt.date(2026, 3, 31),
+                "label": "2026.1~3",
+                "label_cn": "2026年第1季度"}
+
+    def test_no_bridge_returns_marker(self):
+        sink = []
+        r = build_value_resolver({}, self._period(), bridge=None,
+                                 missing_sink=sink)
+        self.assertEqual(r("conclusions"), "—")
+        self.assertIn("conclusions", sink)
+
+    def test_bridge_exception_returns_marker(self):
+        class BadBridge:
+            def build_conclusions(self, period, llm_cfg=None):
+                raise RuntimeError("boom")
+
+        sink = []
+        r = build_value_resolver({}, self._period(), bridge=BadBridge(),
+                                 missing_sink=sink)
+        self.assertEqual(r("conclusions"), "—")
+
+    def test_bridge_text_returned(self):
+        class OkBridge:
+            def build_conclusions(self, period, llm_cfg=None):
+                return "（1）桥梁结构处于良好状态。"
+
+        r = build_value_resolver({}, self._period(), bridge=OkBridge())
+        self.assertIn("良好状态", r("conclusions"))
+
+
+class ReportNumberFormatTest(unittest.TestCase):
+    def test_number_rules(self):
+        self.assertEqual(format_report_number(21.5665), "21.57")
+        self.assertEqual(format_report_number(-3.371), "-3.37")
+        self.assertEqual(format_report_number(-15.123), "-15.1")
+        self.assertEqual(format_report_number(0.001234), "1.234e-03")
+        self.assertEqual(format_report_number(0), "0")
+        self.assertEqual(format_report_number(90), "90")
+        self.assertEqual(format_report_number(float("nan")), "—")
+        self.assertEqual(format_report_number(float("inf")), "—")
 
     def test_static_keep_works_without_llm(self):
         analysis = {
