@@ -61,8 +61,10 @@ except Exception:  # noqa: BLE001
             return "0"
         if v == int(v) and abs(v) < 1e9:
             return str(int(v))
-        if abs(v) < 0.01:
+        if abs(v) < 1e-5:
             return f"{v:.3e}"
+        if abs(v) < 0.01:
+            return f"{v:.10f}".rstrip("0").rstrip(".")
         if v > 0:
             return f"{v:.2f}"
         return f"{v:.3g}"

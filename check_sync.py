@@ -27,6 +27,7 @@ PATTERNS = [
     "requirements.txt",
     "report_agent/*.py",
     "preprocess/scripts/*.py",
+    "tests/*.py",
 ]
 # 明确要忽略的文件
 IGNORE = {"sync_manifest.json"}

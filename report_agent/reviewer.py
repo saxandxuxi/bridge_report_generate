@@ -411,6 +411,39 @@ def self_check_report(path: str) -> List[Dict]:
             if df is not None and df < -1e-9:
                 issues.append({"type": "stat_logic",
                                "detail": f"表{ti + 1} 行{ri} 差值/极差为负 {df}"})
+            # 物理量级体检：脏统计值直接透传时拦截（如振动 5.6e6 m/s²、
+            # 结构温度 -30.7℃、应变百万级）
+            for h, ci in col.items():
+                v = _to_num(row.cells[ci].text)
+                if v is None:
+                    continue
+                limit = None
+                if "m/s²" in h or "m/s2" in h:
+                    limit, kind = 100.0, "加速度"
+                elif "℃" in h:
+                    limit, kind = 75.0, "温度"
+                elif "με" in h:
+                    limit, kind = 50000.0, "应变"
+                elif "mm" in h:
+                    limit, kind = 100000.0, "位移"
+                elif "%" in h or "％" in h:
+                    limit, kind = 100.0, "百分比"
+                if limit is not None and abs(v) > limit:
+                    issues.append({
+                        "type": "physical_range",
+                        "detail": (f"表{ti + 1} 行{ri} {h}={v} 超出"
+                                   f"{kind}物理量级（±{limit:g}）"),
+                    })
+                if "温度" in h and v < -30.0:
+                    issues.append({
+                        "type": "physical_range",
+                        "detail": f"表{ti + 1} 行{ri} {h}={v} 低于 -30℃",
+                    })
+                if "温度" in h and ("差" in h or "极差" in h) and v > 50.0:
+                    issues.append({
+                        "type": "physical_range",
+                        "detail": f"表{ti + 1} 行{ri} {h}={v} 温差超过 50℃",
+                    })
     # 3) 湿度/百分比越界 + 单位空格
     for t in texts:
         for m in re.finditer(r"([-+]?\d+(?:\.\d+)?)\s*(%|％)", t):
@@ -421,4 +454,15 @@ def self_check_report(path: str) -> List[Dict]:
         if re.search(r"\d\s{2,}(m/s²|m/s2|℃|%|με|mm|kN)", t):
             issues.append({"type": "unit_wrong",
                            "detail": f"数值与单位之间有多余空格 | {t[:50]}"})
+    # 4) 占位图/未匹配图（图注就是 chart_id 或带“待补充/未匹配”字样）
+    _chart_id_re = re.compile(
+        r"^(?:strain|vibration|temperature|structure_temperature|humidity|"
+        r"wind_speed|displacement|earthquake_load|rotation|deflection|"
+        r"cable_force|crack|cable_clamp|GNSS|DZJSD|SZJSD|WY|SL|YB|WD|WSD)"
+        r"[_-].*(?:_trend|_histogram|_scatter|_timeseries)_\d+$")
+    for t in texts:
+        s = t.strip()
+        if "未匹配到图库" in s or "待补充" in s or _chart_id_re.match(s):
+            issues.append({"type": "chart_placeholder",
+                           "detail": f"图表未匹配（占位图）: {s[:80]}"})
     return issues

@@ -138,6 +138,35 @@ def feature_range(feature):
     return None
 
 
+def feature_granularity(feature):
+    """数据原生粒度（决定清洗粒度与尖峰预算）：
+      second — 加速度/振动/地震（JSD 族，秒级采样）
+      10min  — 风速/风向（FSFX 族，10min）
+      hour   — 温度/湿度/应变/位移/倾角/索力/裂缝等小时级
+    """
+    m = re.search(r"\(([^)]+)\)$", str(feature or ""))
+    code = (m.group(1) if m else str(feature or "")).lower()
+    if code.endswith("jsd") or code in ("xjsd", "yjsd", "zjsd"):
+        return "second"
+    if code in ("spfs", "szfs", "spfx", "szfx") \
+            or code.endswith("fs") or code.endswith("fx"):
+        return "10min"
+    return "hour"
+
+
+def granularity_cleaning_budget(feature, max_spikes, max_dist,
+                                max_removals):
+    """按粒度给尖峰/分布极端点预算：秒级样本多，允许更多替换。"""
+    gr = feature_granularity(feature)
+    if gr == "second":
+        return (max(max_spikes, 200), max(max_dist, 100),
+                max(max_removals, 100))
+    if gr == "10min":
+        return (max(max_spikes, 20), max(max_dist, 20),
+                max(max_removals, 20))
+    return max_spikes, max_dist, max_removals
+
+
 def _is_wind_speed_code(feature):
     """风速判定（跨服务器符号不统一）：轴码 spfs/szfs、以 fs 结尾，
     或风模块(FSFX*)下轴码 s，都按风速处理；风向(spfx/szfx)不算。"""
@@ -368,12 +397,20 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
     finite = np.isfinite(arr)
     in_range = finite.copy()
     vrange_note = None
+    n_gross = 0
     if vrange:
         rlo, rhi = vrange
         tol = max(1e-9, (rhi - rlo) * 1e-6)
         n_finite = int(finite.sum())
-        ratio = (inside := (arr >= rlo) & (arr <= rhi))[finite].sum() / n_finite \
-            if n_finite else 0.0
+        # 超量级毛刺（超出量程 10 倍以上，如振动 5.6e6 m/s²）：无条件剔除，
+        # 不受 98% 命中率门槛影响——秒级/10min 特征尖峰占比高时门槛会失效。
+        _span = max(rhi - rlo, 1e-9)
+        gross = finite & ((arr > rhi + 10 * _span)
+                          | (arr < rlo - 10 * _span))
+        n_gross = int(gross.sum())
+        _ok = finite & ~gross
+        ratio = ((arr >= rlo) & (arr <= rhi) & _ok).sum() / int(_ok.sum()) \
+            if int(_ok.sum()) else 0.0
         if ratio >= VRANGE_MIN_RATIO:
             # 数据大部分落在区间内 → 物理范围可信，做硬过滤(边界带微小容差)
             in_range &= (arr >= rlo - tol) & (arr <= rhi + tol)
@@ -382,6 +419,10 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
             # 仅作绘图参考，不硬过滤，交由分布极端点/尖峰逻辑处理
             vrange_note = (f"物理范围({rlo:g}~{rhi:g})与数据量程不符"
                            f"(命中率{ratio * 100:.1f}%)，仅作绘图参考未硬过滤")
+        if n_gross:
+            in_range &= ~gross
+            vrange_note = ((vrange_note + "；") if vrange_note else "") \
+                + f"超量级毛刺{n_gross}个无条件剔除"
 
     # 1) 稳健基线(只用范围内、去 5%~95% 极值的数据)
     base_arr = arr[in_range]
@@ -3511,6 +3552,9 @@ def main():
                     day_mins, day_secs, day_miss = [], [], []
                     native_hours = []
                     native_means, native_maxs, native_mins = [], [], []
+                    _spk_b, _dist_b, _rm_b = granularity_cleaning_budget(
+                        actual_feature, args.max_spikes,
+                        args.max_dist_outliers, args.max_removals)
                     hist_bins = np.linspace(-1000.0, 1000.0, 101)
                     hist_counts = None
                     chart_day = None          # (日期, hours, means, ix, rx, shifts, gaps)
@@ -3533,21 +3577,21 @@ def main():
                         means_d, r1, ix1, rx1 = clean_series_value(
                             hours_d, means_d, f"{date_str}均值", spike_k,
                             hour_level=True, vrange=vrange,
-                            max_spikes=args.max_spikes, dist_k=args.dist_k,
-                            max_dist_outliers=args.max_dist_outliers,
-                            max_total_removals=args.max_removals)
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b)
                         maxs_d, r2, ix2, rx2 = clean_series_value(
                             hours_d, maxs_d, f"{date_str}最大值", spike_k,
                             hour_level=True, vrange=vrange,
-                            max_spikes=args.max_spikes, dist_k=args.dist_k,
-                            max_dist_outliers=args.max_dist_outliers,
-                            max_total_removals=args.max_removals)
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b)
                         mins_d, r3, ix3, rx3 = clean_series_value(
                             hours_d, mins_d, f"{date_str}最小值", spike_k,
                             hour_level=True, vrange=vrange,
-                            max_spikes=args.max_spikes, dist_k=args.dist_k,
-                            max_dist_outliers=args.max_dist_outliers,
-                            max_total_removals=args.max_removals)
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b)
                         spike_rec += r1 + r2 + r3
                         # 累积清洗后的原生粒度序列（小时级/秒级），
                         # 供全期极值按特征颗粒度计算
@@ -3704,26 +3748,29 @@ def main():
                 spike_rec = []
                 spike_idx = []
                 vrange = feature_range(feature)
+                _spk_b, _dist_b, _rm_b = granularity_cleaning_budget(
+                    actual_feature, args.max_spikes,
+                    args.max_dist_outliers, args.max_removals)
                 spike_k = (0 if _is_direction_feature(feature)
                            else args.spike_threshold)
                 hmeans, r1, ix1, rx1 = clean_series_value(
                     hours, hmeans, "小时均值", spike_k,
                     hour_level=True, vrange=vrange,
-                    max_spikes=args.max_spikes, dist_k=args.dist_k,
-                    max_dist_outliers=args.max_dist_outliers,
-                    max_total_removals=args.max_removals)
+                    max_spikes=_spk_b, dist_k=args.dist_k,
+                    max_dist_outliers=_dist_b,
+                    max_total_removals=_rm_b)
                 hmaxs, r2, ix2, rx2 = clean_series_value(
                     hours, hmaxs, "小时最大值", spike_k,
                     hour_level=True, vrange=vrange,
-                    max_spikes=args.max_spikes, dist_k=args.dist_k,
-                    max_dist_outliers=args.max_dist_outliers,
-                    max_total_removals=args.max_removals)
+                    max_spikes=_spk_b, dist_k=args.dist_k,
+                    max_dist_outliers=_dist_b,
+                    max_total_removals=_rm_b)
                 hmins, r3, ix3, rx3 = clean_series_value(
                     hours, hmins, "小时最小值", spike_k,
                     hour_level=True, vrange=vrange,
-                    max_spikes=args.max_spikes, dist_k=args.dist_k,
-                    max_dist_outliers=args.max_dist_outliers,
-                    max_total_removals=args.max_removals)
+                    max_spikes=_spk_b, dist_k=args.dist_k,
+                    max_dist_outliers=_dist_b,
+                    max_total_removals=_rm_b)
                 spike_rec = r1 + r2 + r3
                 # 图上只标均值序列的剔除点；最大/最小序列的清洗记录仍写入 JSON
                 spike_idx = sorted(ix1)

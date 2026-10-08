@@ -32,6 +32,8 @@ from report_agent.placeholder_arbiter import (
     build_options,
     is_obviously_static,
 )
+from report_agent.bridge_source import BridgeData
+from report_agent.reviewer import self_check_report
 
 
 class RowsExpansionTest(unittest.TestCase):
@@ -263,11 +265,199 @@ class ReportNumberFormatTest(unittest.TestCase):
         self.assertEqual(format_report_number(21.5665), "21.57")
         self.assertEqual(format_report_number(-3.371), "-3.37")
         self.assertEqual(format_report_number(-15.123), "-15.1")
-        self.assertEqual(format_report_number(0.001234), "1.234e-03")
+        self.assertEqual(format_report_number(0.001234), "0.001234")
+        self.assertEqual(format_report_number(0.000159), "0.000159")
+        self.assertEqual(format_report_number(1.234e-7), "1.234e-07")
         self.assertEqual(format_report_number(0), "0")
         self.assertEqual(format_report_number(90), "90")
         self.assertEqual(format_report_number(float("nan")), "—")
         self.assertEqual(format_report_number(float("inf")), "—")
+
+
+class GrossStatFaultTest(unittest.TestCase):
+    def test_vibration_extreme_only_invalidates_extremes(self):
+        st = {"最大值": 5602250.0, "最小值": -0.0975,
+              "平均值": 5.0e-4, "差值": 5602250.1}
+        f = "DZJSD(yJsd)"
+        self.assertTrue(BridgeData._gross_stat_fault(st, f, "max"))
+        self.assertTrue(BridgeData._gross_stat_fault(st, f, "range"))
+        self.assertTrue(BridgeData._gross_stat_fault(st, f, "abs_max"))
+        self.assertFalse(BridgeData._gross_stat_fault(st, f, "min"))
+        self.assertFalse(BridgeData._gross_stat_fault(st, f, "avg"))
+
+    def test_strain_extreme(self):
+        st = {"最大值": 1.2e6, "最小值": -88.0, "平均值": 112.0,
+              "差值": 1.2e6}
+        self.assertTrue(BridgeData._gross_stat_fault(st, "YB(rsg)", "max"))
+        self.assertFalse(BridgeData._gross_stat_fault(st, "YB(rsg)", "min"))
+
+    def test_temp_summer_anomaly(self):
+        st = {"最大值": 30.25, "最小值": -30.7, "平均值": 0.0,
+              "差值": 60.95}
+        self.assertTrue(BridgeData._gross_stat_fault(
+            st, "WD(temp)", "min"))
+        self.assertTrue(BridgeData._gross_stat_fault(
+            st, "WD(temp)", "range"))
+
+    def test_daily_recompute_drops_spike(self):
+        b = BridgeData({})
+        st = {"每日统计": [
+            {"最大值": 5602250.0, "最小值": -0.1, "平均值": 0.0},
+            {"最大值": 4.75, "最小值": -1.64, "平均值": 0.001},
+            {"最大值": 6.38, "最小值": -2.0, "平均值": 0.002},
+        ]}
+        v, note = b._daily_clean_extreme(st, "DZJSD(yJsd)", "max")
+        self.assertAlmostEqual(v, 6.38, places=6)
+        self.assertIn("清洗后重算", note)
+        v2, _ = b._daily_clean_extreme(st, "DZJSD(yJsd)", "range")
+        self.assertAlmostEqual(v2, 8.38, places=6)
+
+    def test_sibling_median_fallback(self):
+        b = BridgeData({})
+        b.sensors_for_metric = lambda m: ["a", "b", "c"]
+        data = {
+            "a": {"最大值": 2.0, "最小值": -1.0, "差值": 3.0},
+            "b": {"最大值": 4.0, "最小值": -2.0, "差值": 6.0},
+            "c": {"最大值": 5602250.0, "最小值": -0.1,
+                  "差值": 5602250.1},
+        }
+        b._feature_stats = lambda sid, metric, feature="": data[sid]
+        v, note = b._sibling_clean_extreme("vibration", "DZJSD(yJsd)",
+                                           "max")
+        self.assertAlmostEqual(v, 3.0, places=6)
+        self.assertIn("中位数", note)
+
+
+class SelfCheckPhysicsTest(unittest.TestCase):
+    def test_physical_and_placeholder_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "r.docx")
+            doc = Document()
+            t = doc.add_table(rows=2, cols=1)
+            t.rows[0].cells[0].text = "最大值(m/s²)"
+            t.rows[1].cells[0].text = "5602250"
+            doc.add_paragraph("strain_左幅3#墩根部顶板_scatter_59")
+            doc.save(p)
+            issues = self_check_report(p)
+            types = {i["type"] for i in issues}
+            self.assertIn("physical_range", types)
+            self.assertIn("chart_placeholder", types)
+
+
+class CategoryIsolationTest(unittest.TestCase):
+    """总结极值只允许在该指标类别的传感器内聚合，不共享特征码回退。"""
+
+    def _bridge(self):
+        b = BridgeData({})
+        b.metric_category = {"vibration": "振动",
+                             "earthquake_load": "地震"}
+        b._category_sensors = {"振动": ["101"], "地震": ["201"]}
+        b.metrics = {"vibration": {"feature": "DZJSD(xJsd)"},
+                     "earthquake_load": {"feature": "DZJSD(xJsd)"}}
+        b.resolve_metric_stat_detail = lambda m, stat, period: (None, {})
+        b._is_excluded = lambda sid: False
+        return b
+
+    def test_extreme_category_isolation(self):
+        b = self._bridge()
+        period = self._period()
+        pos_entries = {
+            "振动位置": {"测点1": {"统计": {
+                "最大值": 1.68, "最小值": -9.57, "差值": 11.25},
+                "传感器编号": "101"}},
+            "地震位置": {"测点1": {"统计": {
+                "最大值": 5602250.0, "最小值": -0.1,
+                "差值": 5602250.1}, "传感器编号": "201"}},
+        }
+        gs = {"最大值": 5602250.0, "最小值": -0.1,
+              "差值": 5602250.1}
+        v, loc = b._metric_extreme("vibration", "max", "最大值",
+                                   "最大值位置", period, gs, pos_entries)
+        self.assertAlmostEqual(v, 1.68, places=6)
+        self.assertEqual(loc, "振动位置")
+        # 地震类别唯一的传感器极值异常且无同族有效值：
+        # 严格类别模式下不得回退到共享特征码的 5602250 全桥统计
+        v2, _ = b._metric_extreme("earthquake_load", "max", "最大值",
+                                  "最大值位置", period, gs, pos_entries)
+        self.assertIsNone(v2)
+
+    def _period(self):
+        return {"start": dt.date(2026, 7, 1),
+                "end": dt.date(2026, 9, 30),
+                "label": "2026.7~9"}
+
+
+class ChartCleaningGranularityTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "bcl_clean",
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))),
+                "preprocess", "scripts", "build_chart_library.py"))
+        cls.bcl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.bcl)
+
+    def test_granularity_mapping(self):
+        g = self.bcl.feature_granularity
+        self.assertEqual(g("DZJSD(yJsd)"), "second")
+        self.assertEqual(g("SZJSD(xJsd)"), "second")
+        self.assertEqual(g("FSFX2(spfs)"), "10min")
+        self.assertEqual(g("WD(temp)"), "hour")
+
+    def test_budget_scales_with_granularity(self):
+        spk, dist, rm = self.bcl.granularity_cleaning_budget(
+            "DZJSD(yJsd)", 5, 5, 5)
+        self.assertGreaterEqual(spk, 200)
+        spk2, _, _ = self.bcl.granularity_cleaning_budget(
+            "FSFX2(spfs)", 5, 5, 5)
+        self.assertGreaterEqual(spk2, 20)
+
+    def test_gross_spike_removed_even_when_ratio_low(self):
+        # 90% 数据在量程外但未到 10 倍量程（如量程漂移），10% 是
+        # 1e7 超量级毛刺：命中率门槛会失效，但毛刺必须无条件剔除
+        values = [50000.0] * 90 + [1e7] * 10
+        times = [dt.datetime(2026, 7, 1) + dt.timedelta(hours=i)
+                 for i in range(len(values))]
+        out, recs, ix, rx = self.bcl.clean_series_value(
+            times, values, "t", spike_k=5.0, hour_level=True,
+            vrange=(-10000.0, 10000.0), max_spikes=200,
+            max_dist_outliers=100, max_total_removals=100)
+        self.assertLess(max(out), 1e6)
+
+
+class ScatterFallbackTest(unittest.TestCase):
+    def test_folder_name_order_tolerance(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        name_dict = os.path.join(root, "preprocess", "传感器对照",
+                                 "传感器名称对照", "洣水河特大桥.json")
+        if not os.path.isfile(name_dict):
+            self.skipTest("缺少洣水河名称对照表")
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "左幅炎陵侧边跨跨中顶板")
+            os.makedirs(d)
+            png = os.path.join(d, "相关性_WD(temp)-YB(rsg).png")
+            with open(png, "wb") as f:
+                f.write(b"x")
+            import json as _json
+            cfgp = os.path.join(root, "config", "config_mishuihe.json")
+            if not os.path.isfile(cfgp):
+                self.skipTest("缺少洣水河配置")
+            cfg = _json.load(open(cfgp, encoding="utf-8"))["bridge_data"]
+            cfg = dict(cfg)
+            cfg["sensor_map"] = os.path.join(
+                root, "preprocess", "传感器对照",
+                "传感器编号名称.json")
+            cfg["name_dict"] = name_dict
+            cfg["stats_dir"] = ""
+            cfg["charts_dir"] = tmp
+            b = BridgeData(cfg)
+            b.load()
+            info = b.resolve_chart_info(
+                "strain_左幅炎陵侧边跨跨中顶板_scatter_57",
+                "strain_左幅炎陵侧边跨跨中顶板_scatter_57")
+            self.assertIsNotNone(info)
+            self.assertTrue(info["path"].endswith(".png"))
 
     def test_static_keep_works_without_llm(self):
         analysis = {

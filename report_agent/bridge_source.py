@@ -403,8 +403,11 @@ def format_report_number(value) -> str:
         return "0"
     if v == int(v) and abs(v) < 1e9:
         return str(int(v))
-    if abs(v) < 0.01:
+    if abs(v) < 1e-5:
         return f"{v:.3e}"
+    if abs(v) < 0.01:
+        # 工程报告里 1.59e-04 可读性差：改用普通小数并保留有效数字
+        return f"{v:.10f}".rstrip("0").rstrip(".")
     if v > 0:
         return f"{v:.2f}"
     return f"{v:.3g}"
@@ -2029,16 +2032,25 @@ class BridgeData:
         # 季度统计位置键），保证总结句与正文统计占位符一致；
         # 解析不到时回退到 全桥统计 的极值与位置键
         max_v, max_loc = self._metric_extreme(metric, "max", "最大值",
-                                              "最大值位置", period, gs)
+                                              "最大值位置", period, gs,
+                                              pos_entries)
         min_v, min_loc = self._metric_extreme(metric, "min", "最小值",
-                                              "最小值位置", period, gs)
+                                              "最小值位置", period, gs,
+                                              pos_entries)
         range_v, range_loc = self._metric_extreme(metric, "range", "差值",
-                                                  "差值位置", period, gs)
+                                                  "差值位置", period, gs,
+                                                  pos_entries)
         abs_v, abs_loc = self._metric_extreme(metric, "abs_max", "绝对最大值",
-                                              "绝对最大值位置", period, gs)
+                                              "绝对最大值位置", period, gs,
+                                              pos_entries)
         trm_v, trm_loc = self._metric_extreme(
             metric, "temp_rm_range", "剔除温度差值",
-            "剔除温度差值位置", period, gs)
+            "剔除温度差值位置", period, gs, pos_entries)
+        # 严格类别隔离后，本类别极值全不可用（超物理范围/无有效测点）时，
+        # 必须提示重跑统计库，不能写成“整体正常”。
+        _no_extreme = bool(
+            metric and self._category_sensor_ids(metric) is not None
+            and max_v is None and min_v is None and range_v is None)
 
         # 最小值==0 时，把逐传感器明细里值为 0 的测点补进 疑似故障位置，
         # 避免位置统计扫描漏掉（如季度统计里该位置不是 max==min==0 记录）
@@ -2074,6 +2086,10 @@ class BridgeData:
             min_loc = (zero_pos or seg_pos)[0]
 
         prompts = [f"指标：{label}；报告期：{period.get('start')} ~ {period.get('end')}"]
+        if _no_extreme:
+            prompts.append(
+                "本指标类别的测点极值均异常（超出物理范围或无可信数据），"
+                "需重跑统计库后复核；不得写成“整体正常”。")
         values = []
         if days:
             try:
@@ -2162,8 +2178,13 @@ class BridgeData:
                          + (f"（{min_loc}）" if min_loc else ""))
         if not parts:
             parts.append("整体正常")
+        if _no_extreme:
+            parts = [x for x in parts if x != "整体正常"]
+            parts.append("极值数据异常，需重跑统计库后复核")
         head = "、".join(parts)
         special = []
+        if _no_extreme:
+            special.append("本指标类别测点极值数据异常，需重跑统计库后复核")
         if zero_pos:
             special.append("恒0/恒值疑似故障位置：" + _cap(zero_pos))
         if seg_pos:
@@ -2224,6 +2245,9 @@ class BridgeData:
         故障时间段、但仍有正常数据的测点（如 635 号传感器），总结里不得
         把这类写成“恒0”。
         """
+        # 类别隔离：振动/地震等同特征码的指标只用本类别的测点位置，
+        # 避免故障/缺失清单互相串（仅在无类别信息时保留旧行为）。
+        pos_entries, _strict = self._filter_pos_entries(metric, pos_entries)
         # 1) 含故障段位置：季度统计的“疑似故障时间段”键（位置（测点）），
         #    以及位置统计里带“疑似故障时间段”字段的测点
         seg_keys = set()
@@ -2263,7 +2287,7 @@ class BridgeData:
         covered_exact = set(zero_pos) | set(seg_pos)
         covered_bases = {
             re.sub(r"（[^）]*）$", "", str(x)) for x in covered_exact}
-        for k in ("疑似故障传感器位置", "持续为0位置"):
+        for k in (() if _strict else ("疑似故障传感器位置", "持续为0位置")):
             for p in (gs.get(k) or []):
                 ps = str(p)
                 if not ps or ps in covered_exact:
@@ -2320,14 +2344,29 @@ class BridgeData:
         return zero_pos, seg_pos, miss_pos
 
     def _metric_extreme(self, metric: str, stat: str, gs_key: str,
-                        gs_loc_key: str, period: Dict, gs: Dict):
-        """按“逐传感器聚合（已排除恒值故障）”取极值+位置，回退 全桥统计。"""
+                        gs_loc_key: str, period: Dict, gs: Dict,
+                        pos_entries: Optional[Dict] = None):
+        """按“该指标类别的逐传感器聚合”取极值+位置。
+
+        禁止回退到共享特征码的全桥统计（如 振动/地震同用 DZJSD(xJsd)），
+        避免两个指标总结到同一批数据；仅当该指标没有类别信息（旧配置）
+        时才允许使用 全桥统计 兜底。
+        """
         v, loc = None, ""
+        strict = self._category_sensor_ids(metric) if metric else None
         if metric:
             val, detail = self.resolve_metric_stat_detail(metric, stat, period)
             if val is not None:
                 v = float(val)
                 loc = str((detail or {}).get("位置") or "")
+            if v is None and strict is not None:
+                filt, _ = self._filter_pos_entries(metric, pos_entries or {})
+                if filt:
+                    _feat = self.metrics.get(metric, {}).get("feature", "")
+                    v, loc = self._clean_extreme_from_positions(
+                        filt, _feat, gs_key,
+                        exclude_zero=(stat == "min"))
+                return v, loc
         if v is None:
             try:
                 v = float(gs.get(gs_key))
@@ -2335,6 +2374,36 @@ class BridgeData:
                 v = None
             loc = str(gs.get(gs_loc_key) or "")
         return v, loc
+
+    def _category_sensor_ids(self, metric: str):
+        """该指标类别的传感器编号集合；无类别信息返回 None。"""
+        if not metric:
+            return None
+        cat = self.metric_category.get(metric, "")
+        if not cat:
+            return None
+        sids = [str(s) for s in (self._category_sensors.get(cat) or [])
+                if not self._is_excluded(s)]
+        return set(sids)
+
+    def _filter_pos_entries(self, metric: str, pos_entries: Dict):
+        """按指标类别过滤 位置统计（位置->测点->{统计,传感器编号}）。
+
+        返回 (过滤后, 是否启用类别隔离)。类别信息缺失时原样返回，
+        允许旧配置走共享特征码回退。
+        """
+        sids = self._category_sensor_ids(metric)
+        if sids is None:
+            return (pos_entries or {}), False
+        out = {}
+        for pos, points in (pos_entries or {}).items():
+            if not isinstance(points, dict):
+                continue
+            for pt, rec in points.items():
+                sid = str((rec or {}).get("传感器编号") or "")
+                if sid in sids:
+                    out.setdefault(pos, {})[pt] = rec
+        return out, True
 
     def _clean_extreme_from_positions(self, pos_entries: Dict, feature: str,
                                       stat_key: str,
@@ -2351,6 +2420,11 @@ class BridgeData:
                 except (TypeError, ValueError):
                     continue
                 if self._constant_faulty(st, feature):
+                    continue
+                _stat_name = {"最大值": "max", "最小值": "min",
+                              "差值": "range",
+                              "绝对最大值": "abs_max"}.get(stat_key, stat_key)
+                if self._gross_stat_fault(st, feature, _stat_name):
                     continue
                 if exclude_zero and abs(v) <= 1e-9:
                     continue
@@ -2423,11 +2497,10 @@ class BridgeData:
                         v = float(val)
                         loc = str((detail or {}).get("位置") or "")
                 if v is None:
-                    try:
-                        v = float(gs_ax.get(gs_key))
-                    except (TypeError, ValueError):
-                        v = None
-                    loc = str(gs_ax.get(gs_loc_key) or "")
+                    # 类别隔离：同指标类别内取极值；仅在无类别信息时回退全桥统计
+                    v, loc = self._metric_extreme(
+                        am, stat, gs_key, gs_loc_key, period, gs_ax,
+                        pos_entries)
                 if v is None:
                     continue
                 values.append(v)
@@ -2442,7 +2515,8 @@ class BridgeData:
         _yearly = str(period.get("label") or "").endswith("年")
         month_miss = []
         if _yearly:
-            month_miss = self._month_missing_positions(pos_entries, 30)
+            _fpos, _ = self._filter_pos_entries(metric, pos_entries)
+            month_miss = self._month_missing_positions(_fpos, 30)
         # 年度报告只报“缺失一个月以上”，季度/月度报 72h 阈值
         missing_pos = month_miss if _yearly else abnormal
         missing_label = (
@@ -2548,7 +2622,13 @@ class BridgeData:
         if code == "rh":
             return mx > 100.0 or mn < -10.0
         if code == "temp":
-            return mx > 80.0 or mn < -45.0
+            # 7~9 月出现的 -30.7℃、温差 60.95℃ 属明显故障；冬季正常
+            # 结构温度可到 -27℃ 左右，因此下限取 -30℃、温差上限取 50℃。
+            try:
+                rng = float(fstats.get("差值"))
+            except (TypeError, ValueError):
+                rng = abs(mx - mn)
+            return mx > 80.0 or mn < -30.0 or rng > 50.0
         if code == "spfs":
             return mx > 100.0 or mn < 0.0
         if code == "szfs":
@@ -2563,6 +2643,169 @@ class BridgeData:
         except (TypeError, ValueError):
             pass
         return False
+
+    @staticmethod
+    def _gross_stat_fault(fstats: Dict, feature: str, stat: str) -> bool:
+        """按“具体统计量”判断是否明显失真：
+        - 温湿度/风速等整条序列异常的，整行无效；
+        - 加速度/应变/位移等：只把超物理范围的极值/差值判失效，
+          平均值/最小值等正常统计仍可用（如振动最大值 5.6e6 m/s² 时
+          最大值与差值填“—”，平均值/最小值照常显示）。
+        """
+        if not isinstance(fstats, dict):
+            return False
+        code = _feature_code(feature)
+        if code in ("rh", "temp", "spfs", "szfs"):
+            return BridgeData._gross_faulty(fstats, feature)
+        limit = None
+        if code.endswith("jsd") or code in ("xjsd", "yjsd", "zjsd"):
+            limit = 1000.0
+        elif code == "rsg":
+            limit = 50000.0
+        elif code in ("nd", "δx", "δy", "δz", "ax", "ay", "az"):
+            limit = 100000.0
+        if not limit:
+            return False
+
+        def _f(key):
+            try:
+                return float(fstats.get(key))
+            except (TypeError, ValueError):
+                return None
+
+        mx, mn, av = _f("最大值"), _f("最小值"), _f("平均值")
+        can = _canon_stat(STAT_KEY_MAP.get(stat, stat))
+        if can == "max":
+            return mx is not None and abs(mx) > limit
+        if can in ("abs_max", "absmax"):
+            vals = [abs(v) for v in (mx, mn) if v is not None]
+            return bool(vals) and max(vals) > limit
+        if can == "min":
+            return mn is not None and abs(mn) > limit
+        if can in ("range", "diff"):
+            d = _f("差值")
+            if d is None and mx is not None and mn is not None:
+                d = mx - mn
+            return d is not None and abs(d) > 2 * limit
+        if av is not None and abs(av) > limit:
+            return True
+        if mx is not None and mn is not None and av is not None:
+            tol = 1e-6 * max(abs(mx), abs(mn), 1.0)
+            if av < mn - tol or av > mx + tol:
+                return True
+        return False
+
+    @staticmethod
+    def _feature_limit(feature: str):
+        """特征物理量级上限（用于极值清洗/同族替代）。"""
+        code = _feature_code(feature)
+        if code == "rh":
+            return 100.0
+        if code == "temp":
+            return 75.0
+        if code == "spfs":
+            return 100.0
+        if code == "szfs":
+            return 60.0
+        if code.endswith("jsd") or code in ("xjsd", "yjsd", "zjsd"):
+            return 1000.0
+        if code == "rsg":
+            return 50000.0
+        if code in ("nd", "δx", "δy", "δz", "ax", "ay", "az"):
+            return 100000.0
+        return None
+
+    @staticmethod
+    def _stat_field(stat: str):
+        can = _canon_stat(STAT_KEY_MAP.get(stat, stat))
+        return {
+            "max": "最大值", "min": "最小值", "range": "差值",
+            "abs_max": "绝对最大值", "absmax": "绝对最大值",
+            "avg": "平均值", "rms": "均方根值",
+        }.get(can), can
+
+    def _daily_clean_extreme(self, fstats: Dict, feature: str, stat: str,
+                             period: Optional[Dict] = None):
+        """① 有每日统计明细时：剔除超物理范围的天，重算极值。"""
+        daily = fstats.get("每日统计")
+        if not isinstance(daily, list) or len(daily) < 2:
+            return None, ""
+        start = str((period or {}).get("start") or "")[:10]
+        end = str((period or {}).get("end") or "")[:10]
+        lim = self._feature_limit(feature)
+
+        def _num(rec, key):
+            try:
+                v = float(rec.get(key))
+                return v if v == v else None
+            except (TypeError, ValueError):
+                return None
+
+        maxs, mins, means = [], [], []
+        dropped = 0
+        for rec in daily:
+            if not isinstance(rec, dict):
+                continue
+            d = str(rec.get("日期") or "")[:10]
+            if (start and d and d < start) or (end and d and d > end):
+                continue
+            mx, mn, av = (_num(rec, "最大值"), _num(rec, "最小值"),
+                          _num(rec, "平均值"))
+            if lim is not None and ((mx is not None and abs(mx) > lim)
+                                    or (mn is not None and abs(mn) > lim)):
+                dropped += 1
+                continue
+            if mx is not None:
+                maxs.append(mx)
+            if mn is not None:
+                mins.append(mn)
+            if av is not None:
+                means.append(av)
+        if len(maxs) < 2 or len(mins) < 2:
+            return None, ""
+        if stat == "range":
+            v = max(maxs) - min(mins)
+        elif stat in ("abs_max", "absmax"):
+            v = max(abs(max(maxs)), abs(min(mins)))
+        elif stat == "max":
+            v = max(maxs)
+        elif stat == "min":
+            v = min(mins)
+        elif stat == "rms":
+            vals = [x * x for x in means]
+            v = float(math.sqrt(sum(vals) / len(vals))) if vals else None
+        else:
+            v = (sum(means) / len(means)) if means else None
+        if v is None:
+            return None, ""
+        note = f"按每日明细清洗后重算（剔除{dropped}天超范围极值）"
+        return float(v), note
+
+    def _sibling_clean_extreme(self, metric: str, feature: str, stat: str):
+        """② 无每日明细时：用同指标类别有效测点的极值中位数替代。"""
+        field, can = self._stat_field(stat)
+        if not field or can not in ("max", "min", "range", "abs_max"):
+            return None, ""
+        lim = self._feature_limit(feature)
+        vals = []
+        for sid in self.sensors_for_metric(metric):
+            st = self._feature_stats(str(sid), metric, feature=feature)
+            if not st or self._constant_faulty(st, feature):
+                continue
+            try:
+                v = float(st.get(field))
+            except (TypeError, ValueError):
+                continue
+            if v != v or (lim is not None and abs(v) > lim):
+                continue
+            vals.append(v)
+        if len(vals) < 2:
+            return None, ""
+        vals.sort()
+        n = len(vals)
+        med = (vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2)
+        return float(med), (f"同指标有效测点中位数替代（异常极值已剔除，"
+                            f"同族样本{n}个；精确极值需重跑统计库）")
 
     def _feature_stats(self, sensor_id: str, metric: str, feature: str = "") -> Optional[Dict]:
         data = self._load_sensor_stats(sensor_id)
@@ -2648,10 +2891,15 @@ class BridgeData:
         """读取单个传感器（可指定特征）在报告期内的统计值。"""
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
         _feat = feature or self.metrics.get(metric, {}).get("feature", "")
-        if fstats and (self._constant_faulty(fstats, _feat)
-                       or self._gross_faulty(fstats, _feat)):
-            # 恒值/严重超物理范围的传感器视为故障/无效：整行填“—”
+        if fstats and self._constant_faulty(fstats, _feat):
             return None
+        if fstats and self._gross_stat_fault(fstats, _feat, stat):
+            # 优先用每日明细重算清洗后极值；无明细时用同族有效测点中位数；
+            # 两者都没有（数据确实为空/稀疏）才返回 None 填“—”。
+            v2, _note = self._daily_clean_extreme(fstats, _feat, stat, period)
+            if v2 is None:
+                v2, _note = self._sibling_clean_extreme(metric, _feat, stat)
+            return v2
         if not fstats:
             return self._aggregate_sensor_stat(sensor_id, metric, stat,
                                                feature=feature)
@@ -2684,10 +2932,25 @@ class BridgeData:
         """单个传感器统计 + 数据来源明细；读不到返回 None。"""
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
         _feat = feature or self.metrics.get(metric, {}).get("feature", "")
-        if fstats and (self._constant_faulty(fstats, _feat)
-                       or self._gross_faulty(fstats, _feat)):
-            # 恒值/严重超物理范围的传感器视为故障/无效：整行填“—”
+        if fstats and self._constant_faulty(fstats, _feat):
             return None
+        if fstats and self._gross_stat_fault(fstats, _feat, stat):
+            v2, note = self._daily_clean_extreme(fstats, _feat, stat, period)
+            if v2 is None:
+                v2, note = self._sibling_clean_extreme(metric, _feat, stat)
+            if v2 is None:
+                return None
+            info = self.sensor_map.get(str(sensor_id), {})
+            return {
+                "传感器编号": str(sensor_id),
+                "监测部位": (info.get("名称")
+                             or info.get("监测部位") or ""),
+                "特征": _feat,
+                "统计文件": os.path.join(self.stats_dir, "位置统计"),
+                "数据来源": note or "异常极值清洗替代",
+                "天数": 0,
+                "值": v2,
+            }
         if not fstats:
             v = self._aggregate_sensor_stat(sensor_id, metric, stat,
                                             feature=feature)
@@ -4459,12 +4722,35 @@ class BridgeData:
         if not pos:
             return None
         base_dir = self._fuzzy_position_dir(pos)
-        if not os.path.isdir(base_dir):
-            return None
-        cands = sorted(f for f in os.listdir(base_dir)
-                       if f.startswith("相关性_") and f.endswith(".png"))
+        cands = []
+        if os.path.isdir(base_dir):
+            cands = sorted(f for f in os.listdir(base_dir)
+                           if f.startswith("相关性_") and f.endswith(".png"))
+        pick_dir = base_dir
         if not cands:
-            return None
+            # 兜底：名称对照与图库目录命名顺序/修饰词不同时的散点图搜索
+            # （如 模板/对照“左幅炎陵侧边跨跨中顶板” vs 图库目录
+            #  “炎陵侧边跨跨中截面顶板左幅”）
+            best_dir, best_score, best_cands = "", 0.0, []
+            try:
+                for d in os.listdir(self.charts_dir):
+                    dp = os.path.join(self.charts_dir, d)
+                    if not os.path.isdir(dp):
+                        continue
+                    cs = sorted(f for f in os.listdir(dp)
+                                if f.startswith("相关性_")
+                                and f.endswith(".png"))
+                    if not cs:
+                        continue
+                    sc = _position_similarity(pos, d)
+                    if sc > best_score:
+                        best_score, best_dir, best_cands = sc, dp, cs
+            except OSError:
+                pass
+            if best_dir and best_score >= 0.6:
+                pick_dir, cands = best_dir, best_cands
+            else:
+                return None
         feat = feature_hint or ""
         if not feat:
             for m in (metric_hint, metric_from_id):
@@ -4485,7 +4771,7 @@ class BridgeData:
                     break
         if pick is None:
             pick = cands[0]
-        path = os.path.join(base_dir, pick)
+        path = os.path.join(pick_dir, pick)
         if not os.path.isfile(path):
             return None
         display_metric = (metric_hint

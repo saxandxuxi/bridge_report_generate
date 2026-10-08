@@ -101,11 +101,32 @@ def _physical_gross_stats(st, feature):
     if code == "rh":
         return mx > 100.0 or mn < -10.0
     if code == "temp":
-        return mx > 80.0 or mn < -45.0
+        try:
+            _rng = float(st.get("差值"))
+        except (TypeError, ValueError):
+            _rng = abs(mx - mn)
+        return mx > 80.0 or mn < -30.0 or _rng > 50.0
     if code == "spfs":
         return mx > 100.0 or mn < 0.0
     if code == "szfs":
         return mx > 60.0 or mn < -60.0
+    # 加速度/应变/位移：量级远超物理范围（旧统计库未清洗）→ 不参与汇总
+    _limit = None
+    if code.endswith("jsd") or code in ("xjsd", "yjsd", "zjsd"):
+        _limit = 1000.0
+    elif code == "rsg":
+        _limit = 50000.0
+    elif code in ("nd", "δx", "δy", "δz"):
+        _limit = 100000.0
+    if _limit:
+        if abs(mx) > _limit or abs(mn) > _limit:
+            return True
+        try:
+            _d = float(st.get("差值"))
+        except (TypeError, ValueError):
+            _d = None
+        if _d is not None and abs(_d) > 2 * _limit:
+            return True
     # 平均值不在 [最小值, 最大值] 内（多序列清洗不一致/单位跳变等）：
     # 统计口径自相矛盾，视为故障测点，避免报告出现 平均121>最大100 这类值
     try:
