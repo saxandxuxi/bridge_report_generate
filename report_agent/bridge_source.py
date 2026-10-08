@@ -1640,8 +1640,9 @@ class BridgeData:
     def abnormal_positions(self, metric: str, period: Dict) -> List[str]:
         """返回该指标下存在缺失数据的监测部位。
 
-        判定：位置统计里任一测点“缺失天数 > 0”（整日缺失），或名称对照
-        里属于该特征、但统计库完全没有记录的监测部位（完全无数据）。
+        判定：位置统计里任一测点缺失 ≥7 天（或达到 summary_miss_hours
+        阈值），以及名称对照里属于该特征、但统计库完全没有记录的监测
+        部位（完全无数据）。
         """
         feat = self.metrics.get(metric, {}).get("feature", "")
         if not feat:
@@ -1659,6 +1660,8 @@ class BridgeData:
                 pos_entries = fe.get("位置") or {}
                 if not isinstance(pos_entries, dict):
                     continue
+                pos_entries, _ = self._filter_pos_entries(
+                    metric, pos_entries)
                 for pos, points in pos_entries.items():
                     if not isinstance(points, dict):
                         continue
@@ -1666,9 +1669,12 @@ class BridgeData:
                         st = (rec.get("统计") or {}) if isinstance(rec, dict) else {}
                         try:
                             miss_days = float(st.get("缺失天数") or 0)
+                            miss_hours = float(st.get("缺失小时数") or 0)
                         except (TypeError, ValueError):
-                            miss_days = 0
-                        if miss_days > 0:
+                            miss_days = miss_hours = 0
+                        if (miss_days >= 7
+                                or miss_hours
+                                >= self._summary_miss_threshold()):
                             out.append(str(pos))
                             break
         # 名称对照里属于该特征、但统计库完全没有记录的监测部位（完全缺失）
@@ -2206,9 +2212,10 @@ class BridgeData:
 
     def _summary_miss_threshold(self) -> float:
         try:
-            return float(self.cfg.get("summary_miss_hours", 72) or 72)
+            # 结论段只说明缺失超过 7 天（168h）的时段；短时掉线不进结论
+            return float(self.cfg.get("summary_miss_hours", 168) or 168)
         except (TypeError, ValueError):
-            return 72.0
+            return 168.0
 
     @staticmethod
     def _cap_positions(items, cap: int = 5) -> str:
@@ -2318,11 +2325,11 @@ class BridgeData:
         zero_pos = _dedup(zero_pos)
         seg_pos = _dedup(seg_pos)
 
-        # 4) 数据缺失位置：缺失天数 > 0（整日缺失必报），或缺失小时数达到
-        #    阈值（默认 72h，bridge_data.summary_miss_hours 可调），或完全无数据
+        # 4) 数据缺失位置：只报缺失 ≥7 天（或达到配置阈值）的测点；
+        #    整日零星缺失不再进结论（图上橙色缺失带仍全画）。
+        #    summary_miss_hours 可配置（默认 168h）。
         miss_hours_thr = self._summary_miss_threshold()
-        miss_pos = [str(p) for p in (gs.get("数据缺失严重的传感器位置") or [])
-                    if p]
+        miss_pos = []
         for pos, points in pos_entries.items():
             if not isinstance(points, dict):
                 continue
@@ -2333,7 +2340,7 @@ class BridgeData:
                     md = float(st.get("缺失天数") or 0)
                 except (TypeError, ValueError):
                     continue
-                if md > 0 or mh >= miss_hours_thr:
+                if mh >= miss_hours_thr or md >= 7:
                     miss_pos.append(str(pos))
                     break
         # 补充完全无数据的监测部位（名称对照里属于该特征但统计库无记录）

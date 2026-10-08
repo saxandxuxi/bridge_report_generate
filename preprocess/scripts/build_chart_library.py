@@ -138,6 +138,84 @@ def feature_range(feature):
     return None
 
 
+# ---- 统计值异常剔除：按特征粒度取判定窗口（小时） ------------------------
+# 统计值清洗默认沿用原逻辑（全局稳健基线 + 尖峰/分布极端点），只是判定
+# “相对谁异常”的窗口按数据粒度取：
+#   second（加速度/振动/地震，JSD 族）：统计序列本身已是 1 小时粒度，
+#          窗口=0（全局）即“按 1 小时粒度判定”；
+#   10min（风速 FSFX 族）：24 小时局部窗口——阵风/大风是常态，只有相对
+#          当日上下文明显异常才剔除；
+#   hour（温度/湿度/挠度/应变等）：窗口=0，与修改前的逻辑完全一致。
+# 绘图路径不传 stat_window，始终走原逻辑（全局基线 + 重合窗口尖峰检测）。
+STAT_WINDOW_BY_GRANULARITY = {"second": 0, "10min": 24, "hour": 0}
+
+
+def _stat_window_for(feature, window=0) -> int:
+    """统计值清洗的判定窗口（小时）：>0 显式指定；0=按特征粒度自动
+    （风速 24h，其余 0=全局）；负数=强制全局。"""
+    try:
+        w = int(window or 0)
+    except (TypeError, ValueError):
+        w = 0
+    if w < 0:
+        return 0
+    if w > 0:
+        return w
+    return int(STAT_WINDOW_BY_GRANULARITY.get(
+        feature_granularity(feature), 0) or 0)
+
+
+# ---- 温度的季节性合理下限（湖南地区，单位 ℃） --------------------------
+# 例：7~9 月湖南不可能出现 0℃ 以下的气温/结构温度，出现即不合常理
+# （传感器故障），按异常值剔除。上限沿用 FEATURE_RANGES["temp"]
+# （结构温度夏季可达 60℃+）。取值取“保守下限”，宁可少剔也不误删：
+# 与物理范围一样有 98% 命中率兜底——若整个序列都低于当月下限（量程不同），
+# 自动降级为“仅作绘图参考，不硬过滤”。
+TEMP_MONTHLY_MIN = {
+    1: -15.0, 2: -12.0, 3: -8.0, 4: -4.0, 5: -1.0, 6: 0.0,
+    7: 0.0, 8: 0.0, 9: 0.0, 10: -1.0, 11: -5.0, 12: -12.0,
+}
+
+
+def _is_temperature_feature(feature) -> bool:
+    """温度类特征（WD(temp)/WSD(temp)/环境温度…）：按括号内轴码含 temp。"""
+    return "temp" in str(feature_code(feature)).lower()
+
+
+def seasonal_min_for(feature, when):
+    """温度类特征按月份给出“不可能低于”的下限；非温度/无时间返回 None。"""
+    if not _is_temperature_feature(feature):
+        return None
+    month = getattr(when, "month", 0)
+    if month in TEMP_MONTHLY_MIN:
+        return TEMP_MONTHLY_MIN[month]
+    return None
+
+
+def _rolling_robust(arr, window, min_points=6):
+    """滑动窗口局部稳健基线/尺度（中位数 + 1.4826×MAD），逐点返回。
+
+    用于统计值清洗按特征粒度判定“相对谁异常”：窗口=24h 时，某小时的风速
+    只与前后 12 小时比，而不与整季比（避免大风天被整季基线误判）。
+    窗口退化（序列两端不足 min_points 点）的位置回退全局基线/尺度。
+    返回 (mo, so) 两个与 arr 等长的数组；so 为 0/NaN 时视为无尺度信息。
+    """
+    n = arr.size
+    mo = np.full(n, np.nan, dtype=float)
+    so = np.full(n, np.nan, dtype=float)
+    half = max(1, int(window) // 2)
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        w = arr[lo:hi]
+        w = w[np.isfinite(w)]
+        if w.size < min_points:
+            continue
+        m = float(np.median(w))
+        mad = float(np.median(np.abs(w - m)))
+        mo[i], so[i] = m, (1.4826 * mad if mad > 0 else float(np.std(w)))
+    return mo, so
+
+
 def feature_granularity(feature):
     """数据原生粒度（决定清洗粒度与尖峰预算）：
       second — 加速度/振动/地震（JSD 族，秒级采样）
@@ -360,21 +438,29 @@ def _fmt_compact_range(start_s, end_s):
 def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
                        hour_level=True, vrange=None, max_spikes=3,
                        dist_k=20.0, max_dist_outliers=5,
-                       max_total_removals=5):
+                       max_total_removals=5, feature="", stat_window=0):
     """
-    尖峰替代 v2：
+    尖峰替代 v3（统计值清洗按特征粒度判定；绘图路径不传 feature/stat_window，
+    行为与 v2 完全一致）：
       0) 物理范围过滤(vrange=(min,max)): 超出合理范围的值(如错误码 435000、
          9e7 等)一律用稳健基线替代，不论连续多长；边界给微小容差
          (量程的百万分之一)，避免基线贴近边界(如索力≈0)时把
          微小测量噪声(-1e-06)误判为超范围导致满图红点。
-         仅当 >=98% 数据落在区间内(VRANGE_MIN_RATIO)才做硬过滤；
+        仅当 >=98% 数据落在区间内(VRANGE_MIN_RATIO)才做硬过滤；
          否则认为该范围与传感器量程不符，仅作绘图参考、不硬过滤，
          交由分布极端点/尖峰逻辑处理。
+      0a) 季节合理性(feature=温度类时)：温度类特征按月份有“不可能低于”的
+         下限（如湖南 7~9 月不会低于 0℃），低于下限的点不合常理，按异常
+         值剔除（不占剔除限额）；同样有 98% 命中率兜底，整段低于下限时
+         只记录不硬过滤。
+      0c) 判定窗口(stat_window): 统计值清洗专用。>0 时用滑动窗口内的局部
+         稳健基线/尺度判定“相对谁异常”（风速按 24h），=0 时沿用全局基线
+         （原始逻辑）。绘图路径不传，保持原状。
       0b) 分布极端点过滤(dist_k): 单个孤立点偏离超过 dist_k×尺度(默认20)
          视为异常值，按偏离程度排名最多剔除 max_total_removals 个；
          连续超过 max_run 个点的异常段不剔除，由 detect_deviation_blocks
          在图上标注"XX时间段偏高/低"(精确到数据粒度)。
-         dist_k=0 时关闭散点异常值剔除(异常段标注仍用默认带宽)。
+        dist_k=0 时关闭散点异常值剔除(异常段标注仍用默认带宽)。
       1) 稳健基线: 去掉上下 5% 极端值后的中位数(不被少数大值拉偏);
       2) 稳健尺度: 修剪后的 MAD(1.4826 倍);
       3) 候选异常: |x - 基线| > spike_k * 尺度(仅对范围内值);
@@ -451,14 +537,65 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
     if vrange_note:
         records.append({"说明": vrange_note})
 
+    # 0a) 季节合理性（温度类）：低于当月“不可能下限”的点不合常理 → 剔除。
+    #     与物理范围同样有 98% 命中率兜底：整段低于下限时视为量程不同，
+    #     只记录不硬过滤，避免把整条序列清空。
+    season_bad = np.zeros(n, dtype=bool)
+    if feature:
+        floors = np.full(n, np.nan, dtype=float)
+        for _i, _t in enumerate(times):
+            _f = seasonal_min_for(feature, _t)
+            if _f is not None:
+                floors[_i] = _f
+        if np.isfinite(floors).any():
+            _season_hit = finite & np.isfinite(floors) & (arr < floors)
+            n_season = int(_season_hit.sum())
+            if n_season:
+                # 只有“大部分点都低于下限”（整段量程/单位不同）才降级；
+                # 少数点（含连续几天的传感器故障）一律按异常剔除。
+                if 2 * n_season <= n:
+                    season_bad = _season_hit
+                    in_range &= ~season_bad
+                    records.append({
+                        "说明": f"{n_season} 个点低于当月合理下限"
+                                f"(季节异常)，按异常值剔除",
+                    })
+                else:
+                    records.append({
+                        "说明": f"{n_season} 个点低于当月合理下限，"
+                                f"占比过半视为量程不同，未硬过滤",
+                    })
+
+    # 0c) 判定窗口：统计值清洗按特征粒度取局部稳健基线/尺度（风速 24h），
+    #     窗口=0（绘图路径与其余特征）时 mo/so 恒等于全局基线/尺度，
+    #     与修改前的逻辑完全一致。
+    _win = int(stat_window or 0)
+    if _win >= 6 and n >= _win:
+        _mo, _so = _rolling_robust(arr, _win)
+        mo = np.where(np.isfinite(_mo), _mo, base)
+        so = np.where(np.isfinite(_so) & (_so > 1e-12), _so, scale)
+        records.append({
+            "说明": f"统计值清洗按 {_win}h 局部窗口判定异常"
+                    f"(特征粒度={feature_granularity(feature)})",
+        })
+    else:
+        mo = np.full(n, base, dtype=float)
+        so = np.full(n, scale, dtype=float)
+
     # 0) 范围外/非有限值: 一律替代(不论连续长短，物理错误不占剔除限额)
     bad = ~in_range
     if np.any(bad):
         for t in np.flatnonzero(bad):
-            fixed[t] = base
+            fixed[t] = mo[t]
             range_indices.append(int(t))
-            reason = ("非有限值(inf/nan)" if not finite[t]
-                      else "超出合理范围")
+            if not finite[t]:
+                reason = "非有限值(inf/nan)"
+            elif season_bad[t]:
+                reason = (f"低于当月合理下限"
+                          f"({seasonal_min_for(feature, times[t]):g}℃)，"
+                          f"不合季节常理")
+            else:
+                reason = "超出合理范围"
             records.append({
                 "时间": str(times[int(t)]),
                 "系列": label,
@@ -471,21 +608,25 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
     #     由 detect_deviation_blocks 负责标注(精确到数据粒度)。
     budget = max(0, int(max_total_removals))
     block_k = dist_k if dist_k > 0 else DEFAULT_DIST_K
-    dist_band = block_k * scale
-    if budget > 0 and dist_band > 0:
-        cand = in_range & (np.abs(arr - base) > dist_band)
+    dev_arr = np.abs(arr - mo)           # 相对判定窗口基线的偏离（排名用）
+    # 窗口很平（局部尺度≈0）时用全局带宽的 25% 兜底，避免把平静时段的
+    # 正常小波动当异常剔除；窗口=0（so=scale）时该兜底不改变原逻辑。
+    _floor = 0.25 * block_k * scale
+    dist_band = np.maximum(block_k * np.maximum(so, 1e-12), _floor)
+    if budget > 0 and np.any(dist_band > 0):
+        cand = in_range & (dev_arr > dist_band)
         idx = np.flatnonzero(cand)
         iso = [int(t) for t in idx
                if (t == 0 or not cand[t - 1])
                and (t == n - 1 or not cand[t + 1])]
         if iso:
-            dev = np.abs(arr[iso] - base)
+            dev = dev_arr[iso]
             order = np.argsort(-dev, kind="stable")
             take = min(len(iso), budget)
             for k in range(take):
                 t = iso[order[k]]
                 bad[t] = True
-                fixed[t] = base
+                fixed[t] = mo[t]
                 range_indices.append(t)
                 records.append({
                     "时间": str(times[t]),
@@ -504,7 +645,9 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
         cand_idx, _v = detect_window_spikes(
             times, values, k=spike_k, min_votes=2)
         # 长段过滤: 全局 spike 带中连续 > max_run 的点 → 突变段, 不判尖峰
-        glob_cand = in_range & ~bad & (np.abs(arr - base) / scale > spike_k)
+        _spike_band = np.maximum(spike_k * np.maximum(so, 1e-12),
+                                 0.25 * spike_k * scale)
+        glob_cand = in_range & ~bad & (dev_arr > _spike_band)
         long_exclude = np.zeros(n, dtype=bool)
         for a, b in _true_runs(glob_cand):
             if b - a > max_run:
@@ -540,7 +683,7 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
 
     # 6) 数量上限: 与分布极端点合计最多剔除 max_total_removals 个
     if len(real) > min(max_spikes, budget):
-        real = sorted(real, key=lambda t: abs(arr[t] - base),
+        real = sorted(real, key=lambda t: abs(arr[t] - mo[t]),
                       reverse=True)[:min(max_spikes, budget)]
         records.append({
             "说明": f"尖峰候选超过上限，只替代最极端的 "
@@ -549,7 +692,7 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
         })
 
     for t in real:
-        fixed[t] = base
+        fixed[t] = mo[t]
         indices.append(t)
         records.append({
             "时间": str(times[t]),
@@ -1469,7 +1612,7 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
     """
     时间序列图。
     hour_level=True 时按小时描点(一天 24 个点)，横轴仍标日期；
-    突变区间着色标注，文字放在图内顶部(不与标题重叠)。
+    突变/缺失/恒0段只画色带，不写文字标注（方案第 2 节）。
     """
     x = list(range(len(times)))
     fig, ax = plt.subplots(figsize=(15, 5.5))
@@ -1571,10 +1714,7 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
         label_items.append(
             (f"{sensor_id}({_fmt_compact_range(z['起始时间'], z['结束时间'])})"
              f"可能故障", "#9467bd", float(x[a]), yv))
-    if label_items:
-        y0, y1 = ax.get_ylim()
-        if len(label_items) <= 4:
-            _label_on_bands(ax, fig, label_items, fontsize=10)
+    # 方案第 2 节：图上不再画文字标注（彩色带保留，时段信息在统计 JSON/结论段）
 
     ax.set_xlabel("日期")
     ax.set_ylabel("数值")
@@ -1585,18 +1725,14 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
         title = f"传感器{sensor_id} - {feature_display(feature)} 时间序列"
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
+    _converge_ylim(ax, plot_means, feature)
     _handles, _labels = ax.get_legend_handles_labels()
+    _labels, _handles = _trim_legend_items(_labels, _handles, 1)
     if _handles:
         fig.legend(_handles, _labels, loc="lower center",
                    bbox_to_anchor=(0.5, 0.005),
-                   ncol=min(4, len(_labels)), fontsize=9, framealpha=0.9,
-                   title=f"编号 {sensor_id}")
+                   ncol=min(4, len(_labels)), fontsize=9, framealpha=0.9)
     fig.tight_layout(rect=(0.0, 0.11, 1.0, 1.0))
-    if label_items and len(label_items) > 4:
-        # 多段标注: 收缩子图宽度，文字画到右侧留白区
-        x0, y0, w, h = ax.get_position().bounds
-        ax.set_position([x0, y0, w * 0.76, h])
-        _label_in_margin(fig, ax.get_position(), label_items, fontsize=9)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -1740,21 +1876,15 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
         label_items.append(
             (_fmt_compact_range(g['起始时间'], g['结束时间']), "#d2691e",
              float(xs[a]), yv))
-    if label_items:
-        y0, y1 = ax.get_ylim()
-        if len(label_items) <= 4:
-            _label_on_bands(ax, fig, label_items, fontsize=12)
+    # 方案第 2 节：图上不再画文字标注（彩色带保留）
+    _converge_ylim(ax, means, feature)
     _handles, _labels = ax.get_legend_handles_labels()
+    _labels, _handles = _trim_legend_items(_labels, _handles, 1)
     if _handles:
         fig.legend(_handles, _labels, loc="lower center",
                    bbox_to_anchor=(0.5, 0.005),
                    ncol=min(4, len(_labels)), fontsize=9, framealpha=0.9)
     fig.tight_layout(rect=(0.0, 0.11, 1.0, 1.0))
-    if label_items and len(label_items) > 4:
-        # 多段标注: 收缩子图宽度，文字画到右侧留白区
-        x0, y0, w, h = ax.get_position().bounds
-        ax.set_position([x0, y0, w * 0.76, h])
-        _label_in_margin(fig, ax.get_position(), label_items, fontsize=11)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
@@ -2088,6 +2218,8 @@ def read_clean_hourly_means(daily_root, sensor, feature, start="", end="",
     """读取某 (传感器,特征) 的均值序列，返回:
     (plot_hours, plot_means, spike_pts, range_pts, gaps, records, shifts)
       - 已做日期过滤 + 物理范围过滤 + 尖峰清洗（与 per_sensor 同一套逻辑）
+      - 绘图路径不启用统计值特有的判定窗口与候选式剔除 = 图上只有原来的
+        尖峰标记与物理范围/季节合理性异常标记
       - plot_* 已按 gap_fill_hours 线性填充缺失段（仅用于绘图）
       - spike_pts/range_pts: 被替换尖峰/被剔除异常值的坐标 (时间, 清洗后值)
       - gaps: 缺失段记录 [{起始时间, 结束时间, 缺失小时数}]
@@ -2113,7 +2245,7 @@ def read_clean_hourly_means(daily_root, sensor, feature, start="", end="",
             hours, means, f"{sensor}-{feature}", spike_k,
             hour_level=True, vrange=vrange, max_spikes=max_spikes,
             dist_k=dist_k, max_dist_outliers=max_dist_outliers,
-            max_total_removals=max_total_removals)
+            max_total_removals=max_total_removals, feature=feature)
     spike_pts = [(hours[i], means[i]) for i in spike_idx]
     range_pts = [(hours[i], means[i]) for i in range_idx]
 
@@ -2444,7 +2576,8 @@ _LEGEND_ANNO_PRIORITY = {
 }
 
 
-def _trim_legend_items(labels, handles, uniq_sensor_count):
+def _trim_legend_items(labels, handles, uniq_sensor_count,
+                       multi_curve: bool = False):
     """图例项限量，避免底部图例行数过多把子图挤扁。
 
     单传感器组（如 3#柱墩墩底左幅 SZJSD 的 X/Y/Z 三面板）：传感器编号
@@ -2456,16 +2589,19 @@ def _trim_legend_items(labels, handles, uniq_sensor_count):
     if not labels:
         return labels, handles
     items = list(zip(labels, handles))
-    if uniq_sensor_count <= 1:
-        kept = [(lb, h) for lb, h in items if lb in _LEGEND_ANNO_PRIORITY]
-        kept.sort(key=lambda x: _LEGEND_ANNO_PRIORITY[x[0]])
-        kept = kept[:4]
-    else:
+    if multi_curve:
+        # 多曲线子图（应变原始+剔除温度叠加/同面板多测点）：保留编号区分线型
         def _pri(lb):
             if lb in _LEGEND_ANNO_PRIORITY:
                 return _LEGEND_ANNO_PRIORITY[lb] + 1
             return 0   # 传感器编号等其余标签优先保留
         kept = sorted(items, key=lambda x: _pri(x[0]))[:8]
+    else:
+        # 单曲线（温度/湿度/挠度等，即使多面板）：编号已在子图标题里，
+        # 图例只留状态项，最多 4 条，保证一行放得下
+        kept = [(lb, h) for lb, h in items if lb in _LEGEND_ANNO_PRIORITY]
+        kept.sort(key=lambda x: _LEGEND_ANNO_PRIORITY[x[0]])
+        kept = kept[:4]
     return [lb for lb, _ in kept], [h for _, h in kept]
 
 
@@ -2546,14 +2682,37 @@ def _finalize_layout(fig, rows: int = 1, bottom: float = 0.0) -> None:
             pass
 
 
+def _converge_ylim(ax, values, feature: str = "",
+                   multi_curve: bool = False) -> None:
+    """按数据 2.5%~97.5% 分位数收一收 y 轴，减少大段空白；
+    长尾特征（风速/风向 10min）不收敛，避免裁掉真实大风事件。
+    multi_curve（同子图多条曲线，如应变原始+剔除温度叠加线）用全量
+    最值+5% 余量，避免把其中一条线裁掉。"""
+    vals = [float(v) for v in (values or [])
+            if v is not None and np.isfinite(v)]
+    if len(vals) < 10:
+        return
+    if feature_granularity(feature) == "10min" or _is_direction_feature(feature):
+        return
+    if multi_curve:
+        lo, hi = min(vals), max(vals)
+    else:
+        lo, hi = np.percentile(vals, [2.5, 97.5])
+    span = float(hi - lo)
+    if span <= 0:
+        return
+    pad = 0.05 if multi_curve else 0.10
+    ax.set_ylim(float(lo) - pad * span, float(hi) + pad * span)
+
+
 def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                                 day_mode=False, chunk_idx=1, chunk_total=1):
     """同位置同特征组的时间序列图（子图布局，保证清晰度）：
       - 单特征多测点：每个传感器一个子图，标题带传感器编号；
       - 多特征：每个特征一个子图，子图内叠加各测点；
-      - 缺失时段橙色着色 + 文字“传感器XX缺失(起~止 数据)”（支持跨天）；
-      - 长时间突变段红/绿着色 + 文字“均值xx 偏高/偏低(起~止)”。
-      day_mode=True 时横轴改为 0~24 小时(秒级振动按天出图)，标题含日期。"""
+      - 缺失时段橙色色带、长时间突变段红/绿色带、恒0故障紫色带；
+      - 图上不写文字标注（时段清单在统计 JSON 与报告结论段）。
+     day_mode=True 时横轴改为 0~24 小时(秒级振动按天出图)，标题含日期。"""
     n = len(panels)
     single_feat = len({sub[0]["feature"] for _, sub in panels}) == 1
     # 单传感器 X/Y/Z 等轴/方向分量(如 GNSS Δx/Δy/Δz)：三行一列竖排，
@@ -2562,17 +2721,17 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
         [(sub[0].get("sensor"), sub[0]["feature"]) for _, sub in panels])
     if row3:
         ncols = 1
-        panel_h = 3.4
+        panel_h = 4.2
         panel_w = 9.5
     elif n <= 3:
         ncols = 1
         panel_w = 9.5
         # 2/3 个子图两/三行一列竖排，行高给足避免被裁成横版
-        panel_h = 4.6 if n == 2 else 3.4
+        panel_h = 4.2
     else:
         ncols = 2
         panel_w = 9.5
-        panel_h = 5.0
+        panel_h = 4.2
     nrows = (n + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols,
                              figsize=(panel_w * ncols, panel_h * nrows + 1.5),
@@ -2638,8 +2797,8 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                                 markersize=6, mew=1.6, zorder=6)
             _gaps = s.get("gaps") or []
             if len(_gaps) > _MAX_GAP_ANNOTS:
-                # 缺失段过多：不逐段画色带/文字，只在首个缺失点旁提示一次
-                # （完整时段清单仍写入 预处理记录.json）
+                # 缺失段过多（秒级数据常每隔几分钟掉线）：不逐段画色带，
+                # 避免整幅图被橙色带铺满；完整时段清单在 预处理记录.json。
                 try:
                     _gt0 = dt.datetime.strptime(
                         _gaps[0]["起始时间"], "%Y-%m-%d %H:%M")
@@ -2738,14 +2897,10 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                         [p[1] for p in s["range_pts"]],
                         "x", color="#d62728", markersize=10, mew=2.2, zorder=5)
 
-        # 标注: ≤4 段标在带上(带间距近自动让位)；>4 段全部挪到图旁留白
-        if panel_labels:
-            y0, y1 = ax.get_ylim()
-            if len(panel_labels) <= 4:
-                _label_on_bands(ax, fig, panel_pos, fontsize=13)
-            else:
-                for item in panel_pos:
-                    margin_labels.append((pi, *item))
+        # 图上不再画“时间段/偏高偏低/可能故障”文字（方案第 2 节）：
+        # 这些结论信息在统计 JSON 与报告结论段已有；图只保留彩色带+曲线，
+        # 避免文字挤压绘图区、造成子图不等宽。
+        _ = (panel_labels, panel_pos, margin_labels)   # 保留变量供调试
 
         if day_mode:
             ax.set_xticks(range(0, 25, 6))
@@ -2780,6 +2935,15 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                       else feature_display(ptitle), fontsize=14)
         ax.tick_params(axis="y", labelsize=12)
         ax.grid(True, alpha=0.3)
+        # 收敛 y 轴时把“剔除温度后”叠加线也算进去，避免叠加线被裁掉
+        _ylim_vals = [v for s in sub for v in s.get("means", [])]
+        for _s in sub:
+            for _ov in (_s.get("load_overlays") or []):
+                _ylim_vals.extend(_ov[1] or [])
+        _converge_ylim(ax, _ylim_vals, sub[0].get("feature", ""),
+                       multi_curve=(len(sub) >= 2
+                                    or any(s.get("load_overlays")
+                                           for s in sub)))
 
         handles, labels = ax.get_legend_handles_labels()
         handles += [plt.Line2D([], [], marker="x", color="black",
@@ -2841,8 +3005,13 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
     if global_handles:
         uniq_sensor_count = len({s["sensor"] for _, sub in panels
                                  for s in sub})
+        # 多曲线判定：同面板多条曲线（应变原始+剔除温度叠加），
+        # 或同一子图内叠加多个测点 → 图例需保留编号区分线型
+        _multi_curve = any(
+            len(ss) >= 2 or any(s.get("load_overlays") for s in ss)
+            for _, ss in panels)
         global_labels, global_handles = _trim_legend_items(
-            global_labels, global_handles, uniq_sensor_count)
+            global_labels, global_handles, uniq_sensor_count, _multi_curve)
         leg, leg_ext = _make_legend_fit(fig, global_handles, global_labels)
         fig_h_px = fig.get_size_inches()[1] * fig.dpi
         # 图例完整位于画布内，axes 下边界让出图例高度 + 间距
@@ -2850,26 +3019,8 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
         _apply_group_layout(fig, bottom, top=_top)
     else:
         _apply_group_layout(fig, 0.0, top=_top)
-    # 多段标注: 收缩子图宽度，把右侧留白区让出来放文字
-    if margin_labels:
-        # 先预留右侧留白再画标注，保证文字全部落在画布内：个别 matplotlib
-        # 版本对 tight bbox 中“画布外元素”处理异常，会把画布放大成 16:1 的
-        # 废图（如 37704×2323，内容被挤到右侧），这里从根上避免。
-        fig.subplots_adjust(right=0.80)
-        for a in axes:
-            x0, y0, w, h = a.get_position().bounds
-            a.set_position([x0, y0, w * 0.78, h])
-        by_ax = {}
-        for pi, label, color, xv, yv in margin_labels:
-            by_ax.setdefault(pi, []).append((label, color, xv, yv))
-        for pi, items in by_ax.items():
-            _label_in_margin(fig, axes[pi].get_position(), items,
-                             fontsize=11)
-        # 有右侧标注时用固定画布保存（不带 tight bbox），避免标注文字
-        # 超出画布边缘触发 tight 放大；正常无标注的图仍用 tight 裁剪留白。
-        _save_group_fig(fig, out_path, dpi, tight=False)
-    else:
-        _save_group_fig(fig, out_path, dpi, tight=True)
+    # 不再有右侧文字标注：子图占满画布宽度（等宽等高），统一 tight 保存
+    _save_group_fig(fig, out_path, dpi, tight=True)
     plt.close(fig)
 
 
@@ -3301,6 +3452,11 @@ def main():
                          "默认5；物理范围外/非有限值不计入)")
     ap.add_argument("--max-shifts", type=int, default=5,
                     help="突变区间最多标注几条(按偏离程度排名，默认5)")
+    ap.add_argument("--stat-window", type=int, default=0,
+                    help="统计值清洗的判定窗口(小时)：0=按特征粒度自动"
+                         "(风速24h、加速度1h即原逻辑、其余全局)，"
+                         ">0 显式指定，负数=强制全局。只影响统计值，"
+                         "绘图始终用原有的稳健基线+尖峰逻辑")
     ap.add_argument("--skip-per-sensor", action="store_true",
                     help="跳过逐传感器(per_sensor)出图，直接生成 merged 图"
                          "(单传感器单特征组也会由 merged 路径直接出图)")
@@ -3579,19 +3735,22 @@ def main():
                             hour_level=True, vrange=vrange,
                             max_spikes=_spk_b, dist_k=args.dist_k,
                             max_dist_outliers=_dist_b,
-                            max_total_removals=_rm_b)
+                            max_total_removals=_rm_b,
+                            feature=feature)
                         maxs_d, r2, ix2, rx2 = clean_series_value(
                             hours_d, maxs_d, f"{date_str}最大值", spike_k,
                             hour_level=True, vrange=vrange,
                             max_spikes=_spk_b, dist_k=args.dist_k,
                             max_dist_outliers=_dist_b,
-                            max_total_removals=_rm_b)
+                            max_total_removals=_rm_b,
+                            feature=feature)
                         mins_d, r3, ix3, rx3 = clean_series_value(
                             hours_d, mins_d, f"{date_str}最小值", spike_k,
                             hour_level=True, vrange=vrange,
                             max_spikes=_spk_b, dist_k=args.dist_k,
                             max_dist_outliers=_dist_b,
-                            max_total_removals=_rm_b)
+                            max_total_removals=_rm_b,
+                            feature=feature)
                         spike_rec += r1 + r2 + r3
                         # 累积清洗后的原生粒度序列（小时级/秒级），
                         # 供全期极值按特征颗粒度计算
@@ -3758,19 +3917,22 @@ def main():
                     hour_level=True, vrange=vrange,
                     max_spikes=_spk_b, dist_k=args.dist_k,
                     max_dist_outliers=_dist_b,
-                    max_total_removals=_rm_b)
+                    max_total_removals=_rm_b,
+                    feature=feature)
                 hmaxs, r2, ix2, rx2 = clean_series_value(
                     hours, hmaxs, "小时最大值", spike_k,
                     hour_level=True, vrange=vrange,
                     max_spikes=_spk_b, dist_k=args.dist_k,
                     max_dist_outliers=_dist_b,
-                    max_total_removals=_rm_b)
+                    max_total_removals=_rm_b,
+                    feature=feature)
                 hmins, r3, ix3, rx3 = clean_series_value(
                     hours, hmins, "小时最小值", spike_k,
                     hour_level=True, vrange=vrange,
                     max_spikes=_spk_b, dist_k=args.dist_k,
                     max_dist_outliers=_dist_b,
-                    max_total_removals=_rm_b)
+                    max_total_removals=_rm_b,
+                    feature=feature)
                 spike_rec = r1 + r2 + r3
                 # 图上只标均值序列的剔除点；最大/最小序列的清洗记录仍写入 JSON
                 spike_idx = sorted(ix1)
@@ -3822,14 +3984,41 @@ def main():
                 day_miss = [_raw_miss.get(d, 0) for d in day_dates]
                 stats = None
                 if not args.skip_stats:
+                    # 统计值清洗：与绘图共用上面那套“物理范围+尖峰”逻辑，
+                    # 但按特征粒度再判一次局部异常（风速 24h 窗口：阵风/大风
+                    # 是常态，只有相对当日上下文明显异常才剔除）；
+                    # 加速度/振动等窗口=0，与上面的清洗结果一致。
+                    # 只影响统计口径，绘图序列仍是原来的清洗结果。
+                    s_means, s_maxs, s_mins = hmeans, hmaxs, hmins
+                    _stat_win = _stat_window_for(feature, args.stat_window)
+                    if _stat_win:
+                        _skw = dict(hour_level=True, vrange=vrange,
+                                    feature=feature,
+                                    stat_window=_stat_win)
+                        s_means, _sr1, _si1, _sx1 = clean_series_value(
+                            hours, hmeans, "小时均值(统计)", spike_k,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b, **_skw)
+                        s_maxs, _sr2, _si2, _sx2 = clean_series_value(
+                            hours, hmaxs, "小时最大值(统计)", spike_k,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b, **_skw)
+                        s_mins, _sr3, _si3, _sx3 = clean_series_value(
+                            hours, hmins, "小时最小值(统计)", spike_k,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b, **_skw)
+                        spike_rec = spike_rec + _sr1 + _sr2 + _sr3
                     # 恒0故障段（含 <24h 短段）剔除后算极值
                     if hours:
                         (_n_hours, _n_means, _n_maxs, _n_mins,
                          zero_runs) = _mask_zero_fault_hours(
-                            hours, hmeans, hmaxs, hmins, feature)
+                            hours, s_means, s_maxs, s_mins, feature)
                     else:
                         _n_hours, _n_means, _n_maxs, _n_mins = \
-                            hours, hmeans, hmaxs, hmins
+                            hours, s_means, s_maxs, s_mins
                         zero_runs = []
                     # 缓存“恒0故障段剔除后”的清洗小时序列（均值/最大/最小）
                     # 供 应变-温度回归/剔除温度极值 使用（与统计口径一致，

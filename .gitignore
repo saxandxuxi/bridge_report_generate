@@ -64,7 +64,10 @@ preprocess/*.csv
 preprocess/*.log
 preprocess/status.json
 preprocess/sensor_ids.txt
-
+data/
+tests/
+sync_daily/
+docs/
 .venv_web/
 docs/
 *.bak

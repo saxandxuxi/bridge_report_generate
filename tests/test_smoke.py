@@ -426,6 +426,182 @@ class ChartCleaningGranularityTest(unittest.TestCase):
         self.assertLess(max(out), 1e6)
 
 
+class SummaryMissThresholdTest(unittest.TestCase):
+    """方案第 5 节：结论段只说明缺失 >7 天（168h）的时段。"""
+
+    def test_default_is_seven_days_and_cfg_overrides(self):
+        b = BridgeData.__new__(BridgeData)
+        b.cfg = {}
+        self.assertEqual(b._summary_miss_threshold(), 168.0)
+        b.cfg = {"summary_miss_hours": 72}
+        self.assertEqual(b._summary_miss_threshold(), 72.0)
+        b.cfg = {"summary_miss_hours": None}
+        self.assertEqual(b._summary_miss_threshold(), 168.0)
+
+
+class ChartBeautifyTest(unittest.TestCase):
+    """方案第 2/3/4/6 节：图上不画文字、子图等宽等高、图例精简、Z-score。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import matplotlib
+        matplotlib.use("Agg")
+        spec = importlib.util.spec_from_file_location(
+            "bcl_beautify",
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))),
+                "preprocess", "scripts", "build_chart_library.py"))
+        cls.bcl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.bcl)
+
+    @staticmethod
+    def _temp_series():
+        base = dt.datetime(2026, 7, 1)
+        hours = [base + dt.timedelta(hours=i) for i in range(240)]
+        series = []
+        for sid, off in (("434", 0.0), ("435", 3.0), ("436", -2.0)):
+            means = [20.0 + off + (i % 24) / 24.0 for i in range(240)]
+            series.append({
+                "label": sid, "feature": "WD(temp)", "sensor": sid,
+                "hours": hours, "means": means,
+                "spike_pts": [(hours[10], means[10])],
+                "range_pts": [(hours[11], means[11])],
+                "gaps": [{"起始时间": "2026-07-03 00:00",
+                          "结束时间": "2026-07-05 00:00",
+                          "缺失小时数": 48}],
+                "records": [],
+                "shifts": [{"起始时间": "2026-07-06 00:00",
+                            "结束时间": "2026-07-08 00:00",
+                            "方向": "偏高"}],
+            })
+        return series
+
+    def test_group_chart_has_no_text_and_equal_panels(self):
+        """时间序列合并图：图上无文字标注，子图等宽等高，画布不畸变。"""
+        plt = self.bcl.plt
+        orig_close = plt.close
+        plt.close = lambda *a, **k: None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "时间序列图.png")
+                self.bcl.plot_group_time_series(
+                    "测试位置", "WD(temp)", self._temp_series(), out)
+                self.assertTrue(os.path.isfile(out))
+                fig = plt.figure(plt.get_fignums()[-1])
+                axes = [a for a in fig.axes if a.get_visible()]
+                self.assertGreaterEqual(len(axes), 3)
+                # 图上不得残留“时间段/偏高偏低/可能故障”文字标注
+                for ax in axes:
+                    self.assertEqual(len(ax.texts), 0)
+                # 同一张图内所有子图等宽等高
+                boxes = [a.get_position() for a in axes]
+                for b in boxes[1:]:
+                    self.assertAlmostEqual(b.width, boxes[0].width, places=4)
+                    self.assertAlmostEqual(b.height, boxes[0].height,
+                                           places=4)
+                # 无右侧留白：子图占满画布宽度（旧实现收缩到 ~0.62）
+                self.assertGreater(max(b.x1 for b in boxes), 0.9)
+                # 单曲线图例只留状态项，最多 4 条，一行放得下
+                self.assertTrue(fig.legends)
+                legend_labels = [t.get_text()
+                                 for t in fig.legends[0].get_texts()]
+                self.assertLessEqual(len(legend_labels), 4)
+                self.assertNotIn("434", legend_labels)
+                from PIL import Image
+                with Image.open(out) as im:
+                    w, h = im.size
+                self.assertLess(w / float(h), 8.0)
+        finally:
+            plt.close = orig_close
+            plt.close("all")
+
+    def test_trim_legend_drops_ids_for_single_curve(self):
+        labels = ["434", "长时间偏高", "可能故障(恒0超过24h)"]
+        handles = [1, 2, 3]
+        kept_l, _ = self.bcl._trim_legend_items(labels, handles, 1)
+        self.assertNotIn("434", kept_l)
+        self.assertIn("长时间偏高", kept_l)
+        multi_l, _ = self.bcl._trim_legend_items(labels, handles, 3, True)
+        self.assertIn("434", multi_l)
+
+    def test_stat_window_by_granularity(self):
+        """统计值清洗窗口按特征粒度取：风速 24h、加速度 1h(=原逻辑)、
+        温度等保持原逻辑(0=全局)。"""
+        w = self.bcl._stat_window_for
+        self.assertEqual(w("FSFX2(spfs)"), 24)
+        self.assertEqual(w("DZJSD(yJsd)"), 0)     # 统计序列本身已是小时级
+        self.assertEqual(w("SZJSD(xJsd)"), 0)
+        self.assertEqual(w("WD(temp)"), 0)
+        self.assertEqual(w("FSFX2(spfs)", 6), 6)  # 显式窗口优先
+        self.assertEqual(w("FSFX2(spfs)", -1), 0)  # 负数=强制全局
+
+    def test_no_zscore_logic_left(self):
+        """Z-score 整套逻辑已删除（含绘图与命令行），不得再被引入。"""
+        import inspect
+        src = inspect.getsource(self.bcl).lower()
+        self.assertNotIn("zscore", src)
+        for fn in (self.bcl.read_clean_hourly_means,
+                   self.bcl._build_merged_series):
+            params = inspect.signature(fn).parameters
+            self.assertNotIn("zscore_k", params)
+            self.assertNotIn("zscore_window", params)
+            self.assertNotIn("stat_window", params)
+        # 统计值清洗入口只保留 feature/stat_window 两个统计侧参数
+        params = inspect.signature(self.bcl.clean_series_value).parameters
+        self.assertIn("feature", params)
+        self.assertIn("stat_window", params)
+
+    def test_seasonal_temperature_floor_removes_impossible_cold(self):
+        """7 月不可能低于 0℃：少数不合理的负值按异常剔除。"""
+        times = [dt.datetime(2026, 7, 1) + dt.timedelta(hours=i)
+                 for i in range(240)]
+        vals = [30.0 + (i % 24) * 0.1 for i in range(240)]
+        vals[100] = -20.0
+        vals[150] = -5.0
+        out, recs, _spike, rng = self.bcl.clean_series_value(
+            times, vals, "t", spike_k=0.0, hour_level=False,
+            vrange=(-30.0, 70.0), feature="WD(temp)", dist_k=0.0)
+        self.assertIn(100, rng)
+        self.assertIn(150, rng)
+        self.assertGreater(out[100], 0.0)
+        self.assertTrue(any("季节" in str(r.get("说明", ""))
+                            for r in recs))
+
+    def test_seasonal_floor_not_applied_when_whole_series_below(self):
+        """整段低于当月下限（量程不同/单位不同）时不硬过滤，避免清空序列。"""
+        times = [dt.datetime(2026, 7, 1) + dt.timedelta(hours=i)
+                 for i in range(240)]
+        vals = [-40.0 - (i % 24) * 0.1 for i in range(240)]
+        out, recs, _spike, rng = self.bcl.clean_series_value(
+            times, vals, "t", spike_k=0.0, hour_level=False,
+            feature="WD(temp)", dist_k=0.0, max_spikes=0,
+            max_total_removals=0)
+        self.assertEqual(rng, [])
+        self.assertTrue(any("未硬过滤" in str(r.get("说明", ""))
+                            for r in recs))
+
+    def test_stat_window_catches_local_spike_global_misses(self):
+        """风速统计按 24h 局部窗口判定：日际变化大时全局带太宽，
+        会漏掉局部阵风；窗口模式能发现并剔除。"""
+        import math
+        n = 24 * 90
+        times = [dt.datetime(2026, 1, 1) + dt.timedelta(hours=i)
+                 for i in range(n)]
+        vals = [5.0 * math.sin(i / (24 * 30.0) * 2 * math.pi)
+                for i in range(n)]
+        vals[1000] += 30.0                      # 相对当日上下文异常的阵风
+        kw = dict(spike_k=0.0, hour_level=False, max_spikes=1,
+                  max_total_removals=1, dist_k=0.0)
+        _o1, _r1, s1, x1 = self.bcl.clean_series_value(times, vals, "t", **kw)
+        out2, recs2, _s2, x2 = self.bcl.clean_series_value(
+            times, vals, "t", stat_window=24, feature="FSFX2(spfs)", **kw)
+        self.assertEqual((s1, x1), ([], []))    # 全局逻辑漏检
+        self.assertIn(1000, x2)                 # 24h 窗口命中
+        self.assertLess(abs(out2[1000]), 10.0)  # 用局部基线替代
+        self.assertTrue(any("24h 局部窗口" in str(r.get("说明", ""))
+                            for r in recs2))
+
+
 class ScatterFallbackTest(unittest.TestCase):
     def test_folder_name_order_tolerance(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
