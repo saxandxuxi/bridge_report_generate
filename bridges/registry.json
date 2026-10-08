@@ -14,7 +14,7 @@
     {
       "id": "dongtinghu",
       "name": "洞庭湖大桥",
-      "config": "config/config.json",
+      "config": "config/config_dongtinghu.json",
       "host": "222.242.220.14",
       "port": 8456,
       "token_env": "BRIDGE_DONGTINGHU_TOKEN",

@@ -19,6 +19,7 @@ API Key 优先级：config.llm.api_key > 环境变量 QWEN_API_KEY > DASHSCOPE_A
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -195,6 +196,24 @@ def main() -> int:
     except Exception:  # noqa: BLE001
         sensor_map = {}
     analysis = recognize(args.input, llm_cfg=llm_cfg, sensor_map=sensor_map)
+    # Phase 2（默认开启）：规则召回 + LLM 受限裁决（只能从 options 选 key）。
+    # LLM 不可用/超时/解析失败时按批次回退规则，不阻塞模板生成。
+    try:
+        from report_agent.placeholder_arbiter import arbitrate_numbers
+        arb = arbitrate_numbers(analysis, llm_cfg)
+        if arb.get("enabled"):
+            log.info(
+                "占位符 LLM 裁决完成: 候选 %s，静态keep %s，翻keep %s，"
+                "选定key %s，无key替换 %s，批次 %s，用时 %ss",
+                arb.get("候选数"), arb.get("static_keep"),
+                arb.get("flip_keep"), arb.get("set_key"),
+                arb.get("replace_no_key"), arb.get("batches"),
+                arb.get("elapsed"))
+        else:
+            log.warning("占位符 LLM 裁决未启用: %s（按规则结果继续）",
+                        arb.get("reason"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("占位符 LLM 裁决异常，回退规则结果: %s", exc)
     log.info("解析完成: 图片 %d 张，数字 %d 个，图表占位 %d 处",
              len(analysis["images"]), len(analysis["numbers"]),
              len(analysis.get("chart_texts", [])))

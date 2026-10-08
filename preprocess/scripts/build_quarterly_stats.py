@@ -85,6 +85,39 @@ def _zero_ok_feature(feature):
             or (code == "s" and module.upper().startswith("FSFX")))
 
 
+def _physical_gross_stats(st, feature):
+    """旧统计库未清洗时整季极值严重超物理范围（湿度 5.2e8、温度 -82.7℃
+    等）的故障测点：不参与 全桥统计 极值/均值，并记入疑似故障位置。"""
+    if not isinstance(st, dict):
+        return False
+    try:
+        mx = float(st.get("最大值"))
+        mn = float(st.get("最小值"))
+    except (TypeError, ValueError):
+        return False
+    f = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", f)
+    code = (m.group(1) if m else "").lower()
+    if code == "rh":
+        return mx > 100.0 or mn < -10.0
+    if code == "temp":
+        return mx > 80.0 or mn < -45.0
+    if code == "spfs":
+        return mx > 100.0 or mn < 0.0
+    if code == "szfs":
+        return mx > 60.0 or mn < -60.0
+    # 平均值不在 [最小值, 最大值] 内（多序列清洗不一致/单位跳变等）：
+    # 统计口径自相矛盾，视为故障测点，避免报告出现 平均121>最大100 这类值
+    try:
+        av = float(st.get("平均值"))
+        tol = 1e-6 * max(abs(mx), abs(mn), 1.0)
+        if av < mn - tol or av > mx + tol:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def load_sensor_map(path):
     if not os.path.exists(path):
         return {}
@@ -548,6 +581,10 @@ def main():
             st_records = [(pos, pt.get("统计") or {})
                           for pos, pts in pos_entries.items()
                           for pt in pts.values()]
+            # 旧统计库未清洗时的严重超物理范围测点（湿度 5.2e8 等）不参与
+            # 全桥极值/均值，避免污染总结（正常清洗过的统计库不触发）
+            st_records = [r for r in st_records
+                          if not _physical_gross_stats(r[1], feat)]
             if not st_records:
                 continue
             # GNSS 位移：排除“边坡”测点——其 GNSS(Δx/Δy/Δz) 统计是大地坐标
@@ -610,7 +647,9 @@ def main():
                 all_pts = list(pts.keys())
                 faulty = [pt for pt, rec in pts.items()
                           if (pos, pt) in fault_period_pts
-                          or _is_suspected_fault((rec.get("统计") or {}), feat)]
+                          or _is_suspected_fault((rec.get("统计") or {}), feat)
+                          or _physical_gross_stats(
+                              (rec.get("统计") or {}), feat)]
                 missing = [pt for pt, rec in pts.items()
                            if _is_missing_severe(rec.get("统计") or {})]
                 fault_positions += _fmt_pos(pos, faulty, all_pts)

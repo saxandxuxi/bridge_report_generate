@@ -290,7 +290,14 @@ def build_value_resolver(stats: Dict, period: Dict,
                 if missing_sink is not None:
                     missing_sink.append(key)
                 return missing_marker
-            raise KeyError(f"不支持的总结占位符: {key}")
+            # 模板来自旧源报告，指标在本桥未配置/无统计特征
+            # （如 索夹滑动位移 cable_clamp 在新流程无对应数据）：
+            # 不中断整份报告，记录待补清单并留空，避免结论段出现“—”。
+            if missing_sink is not None:
+                missing_sink.append(key)
+            log.warning(
+                "总结指标 %s 未配置或无统计数据，{{%s}} 留空", metric, key)
+            return ""
         # 4.1 监测结论：{{conclusions}} —— LLM 综合各分项小结生成
         if key == "conclusions" or key.startswith("conclusions."):
             if bridge is not None:
@@ -608,7 +615,7 @@ def _expand_row_tables(
     for table in doc.tables:
         for row in list(table.rows):
             dataset = None
-            for cell in row.cells:
+            for cell in _unique_cells(row):
                 m = re.search(r"\{\{rows\.([a-zA-Z0-9_.]+)\}\}", cell.text)
                 if m:
                     dataset = m.group(1)
@@ -628,7 +635,7 @@ def _expand_row_tables(
                     for p_elm in tc.findall(qn("w:p")):
                         para = Paragraph(p_elm, None)
 
-                        def col_resolver(key: str, _rec=rec) -> str:
+                        def col_resolver(key: str, _rec=rec, **_kwargs) -> str:
                             if key.startswith("rows."):
                                 return ""  # 行模板指令，填充时移除
                             if key.startswith("col."):
@@ -646,13 +653,26 @@ def _expand_row_tables(
     return expanded
 
 
+def _unique_cells(row) -> List:
+    """合并单元格下 python-docx 的 row.cells 会重复返回同一 _tc，
+    这里按底层 _tc 去重，保证每个单元格只遍历一次。"""
+    seen, out = set(), []
+    for c in row.cells:
+        k = id(getattr(c, "_tc", None))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out
+
+
 def _walk_paragraphs(doc: Document):
     for item in iter_block_items(doc):
         if isinstance(item, Paragraph):
             yield item
         elif isinstance(item, Table):
             for row in item.rows:
-                for cell in row.cells:
+                for cell in _unique_cells(row):
                     for p in cell.paragraphs:
                         yield p
     for section in doc.sections:
@@ -796,6 +816,13 @@ def _period_text_replacements(period: Dict):
         (re.compile(rf"{x4}年{x2}月{x2}日"), f"{y}年{m}月{d}日"),
         # 报告期范围：xx月-xx月（如结论段“2026年xx月-xx月”）
         (re.compile(rf"{x2}月[-—–~～]{x2}月"), f"{sm}月-{em}月"),
+        # 模板残留 “2025年01月{{data.N}}月之间” 且 data.N 未回填变成
+        # “2025年01月—月之间” -> 实际报告期 “2026年01月至03月之间”
+        (re.compile(r"20\d{2}年\d{1,2}月[—－-]月之间"),
+         f"{sig.year}年{sm}月至{em}月之间"),
+        # 同类但月份已带值：“2025年01月-03月之间” -> 换成实际报告期年份/月份
+        (re.compile(r"20\d{2}年\d{1,2}月[-—–~～]\d{1,2}月之间"),
+         f"{sig.year}年{sm}月至{em}月之间"),
         (re.compile(rf"{x4}年"), f"{y}年"),
         (re.compile(rf"第[xX×]季度"), f"第{q}季度" if q else "第X季度"),
         (re.compile(rf"{x2}月{x2}日"), f"{m}月{d}日"),
@@ -1269,6 +1296,10 @@ def build_report(
             _cid = _m.group(1).split(".", 1)[1]
             _png = chart_images.get(_cid)
             if _png and _png == _prev_chart_png:
+                log.warning(
+                    "连续图表占位符 %s 解析到同一图片 %s，已清空重复段"
+                    "（若这两个位置本应不同图，说明图表匹配有问题，"
+                    "请检查图表匹配日志）", _cid, _png)
                 _item.clear()
                 continue
             _prev_chart_png = _png
@@ -1330,7 +1361,7 @@ def build_report(
                 current_title = new_text
         elif isinstance(item, Table):
             for ri, row in enumerate(item.rows):
-                for cell in row.cells:
+                for cell in _unique_cells(row):
                     for p in cell.paragraphs:
                         _process_conditional_blocks(p, resolver)
                         _fill_paragraph(p, resolver, table_title=current_title, row_index=ri)
@@ -1433,7 +1464,7 @@ def _collapse_extra_spaces(doc) -> int:
         _fix_para(pa)
     for tb in doc.tables:
         for row in tb.rows:
-            for cell in row.cells:
+            for cell in _unique_cells(row):
                 # _Cell 没有 .sections，直接用它自己的 .paragraphs
                 for pa in getattr(cell, "paragraphs", []) or []:
                     _fix_para(pa)
@@ -1579,30 +1610,46 @@ def verify_table_columns(output_path: str, lineage: Optional[List[Dict]] = None,
             # round(n, 4) 误判为相同，如 0.00016 vs 0.000151）。
             if len(filled) >= 2 and max(filled) - min(filled) < 1e-9:
                 same = filled[0]
-                # 用血缘判断：这些行解析到的传感器是否不同
-                sensors = set()
+                # 用血缘判断：这些行解析到的传感器是否不同。
+                # 血缘的“输出”即最终写入单元格的格式化文本（两位小数/
+                # 三位有效数字），与表格单元格文本同格式，直接比对即可。
+                val_set = set(vals)
+                col_sensors = set()
                 for e in (lineage or []):
                     ph = str(e.get("占位符") or "")
                     if not ph.startswith("cell."):
                         continue
-                    if abs(float(e.get("输出") or 0)) == abs(same) and "值" in e:
-                        pass
-                # 简化：统计该列占位符涉及的传感器数（通过血缘中 cell 条目）
-                col_sensors = set()
-                for e in (lineage or []):
-                    ph = str(e.get("占位符") or "")
                     s = e.get("传感器")
                     sid = s.get("传感器编号") if isinstance(s, dict) else None
-                    if sid and str(e.get("输出") or "") == f"{same:.1f}":
+                    out = str(e.get("输出") or "")
+                    if sid and (out in val_set or out == vals[0]):
                         col_sensors.add(str(sid))
+                if not col_sensors:
+                    # 血缘文本与单元格格式不一致时（如指数写法差异），
+                    # 退回数值近似比较
+                    for e in (lineage or []):
+                        s = e.get("传感器")
+                        sid = s.get("传感器编号") if isinstance(s, dict) \
+                            else None
+                        if not sid:
+                            continue
+                        try:
+                            outv = float(e.get("输出") or "")
+                        except (TypeError, ValueError):
+                            continue
+                        if any(abs(outv - v) < 1e-9 for v in filled):
+                            col_sensors.add(str(sid))
                 warnings.append({
                     "表序号": t_idx, "列序号": c_idx,
                     "问题": "整列同值",
                     "值": same,
                     "行数": len(filled),
-                    "血缘命中传感器数": len(col_sensors) if col_sensors else "未知",
+                    "血缘命中传感器数": len(col_sensors),
                     "说明": (f"整列数值相同（{same:.2f}）。若不同测点对应不同传感器则为填充错误；"
-                             "若传感器本就相同则属数据本身。")
+                             "若传感器本就相同则属数据本身。"
+                             + ("" if len(col_sensors) <= 1
+                                else f"血缘显示涉及 {len(col_sensors)} 个不同传感器，"
+                                     f"疑似填表错误。"))
                 })
     if warnings and logs_dir:
         os.makedirs(logs_dir, exist_ok=True)

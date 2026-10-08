@@ -26,6 +26,18 @@ COND_RE = re.compile(r"\{\{\?(.+?)\}\}(.*?)\{\{\?\}\}", re.DOTALL)
 NUMBER_RE = re.compile(r"(?<![\w℃%])([+-]?\d+(?:\.\d+)?)(?![\w%])")
 
 
+def _unique_cells(row) -> List:
+    """合并单元格去重（row.cells 会重复返回同一 _tc）。"""
+    seen, out = set(), []
+    for c in row.cells:
+        k = id(getattr(c, "_tc", None))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out
+
+
 def iter_block_items(parent):
     """按文档顺序遍历正文中的段落和表格。"""
     from docx.oxml.ns import qn
@@ -48,7 +60,7 @@ def iter_paragraphs(doc: Document):
             yield para
         elif isinstance(para, Table):
             for row in para.rows:
-                for cell in row.cells:
+                for cell in _unique_cells(row):
                     for p in cell.paragraphs:
                         yield p
     for section in doc.sections:
@@ -174,11 +186,14 @@ def analyze_template(template_path: str) -> Dict:
             elif key.startswith("rows."):
                 result["rows"].append(key.split(".", 1)[1])
 
-        if not MARKER_RE.search(text) and not COND_RE.search(text):
-            for m in NUMBER_RE.finditer(text):
-                result["candidate_numbers"].append(
-                    {"number": m.group(0), "snippet": text.strip()[:80], "index": idx}
-                )
+        # 占位符与正文混排时，把占位符/条件块先“挖空”再扫数字，
+        # 避免“同段含 {{...}} 就漏掉其它动态数字”。
+        _num_text = MARKER_RE.sub(" ", text)
+        _num_text = COND_RE.sub(" ", _num_text)
+        for m in NUMBER_RE.finditer(_num_text):
+            result["candidate_numbers"].append(
+                {"number": m.group(0), "snippet": text.strip()[:80],
+                 "index": idx})
 
     for t_idx, table in enumerate(doc.tables):
         info = {
@@ -188,7 +203,7 @@ def analyze_template(template_path: str) -> Dict:
             "markers": [],
         }
         for row_idx, row in enumerate(table.rows):
-            for col_idx, cell in enumerate(row.cells):
+            for col_idx, cell in enumerate(_unique_cells(row)):
                 for m in MARKER_RE.finditer(cell.text):
                     info["markers"].append(
                         {

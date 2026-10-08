@@ -86,31 +86,53 @@ def _html_unescape(s):
 def parse_traffic_week(path):
     """解析每周车道统计 HTML(扩展名 .xls，实际为 UTF-8 HTML)。
 
-    表头: 时间 | 总共 | 车道1 | 车道2 | 车道3 | 车道4
-    返回 [(datetime, {车道1: n, ..., 车道4: n, 总共: n}), ...]
+    不同桥的车道数不同（矮寨 4 车道、洞庭湖 6 车道…），车道列不写死：
+    先按表头行定位 时间/总共/车道N 列，再逐行取值。
+    返回 [(datetime, {车道1: n, ..., 车道N: n, 总共: n}), ...]
     """
     with open(path, "rb") as f:
         raw = f.read()
     text = raw.decode("utf-8", errors="replace")
     rows = re.findall(r"<tr>(.*?)</tr>", text, re.S)
+    header_cols = {}   # 列名(时间/总共/车道N) -> 列下标
+    time_col = -1
     out = []
     for r in rows:
-        tds = [_html_unescape(re.sub(r"<[^>]+>", "", t))
-               for t in re.findall(r"<td[^>]*>(.*?)</td>", r, re.S)]
-        if len(tds) < 6 or not tds[0]:
+        cells = [_html_unescape(re.sub(r"<[^>]+>", "", t))
+                 for t in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", r, re.S)]
+        if not cells:
             continue
-        m = TRAFFIC_TIME_RE.search(tds[0])
+        if not header_cols:
+            # 表头行：含“时间”与至少一个“车道N”
+            names = [str(c).strip() for c in cells]
+            if "时间" in names and any(
+                    re.match(r"^车道\s*\d+", n) for n in names):
+                for i, n in enumerate(names):
+                    if n == "时间":
+                        time_col = i
+                        header_cols["时间"] = i
+                    elif n == "总共":
+                        header_cols["总共"] = i
+                    elif re.match(r"^车道\s*\d+", n):
+                        header_cols[f"车道{re.search(r'\d+', n).group()}"] = i
+                continue
+            continue
+        if time_col < 0 or time_col >= len(cells):
+            continue
+        m = TRAFFIC_TIME_RE.search(cells[time_col])
         if not m:
             continue
         try:
             ts = dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
                              int(m.group(4)), int(m.group(5)), int(m.group(6)))
-            # 表头: 时间 | 总共 | 车道1 | 车道2 | 车道3 | 车道4
             vals = {}
-            for i, k in enumerate(("车道1", "车道2", "车道3", "车道4")):
-                if i + 2 < len(tds) and tds[i + 2].strip():
-                    vals[k] = int(float(tds[i + 2]))
-            vals["总共"] = int(float(tds[1])) if tds[1].strip() else None
+            for k, i in header_cols.items():
+                if k == "时间" or i >= len(cells):
+                    continue
+                v = cells[i].strip()
+                if not v:
+                    continue
+                vals[k] = int(float(v))
         except (ValueError, IndexError):
             continue
         if not vals or all(v is None for v in vals.values()):

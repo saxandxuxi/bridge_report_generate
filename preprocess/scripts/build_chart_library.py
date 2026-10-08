@@ -1544,8 +1544,13 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
         title = f"传感器{sensor_id} - {feature_display(feature)} 时间序列"
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="best", fontsize=10, title=f"编号 {sensor_id}")
-    fig.tight_layout()
+    _handles, _labels = ax.get_legend_handles_labels()
+    if _handles:
+        fig.legend(_handles, _labels, loc="lower center",
+                   bbox_to_anchor=(0.5, 0.005),
+                   ncol=min(4, len(_labels)), fontsize=9, framealpha=0.9,
+                   title=f"编号 {sensor_id}")
+    fig.tight_layout(rect=(0.0, 0.11, 1.0, 1.0))
     if label_items and len(label_items) > 4:
         # 多段标注: 收缩子图宽度，文字画到右侧留白区
         x0, y0, w, h = ax.get_position().bounds
@@ -1698,8 +1703,12 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
         y0, y1 = ax.get_ylim()
         if len(label_items) <= 4:
             _label_on_bands(ax, fig, label_items, fontsize=12)
-    ax.legend(loc="best", fontsize=10)
-    fig.tight_layout()
+    _handles, _labels = ax.get_legend_handles_labels()
+    if _handles:
+        fig.legend(_handles, _labels, loc="lower center",
+                   bbox_to_anchor=(0.5, 0.005),
+                   ncol=min(4, len(_labels)), fontsize=9, framealpha=0.9)
+    fig.tight_layout(rect=(0.0, 0.11, 1.0, 1.0))
     if label_items and len(label_items) > 4:
         # 多段标注: 收缩子图宽度，文字画到右侧留白区
         x0, y0, w, h = ax.get_position().bounds
@@ -1801,7 +1810,7 @@ def plot_traffic_charts(series, total_series, out_dir, dpi=200):
     for j in range(n, nrows * ncols):
         axes.flat[j].axis("off")
     fig.suptitle("各车道通过数量比例图（小时级）", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _finalize_layout(fig, rows=nrows)
     fig.savefig(os.path.join(out_dir, "各车道通过数量比例图.png"),
                 dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -1821,7 +1830,7 @@ def plot_traffic_charts(series, total_series, out_dir, dpi=200):
     for j in range(n, nrows * ncols):
         axes.flat[j].axis("off")
     fig.suptitle("各车道频率分布图", fontsize=14)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    _finalize_layout(fig, rows=nrows)
     fig.savefig(os.path.join(out_dir, "各车道频率分布图.png"),
                 dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -2422,6 +2431,10 @@ def _trim_legend_items(labels, handles, uniq_sensor_count):
 # 面板间最小垂直间隙（图高比例）：低于该值视为上下挤在一起
 _GROUP_MIN_PANEL_GAP = 0.055
 
+# 单个测点在一张图上的缺失段标注上限：超过后不再逐段画色带/文字，
+# 只提示“缺失时段过多”（秒级数据常每隔一两分钟掉几十秒，段数成百上千）
+_MAX_GAP_ANNOTS = 12
+
 
 def _apply_group_layout(fig, bottom, top=0.95):
     """多子图合并图布局：tight_layout 优先；失败时回退固定边距+hspace。
@@ -2467,6 +2480,31 @@ def _apply_group_layout(fig, bottom, top=0.95):
                             hspace=0.32, wspace=0.20)
 
 
+def _finalize_layout(fig, rows: int = 1, bottom: float = 0.0) -> None:
+    """统一的标题/图例安全区：
+    - 顶部为 fig.suptitle 预留空间，避免总标题与第一行子图标题重合；
+    - 底部按调用方给的图例高度 bottom 预留，避免图例压住坐标轴/刻度。
+    tight_layout 不会自动为 suptitle 留白，这里显式收紧 rect 并把 suptitle
+    顶到画布上沿（bbox_inches='tight' 保存时不会裁掉）。
+    """
+    top = 0.92 if rows <= 1 else max(0.84, 0.92 - 0.025 * (rows - 1))
+    bottom = min(0.45, max(0.0, bottom))
+    try:
+        fig.tight_layout(rect=(0.0, bottom, 1.0, top))
+    except Exception:  # noqa: BLE001
+        try:
+            fig.subplots_adjust(top=top, bottom=bottom)
+        except Exception:  # noqa: BLE001
+            pass
+    st = getattr(fig, "_suptitle", None)
+    if st is not None:
+        try:
+            st.set_y(1.0)
+            st.set_va("top")
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                                 day_mode=False, chunk_idx=1, chunk_total=1):
     """同位置同特征组的时间序列图（子图布局，保证清晰度）：
@@ -2507,7 +2545,7 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
     for pi, (ptitle, sub) in enumerate(panels):
         ax = axes[pi]
         # 缺失/突变段全部着色并收集文字(带对应色带位置)
-        any_gap = any(s["gaps"] for s in sub)
+        any_gap = False
         any_shift = any(s.get("shifts") for s in sub)
         any_zero = False
         panel_labels = []   # [(label, color)]
@@ -2557,26 +2595,51 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                                 [p[1] for p in _ov_range],
                                 "D", color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
                                 markersize=6, mew=1.6, zorder=6)
-            for g in s["gaps"]:
+            _gaps = s.get("gaps") or []
+            if len(_gaps) > _MAX_GAP_ANNOTS:
+                # 缺失段过多：不逐段画色带/文字，只在首个缺失点旁提示一次
+                # （完整时段清单仍写入 预处理记录.json）
                 try:
-                    t0 = dt.datetime.strptime(g["起始时间"], "%Y-%m-%d %H:%M")
-                    t1 = dt.datetime.strptime(g["结束时间"], "%Y-%m-%d %H:%M")
+                    _gt0 = dt.datetime.strptime(
+                        _gaps[0]["起始时间"], "%Y-%m-%d %H:%M")
+                    _ga = min(range(len(s["hours"])),
+                              key=lambda k: abs(
+                                  (s["hours"][k] - _gt0).total_seconds()))
+                    _glabel = f"缺失时段过多（{len(_gaps)}段）"
+                    panel_labels.append((_glabel, "#d2691e"))
+                    _yv = (plot_means[_ga] if _ga < len(plot_means)
+                           else 0.0)
+                    panel_pos.append(
+                        (_glabel, "#d2691e", xs[_ga], _yv))
+                    s["_gap_overflow"] = len(_gaps)
                 except (ValueError, KeyError):
-                    continue
-                a = min(range(len(s["hours"])),
-                        key=lambda k: abs((s["hours"][k] - t0).total_seconds()))
-                b = min(range(len(s["hours"])),
-                        key=lambda k: abs((s["hours"][k] - t1).total_seconds()))
-                ax.axvspan(xs[a], xs[b],
-                           color="#ff7f0e", alpha=0.18)
-                panel_labels.append(
-                    (_fmt_compact_range(g['起始时间'], g['结束时间']),
-                     "#d2691e"))
-                yv = (plot_means[b] if b < len(plot_means)
-                      else plot_means[a] if a < len(plot_means) else 0.0)
-                panel_pos.append(
-                    (_fmt_compact_range(g['起始时间'], g['结束时间']),
-                     "#d2691e", xs[a], yv))
+                    pass
+            else:
+                for g in _gaps:
+                    try:
+                        t0 = dt.datetime.strptime(
+                            g["起始时间"], "%Y-%m-%d %H:%M")
+                        t1 = dt.datetime.strptime(
+                            g["结束时间"], "%Y-%m-%d %H:%M")
+                    except (ValueError, KeyError):
+                        continue
+                    a = min(range(len(s["hours"])),
+                            key=lambda k: abs(
+                                (s["hours"][k] - t0).total_seconds()))
+                    b = min(range(len(s["hours"])),
+                            key=lambda k: abs(
+                                (s["hours"][k] - t1).total_seconds()))
+                    ax.axvspan(xs[a], xs[b],
+                               color="#ff7f0e", alpha=0.18)
+                    panel_labels.append(
+                        (_fmt_compact_range(g['起始时间'], g['结束时间']),
+                         "#d2691e"))
+                    yv = (plot_means[b] if b < len(plot_means)
+                          else plot_means[a] if a < len(plot_means) else 0.0)
+                    panel_pos.append(
+                        (_fmt_compact_range(g['起始时间'], g['结束时间']),
+                         "#d2691e", xs[a], yv))
+                    any_gap = True
             for sh in s.get("shifts") or []:
                 try:
                     t0 = dt.datetime.strptime(sh["起始时间"], "%Y-%m-%d %H:%M")
@@ -2719,14 +2782,21 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
 
     _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
     _gran = _granularity_label(panels)
+    _rows = (n + ncols - 1) // ncols if ncols else 1
+    _top = 0.92 if _rows <= 1 else max(0.84, 0.92 - 0.025 * (_rows - 1))
     if day_mode:
         fig.suptitle(
             f"{position}｜{group} {_gran}时间序列（{n} 个测点）｜"
-            f"{_fmt_cn_date(day_date)}{_chunk_txt}", fontsize=19)
+            f"{_fmt_cn_date(day_date)}{_chunk_txt}", fontsize=18)
     else:
         fig.suptitle(
             f"{position}｜{group} {_gran}时间序列（{n} 个测点）{_chunk_txt}",
-            fontsize=19)
+            fontsize=18)
+    try:
+        fig._suptitle.set_y(1.0)
+        fig._suptitle.set_va("top")
+    except Exception:  # noqa: BLE001
+        pass
     if global_handles:
         uniq_sensor_count = len({s["sensor"] for _, sub in panels
                                  for s in sub})
@@ -2735,10 +2805,10 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
         leg, leg_ext = _make_legend_fit(fig, global_handles, global_labels)
         fig_h_px = fig.get_size_inches()[1] * fig.dpi
         # 图例完整位于画布内，axes 下边界让出图例高度 + 间距
-        bottom = min(0.35, max(0.06, leg_ext.y1 / fig_h_px + 0.01))
-        _apply_group_layout(fig, bottom)
+        bottom = min(0.35, max(0.08, leg_ext.y1 / fig_h_px + 0.03))
+        _apply_group_layout(fig, bottom, top=_top)
     else:
-        _apply_group_layout(fig, 0.0, top=0.97)
+        _apply_group_layout(fig, 0.0, top=_top)
     # 多段标注: 收缩子图宽度，把右侧留白区让出来放文字
     if margin_labels:
         # 先预留右侧留白再画标注，保证文字全部落在画布内：个别 matplotlib
@@ -2837,7 +2907,7 @@ def _plot_group_histogram_chunk(position, group, series, out_path, dpi=200,
                 density=True, alpha=0.7, color=colors[i % len(colors)],
                 edgecolor="black")
         ax.set_title(f"{s['label']}｜{feature_display(s['feature'])}",
-                     fontsize=12)
+                     fontsize=12, pad=8)
         ax.set_xlabel("数值", fontsize=11)
         ax.set_ylabel("频率", fontsize=11)
         ax.grid(True, alpha=0.3)
@@ -2846,8 +2916,8 @@ def _plot_group_histogram_chunk(position, group, series, out_path, dpi=200,
     _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
     fig.suptitle(
         f"{position}｜{group} 频率分布直方图（{n} 个测点）{_chunk_txt}",
-        fontsize=17)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+        fontsize=16)
+    _finalize_layout(fig, rows=rows)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
@@ -2902,7 +2972,7 @@ def _plot_group_histogram_from_counts_chunk(position, group, hist_acc,
                color=colors[i % len(colors)], alpha=0.75,
                edgecolor="black", linewidth=0.4)
         ax.set_title(f"{sensor}｜{feature_display(feat)}",
-                     fontsize=12)
+                     fontsize=12, pad=8)
         ax.set_xlabel("数值", fontsize=11)
         ax.set_ylabel("频率密度", fontsize=11)
         ax.grid(True, alpha=0.3)
@@ -2911,8 +2981,8 @@ def _plot_group_histogram_from_counts_chunk(position, group, hist_acc,
     _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
     fig.suptitle(
         f"{position}｜{group} 频率分布直方图（{n} 个测点，按日累积）{_chunk_txt}",
-        fontsize=17)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+        fontsize=16)
+    _finalize_layout(fig, rows=rows)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
@@ -2954,8 +3024,8 @@ def plot_group_correlation(position, group, series, out_path, dpi=200):
     if not single:
         for j in range(len(pairs), len(axes)):
             axes[j].axis("off")
-    fig.suptitle(f"{position}｜{group} 特征相关性分析", fontsize=17)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.suptitle(f"{position}｜{group} 特征相关性分析", fontsize=16)
+    _finalize_layout(fig, rows=rows)
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
@@ -3032,8 +3102,8 @@ def plot_position_correlation(position, series, pos_dir, dpi=200):
                 axes[j].axis("off")
         fig.suptitle(
             f"{position}｜{feature_display(a)}-{feature_display(b)} "
-            f"相关性散点图", fontsize=17)
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
+            f"相关性散点图", fontsize=16)
+        _finalize_layout(fig, rows=1)
         out = os.path.join(pos_dir, f"相关性_{a}-{b}.png")
         fig.savefig(out, dpi=dpi, bbox_inches="tight", facecolor="white")
         plt.close(fig)
@@ -3342,6 +3412,15 @@ def main():
               f"{args.daily_root}")
         sys.exit(1)
     print(f"数据源: daily 目录(小时级明细) {args.daily_root}")
+    # 新符号提醒：实际数据里出现但没配置物理范围的特征，只用自适应
+    # 尖峰/分布清洗（不做物理硬过滤），提醒人工看过数据后补范围
+    _unranged = sorted({
+        f for _s, feats in sensor_feats.items() for f in feats
+        if feature_range(f) is None})
+    if _unranged:
+        print("[提示] 以下特征未配置物理范围，仅用自适应尖峰/分布清洗"
+              "（看过一两个季度数据后可补范围）："
+              + "、".join(_unranged), flush=True)
 
     # 收集 (传感器, 特征) 列表
     pairs = [(s, f) for s, feats in sorted(sensor_feats.items())

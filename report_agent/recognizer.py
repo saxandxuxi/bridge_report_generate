@@ -1574,7 +1574,8 @@ def _build_doc_chunks(parsed: dict, max_chars: int = 10000) -> List[tuple]:
     返回 [(文本, 起始段落, 结束段落)]。
     """
     texts = parsed.get("texts") or []
-    heading_re = re.compile(r"^\d+(?:\.\d+){0,3}\.?(?=[\u4e00-\u9fa5\s])")
+    heading_re = re.compile(
+        r"^\d+(?:\.\d+){0,3}\.?(?!年|月|日)(?=[\u4e00-\u9fa5\s])")
     chunks = []
     cur_start = 0
     cur_lines = []
@@ -2119,7 +2120,7 @@ def _strip_section_no(title: str) -> str:
     """
     t = str(title or "")
     # 常规：章节号后是空格或非数字（3.4.2.7 59#墩 / 3.4.2.7上游…）
-    t2 = re.sub(r"^\d+(?:\.\d+){0,3}(?![.\d#])\s*", "", t)
+    t2 = re.sub(r"^\d+(?:\.\d+){0,3}(?![.\d#/])\s*", "", t)
     if t2 != t:
         return t2
     best, best_dun = None, ""
@@ -2167,6 +2168,10 @@ def _position_from_title(title: str) -> str:
               "结果如下表", "结果", "如下表"):
         t = t.replace(w, "")
     t = re.sub(r"[\s：:。]+", "", t)
+    # 日期/报告期词不能当位置（如 “2025年第一季度风速监测…” -> 位置应为空，
+    # 由图例表/节标题回推，而不是把“年第一季度”当监测部位）
+    t = re.sub(r"(?:\d{4}年|第[一二三四1-4]季度|本季度|年度|季度|年(?=第)|"
+               r"\d{1,2}月(?=\d{1,2}月)|(?<=\d)\d{1,2}月)", "", t)
     t = t.rstrip("表")  # 表标题末尾的“表”字（如 …监测统计表）
     t = t.strip("、，,和及")
     return t if len(t) >= 2 else ""
@@ -2181,17 +2186,27 @@ def _cell_position_from_title(title: str) -> str:
         “随州侧边跨跨中截面环境温度监测统计” -> “随州侧边跨跨中截面”
     """
     t = _strip_section_no(title)
-    for w in ("结构温度监测", "环境温度监测", "环境湿度监测", "应变监测",
-              "挠度监测", "位移监测", "倾角监测", "振动监测", "地震监测",
-              "索力监测", "裂缝监测", "风速监测", "风向监测",
-              "支座位移监测", "结构应变监测", "结构振动监测",
-              "时程曲线图", "频率分布直方图", "监测统计", "监测数据",
-              "监测结果", "统计结果", "如下表", "监测", "统计",
-              "结果", "数据分析", "平均温度", "最高温度", "最低温度",
-              "最大温差", "平均应变", "最大应变", "最小应变",
-              "最大应变差", "平均", "最高", "最低", "最大", "最小",
-              "差值", "剔除温度", "相关性系数", "均方根", "标准差"):
-        t = t.replace(w, "")
+    _words = (
+        "新增系统", "原有系统", "新增", "原有",
+        "结构温度监测", "环境温度监测", "环境湿度监测", "应变监测",
+        "挠度监测", "位移监测", "倾角监测", "振动监测", "地震监测",
+        "索力监测", "裂缝监测", "风速监测", "风向监测",
+        "支座位移监测", "结构应变监测", "结构振动监测",
+        "空间变位监测", "锚碇偏位", "索塔偏位", "塔偏位",
+        "空间变位", "偏位", "变位",
+        "结构温度", "环境温度", "环境湿度", "温度", "湿度",
+        "时程曲线图", "频率分布直方图", "曲线图", "直方图",
+        "如下图所示", "如下表", "如下",
+        "监测统计", "监测数据", "监测结果", "统计结果",
+        "监测", "统计", "结果", "数据分析",
+        "平均温度", "最高温度", "最低温度",
+        "最大温差", "平均应变", "最大应变", "最小应变",
+        "最大应变差", "平均", "最高", "最低", "最大", "最小",
+        "差值", "剔除温度", "相关性系数", "均方根", "标准差",
+    )
+    # 长词优先（支座位移监测 > 位移监测），避免短词先剥掉后残留“支座”等
+    t = re.sub("|".join(
+        re.escape(w) for w in sorted(_words, key=len, reverse=True)), "", t)
     t = re.sub(r"[\s：:。]+", "", t)
     t = t.rstrip("表")
     t = t.strip("、，,和及")
@@ -2307,7 +2322,8 @@ def _expand_chart_blocks(analysis: dict, cell_ref_paras: Dict[int, tuple],
                 t = str(texts[pi]) if 0 <= pi < len(texts) else ""
                 # 标题即使含“如下图所示”（如 “1/2主跨…结构温度时程曲线图、频率分布直方图如下图所示:”）
                 # 也是标题，应作为位置来源
-                if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*[^\d]", t.strip()):
+                if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*(?!年|月|日)[^\d]",
+                            t.strip()):
                     pos = _position_from_title(t)
                     if pos:
                         locations = [pos]
@@ -2327,7 +2343,8 @@ def _expand_chart_blocks(analysis: dict, cell_ref_paras: Dict[int, tuple],
             base_pos = ""
             for pi in range(p_min - 1, max(p_min - 6, -1), -1):
                 t = str(texts[pi]) if 0 <= pi < len(texts) else ""
-                if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*[^\d]", t.strip()):
+                if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*(?!年|月|日)[^\d]",
+                            t.strip()):
                     base_pos = _position_from_title(t)
                     if base_pos:
                         if "结构温度" in t:
@@ -2824,6 +2841,7 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     cell_ref_targets = {}     # paragraph index -> {pos: marker}
     vehicle_cell_targets = {} # paragraph index -> marker（整段替换）
     cell_seq_rows = {}        # (metric, table_letter, table_title, row_label) -> 已出现的行号集合
+    tbl_pos_seen = {}         # (表标题, metric) -> 本表已推断出的位置基座（同表多行复用）
     cell_ref_paras: Dict[int, tuple] = {}   # paragraph -> (表标题, row_label)，用于图表占位符位置推断
     # bare_caption 图题文本段（仅做识别提示，不替换为占位符；由 build_report 阶段补上编号图注）
     bare_caption_paras: set = set()
@@ -2882,7 +2900,8 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
     _texts_all = analysis.get("texts", []) or []
     heading_paras = [
         i for i, t in enumerate(_texts_all)
-        if re.match(r"^\d+(?:\.\d+){0,3}\.?(?=[\u4e00-\u9fa5\s])", str(t).strip())
+        if re.match(r"^\d+(?:\.\d+){0,3}\.?(?!年|月|日)"
+                    r"(?=[\u4e00-\u9fa5\s])", str(t).strip())
         and len(str(t).strip()) <= 60
     ]
 
@@ -2939,14 +2958,36 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
             table_title_ctx = str(ct.get("table_title") or "")
             if row_label and not column_from_map:
                 base_pos = _cell_position_from_title(table_title_ctx)
+                # “塔梁交接处支座位移监测统计”这类标题，剥掉“位移监测”后
+                # 只剩“塔梁交接处”；行标签是“君山侧测点N”时会拼成
+                # “塔梁交接处君山侧测点N”，解析时容易错配到同名主体的
+                # GNSS 上游/下游位置。把实体词“支座”保留在位置基座里，
+                # 生成“塔梁交接处支座君山侧测点N”，保证命中 WY 支座传感器。
+                if (base_pos and "塔梁交接处" in table_title_ctx
+                        and "支座" in table_title_ctx
+                        and "支座" not in base_pos):
+                    base_pos += "支座"
                 rn = _norm(row_label)
                 loc_words = ("截面", "箱梁", "墩", "跨", "断面", "梁段",
-                             "索塔", "塔", "锚固", "桥面")
+                             "索塔", "塔", "锚固", "桥面",
+                             "主梁", "锚碇", "索鞍", "塔冠", "塔底",
+                             "边跨", "跨中", "桥面板", "钢桁", "横梁",
+                             "下横梁", "桥塔", "伸缩缝", "支座", "梁端",
+                             "索夹", "散索鞍")
+                base_loc_words = loc_words + (
+                    "主梁", "锚碇", "索鞍", "塔冠", "塔底", "边跨",
+                    "跨中", "桥面板", "钢桁", "横梁", "桥塔", "伸缩缝",
+                )
                 has_loc = any(w in rn for w in loc_words)
                 if not has_loc:
-                    # 行标签只是“顶板测点1/底板测点3/测点2”时拼位置基座
-                    if base_pos:
+                    # 行标签只是“顶板测点1/底板测点3/测点2”时拼位置基座；
+                    # 基座必须是正经位置词（含 截面/跨/桥面/索塔 等），
+                    # 避免把“新增结构温度监测统计”剥出来的“新增”之类
+                    # 系统前缀拼成“新增测点1”伪位置。
+                    if base_pos and any(w in base_pos for w in base_loc_words):
                         column = base_pos + row_label
+                        tbl_pos_seen[(table_title_ctx, metric)] = base_pos
+                        tbl_pos_seen[("", metric)] = base_pos
                     else:
                         # 表格标题太泛（如“结构温度监测统计”）时，
                         # 从上方最近的小节标题继承位置
@@ -2971,9 +3012,21 @@ def annotate_docx(src: str, dst: str, llm_cfg: Optional[dict] = None,
                                                 _t.strip()):
                                     continue
                                 _bp = _cell_position_from_title(_t)
-                                if _bp:
+                                if _bp and any(
+                                        w in _bp for w in base_loc_words):
                                     column = _bp + row_label
+                                    tbl_pos_seen[(table_title_ctx, metric)] = _bp
+                                    tbl_pos_seen[("", metric)] = _bp
                                     break
+                    # 同一张表内前面的行已推断出位置基座时复用，避免同一表格
+                    # 前半段带位置、后半段变成裸“测点N”（如 新增结构温度表
+                    # 前 7 行正常、后 9 行丢位置）。
+                    if (not has_loc
+                            and not any(w in column for w in loc_words)
+                            and re.match(r"^测点\s*\d+$", rn)
+                            and (table_title_ctx, metric) in tbl_pos_seen):
+                        column = tbl_pos_seen[(table_title_ctx, metric)] \
+                            + row_label
                 else:
                     # 行标签已有位置，标题带方位且行标签缺方位时补方位
                     for side in ("上游", "下游", "左侧", "右侧", "左", "右"):
@@ -3560,7 +3613,7 @@ STATIC_NUMBER_RE = re.compile(
     r"\d+\s*N\s*·?\s*m\b|"                                        # 单值 N·m（扭矩阈值）
     r"\d+\s*m\s*处|"                                              # 30m处（监测位置）
     r"(?<![\d.])\d+\s*/\s*\d+(?=\s*(?:主跨|跨中|边跨|跨|桥面|断面|截面|钢桁|箱梁|处))|"  # 1/2主跨、1/4处、2/4跨
-    r"^\d+(?:\.\d+){0,3}\.?(?=[\u4e00-\u9fa5\s])"              # 节标题编号（4.监测结论 / 3.5.1梁端倾角…）
+    r"^\d+(?:\.\d+){0,3}\.?(?!年|月|日)(?=[\u4e00-\u9fa5\s])"  # 节标题编号（4.监测结论 / 3.5.1梁端倾角…）
 )
 LOCATION_SPAN_RE = STATIC_NUMBER_RE
 
@@ -3583,7 +3636,8 @@ def _protect_static_numbers(parsed: dict) -> int:
         # 节标题整体保护：编号标题（3.3.1.2  2/4跨主梁截面挠度监测）里的数字
         # 都是位置/编号（跨号、墩号、1/4、30m 等），一律不替换。
         # 年份/季度若出现在标题里，由文本替换（text_replacements）另行处理，不受影响。
-        if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*[\u4e00-\u9fa5A-Za-z#\d]", p_text):
+        if re.match(r"^\d+(?:\.\d+){0,3}\.?\s*(?!年|月|日)"
+                    r"[\u4e00-\u9fa5A-Za-z#\d]", p_text):
             num["verdict"] = "keep"
             num["confidence"] = 0.95
             num["reasons"].append("节标题数字整体保护")

@@ -1,212 +1,21 @@
 {
-  "template": "templates/洞庭湖大桥_template_v1.docx",
-  "output_dir": "outputs",
+  "template": "templates/洞庭湖大桥_template_v5.docx",
+  "output_dir": ".\\outputs\\reports",
   "source_report": "inputs/洞庭湖大桥.docx",
-  "report": {
-    "name_prefix": "",
-    "with_timestamp": true
-  },
-  "data": {
-    "file": "data/temperature_daily.csv",
-    "date_column": "date",
-    "value_columns": [
-      "temperature",
-      "humidity"
-    ],
-    "thresholds": [
-      30,
-      35
-    ],
-    "strict_mode": false
-  },
-  "data_sources": {
-    "temperature": {
-      "file": "data/temperature_daily.csv",
-      "date_column": "date",
-      "value_columns": [
-        "temperature"
-      ],
-      "label": "环境温度",
-      "unit": "℃"
-    },
-    "humidity": {
-      "file": "data/temperature_daily.csv",
-      "date_column": "date",
-      "value_columns": [
-        "humidity"
-      ],
-      "label": "环境湿度",
-      "unit": "%"
-    },
-    "cable_clamp": {
-      "file": "data/cable_clamp.csv",
-      "date_column": "date",
-      "value_columns": [
-        "h_87L_1",
-        "h_87R_1",
-        "h_88L_1",
-        "h_88R_1",
-        "h_87L_2",
-        "h_87R_2",
-        "h_88L_2",
-        "h_88R_2"
-      ],
-      "label": "索夹滑动位移",
-      "unit": "mm"
-    },
-    "rotation": {
-      "file": "data/rotation.csv",
-      "date_column": "date",
-      "value_columns": [
-        "m_junshan_x",
-        "m_junshan_y",
-        "m_yueyang_x",
-        "m_yueyang_y"
-      ],
-      "label": "梁端转角",
-      "unit": "°"
-    },
-    "wind_speed": {
-      "file": "data/wind_speed.csv",
-      "date_column": "date",
-      "value_columns": [
-        "j_junshan_top",
-        "j_yueyang_top",
-        "j_half_upstream",
-        "j_half_downstream",
-        "j_10min_avg"
-      ],
-      "label": "风速",
-      "unit": "m/s"
-    },
-    "vehicle_count": {
-      "file": "data/vehicle_count.csv",
-      "date_column": "date",
-      "value_columns": [
-        "lane_1",
-        "lane_2",
-        "lane_3",
-        "lane_4",
-        "lane_5",
-        "lane_6"
-      ],
-      "label": "交通荷载",
-      "unit": "辆"
-    }
-  },
-  "llm": {
-    "enabled": true,
-    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "api_key": "",
-    "model": "qwen-plus",
-    "review_low": 0.38,
-    "review_high": 0.68,
-    "timeout": 300,
-    "batch_size": 20
-  },
-  "charts": {
-    "engine": "python",
-    "output_dir": "outputs/charts",
-    "width_inches": 5.8,
-    "definitions": [
-      {
-        "id": "trend",
-        "type": "line",
-        "title": "温度变化趋势（逐日）",
-        "x_label": "日期",
-        "y_label": "温度（℃）",
-        "column": "temperature"
-      },
-      {
-        "id": "histogram",
-        "type": "histogram",
-        "title": "温度分布直方图",
-        "x_label": "温度（℃）",
-        "y_label": "天数",
-        "column": "temperature",
-        "bins": 10
-      },
-      {
-        "id": "daily_bars",
-        "type": "bar",
-        "title": "每日温度对比",
-        "x_label": "日期",
-        "y_label": "温度（℃）",
-        "column": "temperature"
-      },
-      {
-        "id": "boxplot",
-        "type": "boxplot",
-        "title": "温度分布箱线图",
-        "y_label": "温度（℃）",
-        "column": "temperature"
-      },
-      {
-        "id": "temp_hum_scatter",
-        "type": "scatter",
-        "title": "温度-湿度相关性散点图",
-        "x_label": "温度（℃）",
-        "y_label": "湿度（%）",
-        "x_column": "temperature",
-        "y_column": "humidity"
-      },
-      {
-        "id": "temp_distribution_pie",
-        "type": "pie",
-        "title": "温度区间占比",
-        "column": "temperature",
-        "bins": 5
-      },
-      {
-        "id": "temp_area",
-        "type": "area",
-        "title": "温度变化面积图",
-        "x_label": "日期",
-        "y_label": "温度（℃）",
-        "column": "temperature"
-      },
-      {
-        "id": "temp_hum_multi",
-        "type": "multi_line",
-        "title": "温度与湿度趋势对比",
-        "x_label": "日期",
-        "y_label": "数值",
-        "columns": [
-          "temperature",
-          "humidity"
-        ],
-        "series_labels": [
-          "温度（℃）",
-          "湿度（%）"
-        ]
-      }
-    ]
-  },
-  "schedule": {
-    "mode": "quarterly",
-    "start_date": "2026-01-01",
-    "weekday": 1,
-    "day_of_month": 1,
-    "hour": 8,
-    "minute": 0,
-    "use_apscheduler": true
-  },
-  "period": {
-    "weekly_days": 7,
-    "monthly_days": 30
-  },
-  "analysis_file": "outputs/analysis/analysis_洞庭湖大桥.json",
   "bridge_data": {
     "enabled": true,
     "bridge_name": "洞庭湖大桥",
     "stats_dir": "preprocess/统计值_2026.1~3/洞庭湖大桥",
     "charts_dir": "preprocess/图库_2026.1~3/洞庭湖大桥",
     "sensor_map": "preprocess/传感器对照/传感器编号名称.json",
-    "overview": "preprocess/统计值_2026.1~3/洞庭湖大桥/总览.json",
+    "overview": "preprocess/统计值_2026.1~3/洞庭湖大桥\\总览.json",
     "name_dict": "preprocess/传感器对照/传感器名称对照/洞庭湖大桥.json",
     "fuzzy_threshold": 0.7,
     "period_aggregate": true,
     "auto_fill_missing_charts": true,
+    "text_replace": {
+      "堡": "墩"
+    },
     "metrics": {
       "temperature": {
         "feature": "WSD(temp)",
@@ -216,10 +25,7 @@
       "structure_temperature": {
         "feature": "WD(temp)",
         "unit": "℃",
-        "label": "结构温度",
-        "aliases": [
-          "结构温度"
-        ]
+        "label": "结构温度"
       },
       "humidity": {
         "feature": "WSD(rh)",
@@ -232,14 +38,19 @@
         "label": "风速"
       },
       "cable_force": {
-        "feature": "",
+        "feature": "SL(sl)",
         "unit": "kN",
         "label": "索力"
       },
       "displacement": {
         "feature": "GNSS(Δx)",
         "unit": "mm",
-        "label": "位移"
+        "label": "空间变位"
+      },
+      "bearing_displacement": {
+        "feature": "WY(Δx)",
+        "unit": "mm",
+        "label": "支座位移"
       },
       "deflection": {
         "feature": "ND(nd)",
@@ -259,10 +70,15 @@
       "rotation": {
         "feature": "EZJD(xJd)",
         "unit": "°",
-        "label": "转角",
+        "label": "倾角",
         "aliases": [
           "倾角"
         ]
+      },
+      "earthquake_load": {
+        "feature": "DZJSD(xJsd)",
+        "unit": "m/s²",
+        "label": "地震"
       },
       "crack": {
         "feature": "LF(Δx)",
@@ -273,23 +89,45 @@
         "feature": "",
         "unit": "辆",
         "label": "交通荷载"
-      },
-      "bearing_displacement": {
-        "feature": "WY(Δx)",
-        "unit": "mm",
-        "label": "支座位移"
-      },
-      "earthquake_load": {
-        "feature": "DZJSD(xJsd)",
-        "unit": "m/s²",
-        "label": "地震"
       }
     },
     "sensor_exclude": [],
     "sensor_aliases": {},
-    "chart_map": {},
-    "text_replace": {
-      "堡": "墩"
-    }
+    "chart_map": {}
+  },
+  "report": {
+    "name_prefix": "洞庭湖大桥",
+    "with_timestamp": false
+  },
+  "llm": {
+    "enabled": true,
+    "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key": "",
+    "model": "qwen-plus",
+    "provider": "qwen",
+    "review_low": 0.38,
+    "review_high": 0.68,
+    "timeout": 300,
+    "batch_size": 20
+  },
+  "charts": {
+    "engine": "python",
+    "output_dir": "outputs\\charts",
+    "width_inches": 5.8,
+    "definitions": [],
+    "matlab": {}
+  },
+  "schedule": {
+    "mode": "quarterly",
+    "start_date": "",
+    "weekday": 1,
+    "day_of_month": 1,
+    "hour": 8,
+    "minute": 0,
+    "use_apscheduler": true
+  },
+  "period": {
+    "weekly_days": 7,
+    "monthly_days": 30
   }
 }

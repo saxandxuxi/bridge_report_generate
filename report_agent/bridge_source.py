@@ -42,6 +42,39 @@ from report_agent.config import resolve_bridge_subdir
 # 统一规范成 L/R/U/D，使“左跨中1/2截面”≈“跨中左幅1/2截面”）
 _SIDE_RE = re.compile(r"(上游侧|下游侧|左幅|右幅|左侧|右侧|上游|下游|左|右)")
 
+# 桥端/地点侧词（岳阳/君山/湘潭/随州/炎陵/汝城/矮寨/吉首/茶洞/赤石 等）：
+# 在位置名中可能前后调换（“岳阳侧伸缩缝处”==“伸缩缝处岳阳侧”），
+# 匹配时从主体剥离、单独比较地点集合。
+_SITE_WORDS = (
+    "岳阳侧", "君山侧", "湘潭侧", "随州侧", "炎陵侧", "汝城侧",
+    "矮寨侧", "吉首侧", "茶洞侧", "赤石侧",
+    "岳阳", "君山", "湘潭", "随州", "炎陵", "汝城",
+    "矮寨", "吉首", "茶洞", "赤石",
+)
+_SITE_CODE = {
+    "岳阳": "YY", "君山": "JS", "湘潭": "XT", "随州": "SZ",
+    "炎陵": "YL", "汝城": "RC", "矮寨": "AZ", "吉首": "JSH",
+    "茶洞": "CD", "赤石": "CS",
+}
+_SITE_RE = re.compile("|".join(
+    re.escape(w) for w in sorted(_SITE_WORDS, key=len, reverse=True)))
+
+
+def _site_set(s: str) -> set:
+    """返回位置名里的桥端地点码集合（岳阳=YY、君山=JS…）。"""
+    codes = set()
+    for w in _SITE_RE.findall(str(s or "")):
+        for k, code in _SITE_CODE.items():
+            if k in w:
+                codes.add(code)
+                break
+    return codes
+
+
+def _strip_sites(s: str) -> str:
+    """剥掉桥端地点词，仅保留主体（“伸缩缝处岳阳侧”->“伸缩缝处”）。"""
+    return _SITE_RE.sub("", str(s or ""))
+
 
 def _side_set(s: str) -> set:
     """返回位置名里的方位码集合：左类=L、右类=R、上游=U、下游=D。"""
@@ -203,6 +236,13 @@ def _axis_inner(feature: str) -> str:
     return ""
 
 
+def _feature_code(feature: str) -> str:
+    """提取特征括号内编码（小写），如 WSD(temp)/WD(temp) -> temp、
+    GNSS(Δx)/WY(Δx) -> Δx；无括号取整体。用于同族回退比较。"""
+    m = re.search(r"\(([^)]+)\)$", str(feature or ""))
+    return (m.group(1) if m else str(feature or "")).strip().lower()
+
+
 # 默认指标 -> 特征名（可在 config.bridge_data.metrics 中覆盖）
 DEFAULT_METRIC_FEATURES = {
     "temperature": "WSD(temp)",
@@ -266,7 +306,18 @@ def _position_similarity(a: str, b: str) -> float:
     # 覆盖度 = 公共子序列长度 / 较长串长度（0~1）。不能用 2*，否则近似
     # 匹配（如 “59#墩墩顶截面上游”）会超过精确匹配的 1.0，把精确位置挤掉。
     cover = float(lcs) / max(len(na), len(nb))
-    return max(ratio, cover)
+    score = max(ratio, cover)
+    # 端侧词词序不同（塔梁交接处岳阳侧 vs 岳阳侧塔梁交接处支座）时，
+    # SequenceMatcher 把端侧词当主体的一部分打低分；先剥掉端侧/方位词
+    # 比较主体并给同端加分（与 _match_position 的语义一致）。
+    if _site_set(na) or _site_set(nb):
+        _ba = _strip_sites(_SIDE_RE.sub("", na))
+        _bb = _strip_sites(_SIDE_RE.sub("", nb))
+        _sa, _sb = _site_set(na), _site_set(nb)
+        if _ba and _bb and _sa == _sb and _sa:
+            _body_r = SequenceMatcher(None, _ba, _bb).ratio()
+            score = max(score, min(1.0, _body_r + 0.12))
+    return score
 
 
 _LOC_METRIC_SUFFIXES = (
@@ -773,13 +824,19 @@ class BridgeData:
                 return sid
         return None
 
-    def _sensors_at_position(self, pos: str, metric: str) -> List[str]:
+    def _sensors_at_position(self, pos: str, metric: str,
+                             _visiting: Optional[set] = None) -> List[str]:
         """返回某监测部位中支持该指标的传感器编号（按名称对照顺序）。
 
         指标有特征时按特征编码过滤；无特征时按“类别”过滤（如 挠度/应变/风荷载），
         避免同一位置混装多种传感器时取错（如 5#塔梁交接处主梁 同时有结构温度/应变/挠度）。
         """
         key = _norm(pos)
+        if _visiting is None:
+            _visiting = set()
+        if key in _visiting:
+            return []
+        _visiting.add(key)
         key_sides = _side_set(key)
         # 精确键优先：先只按精确键过滤，命中该指标的传感器就直接返回，
         # 避免“跨中1/2截面”把“跨中1/2截面上游/下游”等带方位变体并进来
@@ -811,17 +868,34 @@ class BridgeData:
                         sids.append(sid)
             if cat_sids:
                 sids = cat_sids
+            if not sids and feat:
+                # 同位置特征族回退：temperature(WSD(temp)) 表所在位置若只有
+                # structure_temperature(WD(temp)) 传感器（如 索塔塔底），
+                # 按括号内编码 temp 命中，避免“跳到别的位置的 WSD 传感器”
+                # 导致塔底行填成塔冠值。
+                _inner = _feature_code(feat)
+                if _inner:
+                    for e in entries:
+                        sid = str(e.get("编号", ""))
+                        if not sid or self._is_excluded(sid) \
+                                or sid in sids:
+                            continue
+                        feats = [str(x) for x in
+                                 (e.get("特征编码") or [])]
+                        if any(_feature_code(f) == _inner for f in feats):
+                            sids.append(sid)
             return sids
 
         sids = _filter_entries(entries)
         if not sids:
             # 精确键未命中该指标传感器：模糊/方位顺序无关合并
+            key_sites = _site_set(key)
             for k, v in self.name_dict.items():
                 kn = _norm(k)
                 ok = (kn == key
                       or (len(key) >= 2 and key in kn)
                       or (len(kn) >= 2 and kn in key))
-                if not ok and key_sides:
+                if not ok:
                     # 方位词顺序不同（如 跨中1/2截面左幅 vs 跨中左幅1/2截面）：
                     # 去掉方位词后相同、且双方方位一致才匹配
                     skey = _SIDE_RE.sub("", key)
@@ -829,9 +903,22 @@ class BridgeData:
                     if (skey and skn and skey == skn
                             and _side_set(kn) == key_sides):
                         ok = True
+                if not ok:
+                    # 桥端地点词顺序不同（岳阳侧伸缩缝处 vs 伸缩缝处岳阳侧）：
+                    # 主体（再去掉方位词）相同、地点/方位集合一致才匹配
+                    tkey = _strip_sites(_SIDE_RE.sub("", key))
+                    tkn = _strip_sites(_SIDE_RE.sub("", kn))
+                    if (tkey and tkn and tkey == tkn
+                            and _site_set(kn) == key_sites
+                            and _side_set(kn) == key_sides):
+                        ok = True
                 if ok and key_sides:
                     # 位置带方位时，候选键必须带相同方位
                     if _side_set(kn) != key_sides:
+                        ok = False
+                if ok and key_sites:
+                    # 位置带桥端地点时，候选键必须带相同地点（岳阳≠君山）
+                    if _site_set(kn) != key_sites:
                         ok = False
                 if not ok:
                     continue
@@ -930,16 +1017,36 @@ class BridgeData:
             # 按相似度在全部位置里找有该指标传感器的相近位置，避免振动/
             # 温度等指标因位置名差异取不到数据。
             feat = self.metrics.get(metric, {}).get("feature", "")
+            key_sites = _site_set(key)
+            key_body = _strip_sites(_SIDE_RE.sub("", key))
             best_pos, best_score = None, 0.0
             for cand, entries2 in self.name_dict.items():
                 cand_n = _norm(cand)
-                sc = difflib.SequenceMatcher(None, key, cand_n).ratio()
+                # 查询带明确上游/下游/左/右时，不允许跨侧替身
+                # （如 上游无风速传感器时填成 下游 1403 造成两行同值）
+                if key_sides and _side_set(cand_n) != key_sides:
+                    continue
+                cand_body = _strip_sites(_SIDE_RE.sub("", cand_n))
+                sc = difflib.SequenceMatcher(None, key_body, cand_body).ratio()
+                cand_sites = _site_set(cand)
+                if cand_sites and cand_sites == key_sites:
+                    sc += 0.12
+                elif key_sites:
+                    sc -= 0.2
                 if sc <= best_score:
                     continue
                 has_feat = False
                 for e in entries2 or []:
                     feats2 = [str(x) for x in (e.get("特征编码") or [])]
                     if feat and feat in feats2:
+                        has_feat = True
+                        break
+                    # 同位置特征族回退（内码相同即可，忽略 WSD/WD、GNSS/WY
+                    # 等模块前缀）：如 支座位移表写 displacement，实际该位置
+                    # 只有 WY(Δx) 传感器；温度表写 temperature、位置只有 WD(temp)
+                    if feat and any(
+                            f and _feature_code(f) == _feature_code(feat)
+                            for f in feats2):
                         has_feat = True
                         break
                     if (not feat and cat and e.get("特征") == cat):
@@ -951,7 +1058,8 @@ class BridgeData:
                 if has_feat:
                     best_pos, best_score = cand, sc
             if best_pos is not None and best_score >= 0.6:
-                return self._sensors_at_position(best_pos, metric)
+                return self._sensors_at_position(best_pos, metric,
+                                                 _visiting=_visiting)
         if not sids:
             # 名称对照特征编码与实际统计库不一致（如对照表 DZJSD、
             # 实际 SZJSD）时，按实际统计库特征收集该位置的传感器。
@@ -973,6 +1081,39 @@ class BridgeData:
                     hit = True
                 if hit and str(sid) not in sids:
                     sids.append(str(sid))
+        if not sids:
+            # 位移类指标同族回退：同一位置可能混装 GNSS/WY 位移计，
+            # 模板把指标写错时（如 伸缩缝支座位移 的图表占位符写成
+            # displacement，实际数据是 bearing_displacement/WY(Δx)）
+            # 仍能取到传感器，避免“有图有数据却匹配不上”。
+            alts = {"displacement": ("bearing_displacement",),
+                    "bearing_displacement": ("displacement",),
+                    # 环境温度表常把 结构温度(WD(temp)) 的测点行当成
+                    # temperature(WSD(temp))：位置上有 WD 而无 WSD 时，
+                    # 先按同位置结构温度特征取数，而不是跳到别的位置的
+                    # 环境温度传感器（如 索塔塔底 错取 索塔塔冠 1231）。
+                    "temperature": ("structure_temperature",),
+                    }.get(metric, ())
+            if alts:
+                for alt in alts:
+                    if alt == metric or alt not in self.metrics:
+                        continue
+                    am = self.metrics.get(alt) or {}
+                    af = str(am.get("feature", "") or "")
+                    ag = feature_group(af) if af else ""
+                    if not af and not ag:
+                        continue
+                    for e in entries:
+                        sid = str(e.get("编号", ""))
+                        if not sid or self._is_excluded(sid):
+                            continue
+                        feats2 = [str(x) for x in (e.get("特征编码") or [])]
+                        if not feats2:
+                            continue
+                        if (af and af in feats2) or (ag and any(
+                                feature_group(f) == ag for f in feats2)):
+                            if sid not in sids:
+                                sids.append(sid)
         return sids
 
     def _axis_features_at_position(self, pos: str, metric: str) -> List[str]:
@@ -983,12 +1124,22 @@ class BridgeData:
         只返回括号内编码属于轴集合的特征；无轴分量返回空列表。
         """
         key = _norm(pos)
+        key_sites = _site_set(key)
+        key_sides = _side_set(key)
         entries = self.name_dict.get(key) or []
         if not entries:
             for k, v in self.name_dict.items():
                 kn = _norm(k)
-                if kn == key or (len(key) >= 2 and key in kn) \
-                        or (len(kn) >= 2 and kn in key):
+                ok = (kn == key or (len(key) >= 2 and key in kn)
+                      or (len(kn) >= 2 and kn in key))
+                if not ok:
+                    # 桥端地点词/方位词顺序不同时按主体比较
+                    tk = _strip_sites(_SIDE_RE.sub("", key))
+                    tn = _strip_sites(_SIDE_RE.sub("", kn))
+                    ok = (tk and tn and tk == tn
+                          and _site_set(kn) == key_sites
+                          and _side_set(kn) == key_sides)
+                if ok:
                     entries = list(v)
                     break
         feat = self.metrics.get(metric, {}).get("feature", "")
@@ -1689,9 +1840,9 @@ class BridgeData:
         return text
 
     def build_traffic_summary(self, period: Dict) -> str:
-        """交通荷载小结：车道1~4 的 数值(辆)/比例(%)。"""
+        """交通荷载小结：按实际车道数（车道1~N）输出 数值(辆)/比例(%)。"""
         parts = []
-        for ln in ("车道1", "车道2", "车道3", "车道4"):
+        for ln in self._traffic_lane_names():
             st = self._traffic_lane_stat(ln)
             if not st:
                 continue
@@ -1704,6 +1855,33 @@ class BridgeData:
                 txt += f"（占比{float(ratio):.1f}%）"
             parts.append(txt)
         return "、".join(parts) + "。" if parts else ""
+
+    def _traffic_lane_names(self) -> List[str]:
+        """位置统计/交通荷载/交通荷载.json 里实际存在的 车道N 键（升序）。
+
+        不同桥车道数不同（矮寨 4、洞庭湖 6…），不写死 车道1~4。
+        """
+        out = []
+        if not self.stats_dir:
+            return out
+        p = os.path.join(self.stats_dir, "位置统计",
+                         "交通荷载", "交通荷载.json")
+        if not os.path.isfile(p):
+            return out
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:  # noqa: BLE001
+            return out
+        nums = set()
+        for _pos, points in (data or {}).items():
+            if not isinstance(points, dict):
+                continue
+            for k in points:
+                m = re.search(r"车道\s*(\d+)", str(k))
+                if m:
+                    nums.add(int(m.group(1)))
+        return [f"车道{i}" for i in sorted(nums)]
 
     def _feature_for_metric(self, metric: str, period: Dict) -> str:
         """返回该指标在季度/年度统计里的实际特征键。
@@ -2338,8 +2516,52 @@ class BridgeData:
                    or (code == "s" and module.upper().startswith("FSFX")))
         if zero_ok:
             return False
-        if abs(mx - mn) <= 1e-9:
+        span = abs(mx - mn)
+        if span <= 1e-9:
             return True
+        # “近恒值”：整季只有微幅噪声（如温度卡在 15.000±0.06、应变卡在
+        # 1.000±0.0005），本质也是传感器故障/未接入。按特征给不同阈值，
+        # 避免把健康的小波动测点（索力/位移/倾角等）误判；正常温度/湿度/
+        # 应变测点一个季度内的总变化都远大于这些阈值。
+        near_const_thr = {
+            "temp": 0.5,   # ℃：正常测点季度温差 >0.5℃
+            "rh": 0.5,     # %：正常湿度测点季度变化 >0.5%
+            "rsg": 0.5,    # με：正常应变测点季度变化 >0.5με
+        }.get(code, 0.0)
+        if near_const_thr > 0.0 and span <= near_const_thr:
+            return True
+        return False
+
+    @staticmethod
+    def _gross_faulty(fstats: Dict, feature: str) -> bool:
+        """统计库为旧版本、未清洗时整季极值严重超出物理范围（如湿度 5.2e8、
+        温度 -82.7℃）的故障测点：读取阶段直接视为无效（整行“—”），
+        避免把不可能值填进报告/结论。正常统计库（已清洗）不会触发。"""
+        if not isinstance(fstats, dict):
+            return False
+        try:
+            mx = float(fstats.get("最大值"))
+            mn = float(fstats.get("最小值"))
+        except (TypeError, ValueError):
+            return False
+        code = _feature_code(feature)
+        if code == "rh":
+            return mx > 100.0 or mn < -10.0
+        if code == "temp":
+            return mx > 80.0 or mn < -45.0
+        if code == "spfs":
+            return mx > 100.0 or mn < 0.0
+        if code == "szfs":
+            return mx > 60.0 or mn < -60.0
+        # 平均值不在 [最小值, 最大值] 内（如 平均121 > 最大100）：
+        # 统计口径自相矛盾，视为故障测点，整行“—”
+        try:
+            av = float(fstats.get("平均值"))
+            tol = 1e-6 * max(abs(mx), abs(mn), 1.0)
+            if av < mn - tol or av > mx + tol:
+                return True
+        except (TypeError, ValueError):
+            pass
         return False
 
     def _feature_stats(self, sensor_id: str, metric: str, feature: str = "") -> Optional[Dict]:
@@ -2425,9 +2647,10 @@ class BridgeData:
                      feature: str = "") -> Optional[float]:
         """读取单个传感器（可指定特征）在报告期内的统计值。"""
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
-        if fstats and self._constant_faulty(
-                fstats, feature or self.metrics.get(metric, {}).get("feature", "")):
-            # 恒值传感器视为故障/无效：整行填“—”，不参与聚合
+        _feat = feature or self.metrics.get(metric, {}).get("feature", "")
+        if fstats and (self._constant_faulty(fstats, _feat)
+                       or self._gross_faulty(fstats, _feat)):
+            # 恒值/严重超物理范围的传感器视为故障/无效：整行填“—”
             return None
         if not fstats:
             return self._aggregate_sensor_stat(sensor_id, metric, stat,
@@ -2460,9 +2683,10 @@ class BridgeData:
                      feature: str = "") -> Optional[Dict]:
         """单个传感器统计 + 数据来源明细；读不到返回 None。"""
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
-        if fstats and self._constant_faulty(
-                fstats, feature or self.metrics.get(metric, {}).get("feature", "")):
-            # 恒值传感器视为故障/无效：整行填“—”，不参与聚合
+        _feat = feature or self.metrics.get(metric, {}).get("feature", "")
+        if fstats and (self._constant_faulty(fstats, _feat)
+                       or self._gross_faulty(fstats, _feat)):
+            # 恒值/严重超物理范围的传感器视为故障/无效：整行填“—”
             return None
         if not fstats:
             v = self._aggregate_sensor_stat(sensor_id, metric, stat,
@@ -2639,21 +2863,31 @@ class BridgeData:
                     return w
             return ""
 
-        qd = _direction(query)
-        q_body = query.replace(qd, "") if qd else query
+        qn = _norm(query)
+        qd = _direction(qn)
+        q_sites = _site_set(qn)
+        q_body = _strip_sites(_SIDE_RE.sub("", qn))
         # 精确键优先：查询与候选完全一致时直接返回，避免无方位查询
         # （如“跨中1/2截面”）被“跨中1/2截面上游/下游”等带方位变体
         # 以相同相似度先遍历到而抢走（与 _sensors_at_position 的
         # 精确键优先策略一致）。
-        qn = _norm(query)
         for pos in positions:
             if _norm(pos) == qn:
                 return pos
         best, best_score = None, -1.0
         for pos in positions:
-            pd = _direction(pos)
-            body = pos.replace(pd, "") if pd else pos
-            score = difflib.SequenceMatcher(None, _norm(q_body), _norm(body)).ratio()
+            pn = _norm(pos)
+            pd = _direction(pn)
+            p_sites = _site_set(pn)
+            p_body = _strip_sites(_SIDE_RE.sub("", pn))
+            score = difflib.SequenceMatcher(None, q_body, p_body).ratio()
+            if q_sites or p_sites:
+                if q_sites and q_sites == p_sites:
+                    score += 0.18
+                elif q_sites and p_sites:
+                    score -= 0.30
+                elif q_sites and not p_sites:
+                    score -= 0.15
             if qd and pd:
                 score += 0.15 if qd == pd else -0.25
             elif qd and not pd:
@@ -2885,7 +3119,33 @@ class BridgeData:
                     if trace is not None:
                         trace.update({"branch": "测点映射表", "position": pos,
                                       "sensor_id": sid, "column": column})
-                    return self._sensor_stat(str(sid), metric, stat, period)
+                    v = self._sensor_stat(str(sid), metric, stat, period)
+                    if v is None and trace is not None:
+                        trace["_map_blocked"] = ("测点映射表", pos, str(sid))
+                    return v
+
+        # 1b) 结构温度/温度监测表（如“君山侧塔梁交接处钢桁梁温度监测统计”）：
+        #     与应变/振动一样按官方“测点映射”取传感器，避免依赖名称对照表里
+        #     传感器排列顺序（不同版本名称对照顺序不一致会导致行↔传感器错位）。
+        if (("结构温度" in t
+             or ("温度" in t and "环境" not in t and "湿度" not in t))
+                and "结构温度监测表" in self.point_map):
+            plans = self.point_map["结构温度监测表"]
+            # 标题里的“温度/结构温度监测统计”是表类型词，去掉后才是断面
+            # 位置（如“君山侧塔梁交接处钢桁梁温度监测统计”）。
+            _t_core = re.sub(r"(结构温度|温湿度|温度).*$", "", t)
+            found = self._point_plan_for_row(plans, _t_core, column, row_index)
+            if found:
+                pos, sid = found
+                if trace is not None:
+                    trace.update({"branch": "结构温度测点映射表",
+                                  "position": pos, "sensor_id": sid,
+                                  "column": column})
+                v = self._sensor_stat(str(sid), metric, stat, period,
+                                      feature="WD(temp)")
+                if v is None and trace is not None:
+                    trace["_map_blocked"] = ("结构温度测点映射表", pos, str(sid))
+                return v
 
         # 2) 梁端支座位移表：墩号 + 左/右
         if "位移" in t and "支座" in t and "梁端支座位移表" in self.table_map:
@@ -3150,6 +3410,26 @@ class BridgeData:
                                               row_index=row_index, trace=trace)
             if val is not None:
                 self._match_stats["table_map"] = self._match_stats.get("table_map", 0) + 1
+            elif trace.get("_map_blocked"):
+                # 官方测点映射已命中该传感器，但该传感器恒值/无统计：
+                # 整行填“—”，不回退到同位置其它传感器（否则坏点会串成
+                # 同位置其它测点的值，如 温度测点12 恒值 3296 被 3286 顶替）。
+                _blk = trace.pop("_map_blocked")
+                _br, _pos, _sid = _blk[0], _blk[1], _blk[2]
+                return None, {
+                    "占位符": f"cell.{metric}.{column}.{stat}",
+                    "结果": "未找到",
+                    "原因": f"测点 {column} 对应传感器({_sid})恒值或"
+                            f"无统计数据（官方测点映射命中），整行填“—”",
+                    "分支": _br,
+                    "监测部位": _pos,
+                    "表格标题": table_title,
+                    "表格行号": row_index + 1,
+                    "传感器": {
+                        "传感器编号": _sid,
+                        "监测部位": _pos,
+                    },
+                }
         # 1) 通用位置多传感器：column 为监测部位名时按表格行号取该位置第 N 个传感器
         if val is None:
             pos = self._match_position(column, list(self.name_dict.keys()))
@@ -3173,6 +3453,25 @@ class BridgeData:
                         if val is not None:
                             self._match_stats["name_dict"] = \
                                 self._match_stats.get("name_dict", 0) + 1
+                # 列名带明确轴向(X/Y向)时：该位置实际没有对应轴向数据
+                # （如转角只存 EZJD(xJd)），Y 行不许拿 X 值重复填充 → 整行“—”
+                if (val is None and axis_feats
+                        and re.search(r"[XY](?:向)?$", str(column))):
+                    _want = "y" if re.search(r"Y(?:向)?$", str(column)) \
+                        else "x"
+                    if not any(
+                            (_axis_inner(f) or "").lower().startswith(_want)
+                            for f in axis_feats):
+                        return None, {
+                            "占位符": f"cell.{metric}.{column}.{stat}",
+                            "结果": "未找到",
+                            "原因": f"测点 {column} 该位置无 {_want} 向轴数据"
+                                    f"，整行填“—”",
+                            "分支": "位置-轴特征按方向取",
+                            "监测部位": pos,
+                            "表格标题": table_title,
+                            "表格行号": row_index + 1,
+                        }
                 if val is None:
                     sids = self._sensors_at_position(pos, metric)
                     if sids:
@@ -3881,6 +4180,18 @@ class BridgeData:
                             best_score = score
                             best = pos
                 if best and best_score >= 0.70:
+                    # 同主体多候选时优先带实体词的位置（支座/伸缩缝/索夹/
+                    # 锚碇…）：如 “塔梁交接处君山侧” 应命中
+                    # “君山侧塔梁交接处支座(WY)”，而不是同主体的 GNSS
+                    # 空间变位 “君山侧塔梁交接处下游侧”。
+                    _preferred = ("支座", "伸缩缝", "索夹", "锚碇", "散索鞍")
+                    if not any(w in best for w in _preferred):
+                        for _p2 in cands:
+                            if any(w in _p2 for w in _preferred) \
+                                    and _site_set(_p2) == _site_set(best) \
+                                    and _position_similarity(lc, _p2) >= 0.70:
+                                best = _p2
+                                break
                     return metric, best, kind, n
         return None
 

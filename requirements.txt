@@ -12,3 +12,5 @@ paramiko>=3.4.0
 # traffic download (download_monitor_data.py) needs playwright;
 # after pip install, run once: playwright install chromium
 playwright>=1.40.0
+# tests
+pytest>=7.0

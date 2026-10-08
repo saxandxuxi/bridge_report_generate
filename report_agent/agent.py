@@ -453,20 +453,16 @@ class ReportAgent:
                             "sensor_id": sid,
                             "kind": kind,
                         })
+                        # 补齐图本身也可能是多面板拆分图（_2/_3.png），一并插入
+                        for _p in bridge.chart_siblings(png):
+                            extra_charts.setdefault(anchor, []).append({
+                                "path": _p,
+                                "caption": caption,
+                                "sensor_id": sid,
+                                "kind": kind,
+                            })
             log.info("缺图推断：%d 节存在缺图（自动补齐 %d 张）",
                      len(chart_gaps), sum(len(v) for v in extra_charts.values()))
-            # 拆分的多面板合并图(时间序列图_2.png / _3.png ...)：
-            # 在对应图表位置后一并插入，避免只有第一张进报告
-            for cid, png in list(chart_images.items()):
-                if not png:
-                    continue
-                for _p in bridge.chart_siblings(png):
-                    extra_charts.setdefault(cid, []).append({
-                        "path": _p,
-                        "caption": "",
-                        "sensor_id": chart_sensors.get(cid, ""),
-                        "kind": chart_kinds.get(cid, ""),
-                    })
             # 模板中额外的位置化图表占位符（如特殊应变 4#/5#墩底部），
             # 未出现在 analysis chart_texts 时按位置直接解析，避免“有占位无图”
             try:
@@ -538,6 +534,26 @@ class ReportAgent:
                 data_registry=data_registry,
                 period=period,
             )
+        # 拆分的多面板合并图/相关性图（时间序列图_2.png、频率分布图_2.png、
+        # 相关性_..._2.png …）：等“模板额外占位符”也解析完后统一补，
+        # 图库里有几张就插几张；caption 与首图一致，保证每张都有独立图号。
+        if bridge is not None:
+            for cid, png in list(chart_images.items()):
+                if not png:
+                    continue
+                base_caption = chart_captions.get(cid, "")
+                exist = {ex.get("path")
+                         for ex in extra_charts.get(cid, [])}
+                for _p in bridge.chart_siblings(png):
+                    if _p in exist:
+                        continue
+                    exist.add(_p)
+                    extra_charts.setdefault(cid, []).append({
+                        "path": _p,
+                        "caption": base_caption,
+                        "sensor_id": chart_sensors.get(cid, ""),
+                        "kind": chart_kinds.get(cid, ""),
+                    })
         for cid, png in chart_images.items():
             log.info("  图表 %s: %s", cid, png)
 
@@ -611,6 +627,11 @@ class ReportAgent:
                 f"{period['end'].strftime('%Y%m%d')}.docx"
             )
         out_path = os.path.join(self.cfg.get("output_dir", "outputs"), out_name)
+        # 同周期重复生成不覆盖旧文件：已存在时追加毫秒级时间戳
+        if os.path.exists(out_path):
+            _base, _ext = os.path.splitext(out_path)
+            _stamp = dt.datetime.now().strftime("%H%M%S%f")[:10]
+            out_path = f"{_base}_{_stamp}{_ext}"
         repair_stats = {}
         from .reviewer import ReportReviewer, _read_docx_text, self_check_report
         from .repairer import ReportRepairer
@@ -918,6 +939,10 @@ class ReportAgent:
         except Exception as exc:  # noqa: BLE001
             log.warning("模板小结段补全读取失败: %s", exc)
             return template_path
+        repaired_cols = self._repair_pseudo_cell_columns(doc, bridge)
+        if repaired_cols:
+            log.info("模板伪位置表格列修正 %d 处（新增测点N -> 真实监测部位）",
+                     repaired_cols)
 
         summary_metrics = {}   # 小结标题段索引 -> [metric]
         sections = []          # [(节标题指标, 节内占位符指标)]
@@ -996,7 +1021,7 @@ class ReportAgent:
         # 位置”固定句会与总结重复（如 3.2.3 的地震、结构温度），删除这些含
         # {{stats.<指标>.<统计>.loc}} 的分句，避免同一数据出现两遍。
         _strip_redundant_loc_clauses(doc)
-        if not added:
+        if not added and not repaired_cols:
             return template_path
         import tempfile as _tf
         fd, tmp_path = _tf.mkstemp(suffix=".docx",
@@ -1013,6 +1038,113 @@ class ReportAgent:
                 pass
             return template_path
         return tmp_path
+
+    def _repair_pseudo_cell_columns(self, doc, bridge) -> int:
+        """把表格里“新增测点N/新增位置N”这类伪占位列修正为真实监测部位。
+
+        伪列不像正经位置名词（如 “新增结构温度监测统计” 表的
+        cell.structure_temperature.新增测点1.avg），resolver 无法匹配统计库；
+        而该表所属小节上方通常有 {{chart.<metric>_<真实位置>_...}} 占位符，
+        用最近的同指标图表位置回填列名：
+          cell.structure_temperature.新增测点1.avg  ->
+          cell.structure_temperature.1/2主跨钢桁架桥面板.avg
+        找不到/有歧义时保留原占位符并告警，供 LLM/人工检查修复。
+        返回修正的占位符数量；不改动原始模板文件。
+        """
+        if doc is None or bridge is None:
+            return 0
+        try:
+            from .report_builder import iter_block_items
+        except Exception:  # noqa: BLE001
+            return 0
+        name_keys = list((bridge.name_dict or {}).keys())
+        blocks = list(iter_block_items(doc))
+        chart_re = re.compile(
+            r"\{\{chart\.([A-Za-z_]+)_(.*?)_(?:trend|histogram|scatter)"
+            r"(?:_\d+)?\}\}")
+        pseudo_re = re.compile(
+            r"\{\{cell\.([A-Za-z_]+)\.(新增|原有|原)"
+            r"(?:测点|位置|传感器)\s*(\d+)\.([a-zA-Z_]+)(?:#(\d+))?\}\}")
+        repaired = 0
+        unresolved = []
+        for bi, blk in enumerate(blocks):
+            if not hasattr(blk, "rows"):
+                continue
+            # 最近图表/上下文（同一节通常图在表前 10 段内）
+            ctx = []
+            for j in range(bi - 1, max(bi - 25, -1), -1):
+                bj = blocks[j]
+                if hasattr(bj, "rows"):
+                    continue
+                t = bj.text.strip() if hasattr(bj, "text") else ""
+                if t:
+                    ctx.append(t)
+                if len(ctx) >= 12:
+                    break
+            # 逐 cell 找伪列并回填
+            for row in blk.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        full = "".join(r.text for r in para.runs)
+                        if not full or ("新增" not in full
+                                        and "原有" not in full):
+                            continue
+                        fixed = list(full)
+                        changed = False
+                        for m in reversed(list(pseudo_re.finditer(full))):
+                            metric = m.group(1)
+                            pseudo_col = m.group(2) + "测点" + m.group(3)
+                            # 从后往前找最近的同指标 chart 位置
+                            pos = ""
+                            for t in ctx:
+                                if "chart" not in t:
+                                    continue
+                                for cm in chart_re.finditer(t):
+                                    if cm.group(1) != metric:
+                                        continue
+                                    cand = cm.group(2)
+                                    if not pos and cand:
+                                        pos = cand
+                            if not pos and name_keys:
+                                # 退一步：上下文里含真实位置词的表题句
+                                for t in ctx:
+                                    if "监测统计" not in t \
+                                            and "统计结果如下表" not in t:
+                                        continue
+                                    for k in sorted(
+                                            name_keys, key=len, reverse=True):
+                                        if k in t:
+                                            pos = k
+                                            break
+                                    if pos:
+                                        break
+                            if not pos:
+                                unresolved.append(
+                                    f"{pseudo_col}({metric})")
+                                continue
+                            new_tok = (f"{{{{cell.{metric}.{pos}."
+                                       f"{m.group(4)}"
+                                       + (f"#{m.group(5)}"
+                                          if m.group(5) else "")
+                                       + "}}")
+                            s, e = m.span()
+                            fixed[s:e] = list(new_tok)
+                            changed = True
+                            repaired += 1
+                            log.warning(
+                                "模板伪位置列 %s(%s) -> %s（依据同节 "
+                                "{{chart.%s_%s_...}} 回填）",
+                                pseudo_col, metric, pos, metric, pos)
+                        if changed:
+                            para.runs[0].text = "".join(fixed)
+                            for r in para.runs[1:]:
+                                r.text = ""
+        if unresolved:
+            log.warning(
+                "模板存在无法自动回填的伪位置列 %s，请人工/LLM 检查该节"
+                "表格位置名词（可能需在源文档中补位置列）",
+                "、".join(dict.fromkeys(unresolved)))
+        return repaired
 
     @staticmethod
     def _template_para_metric_prefixes(texts, bridge, period) -> set:
