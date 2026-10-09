@@ -6,7 +6,9 @@
 """
 import datetime as dt
 import importlib.util
+import json
 import os
+import re
 import tempfile
 import unittest
 
@@ -299,33 +301,76 @@ class GrossStatFaultTest(unittest.TestCase):
         self.assertTrue(BridgeData._gross_stat_fault(
             st, "WD(temp)", "range"))
 
-    def test_daily_recompute_drops_spike(self):
-        b = BridgeData({})
-        st = {"每日统计": [
-            {"最大值": 5602250.0, "最小值": -0.1, "平均值": 0.0},
-            {"最大值": 4.75, "最小值": -1.64, "平均值": 0.001},
-            {"最大值": 6.38, "最小值": -2.0, "平均值": 0.002},
-        ]}
-        v, note = b._daily_clean_extreme(st, "DZJSD(yJsd)", "max")
-        self.assertAlmostEqual(v, 6.38, places=6)
-        self.assertIn("清洗后重算", note)
-        v2, _ = b._daily_clean_extreme(st, "DZJSD(yJsd)", "range")
-        self.assertAlmostEqual(v2, 8.38, places=6)
+class StatDirectReadTest(unittest.TestCase):
+    """统计库有什么就填什么，没有就填“—”，报告不再二次判断。"""
 
-    def test_sibling_median_fallback(self):
-        b = BridgeData({})
-        b.sensors_for_metric = lambda m: ["a", "b", "c"]
-        data = {
-            "a": {"最大值": 2.0, "最小值": -1.0, "差值": 3.0},
-            "b": {"最大值": 4.0, "最小值": -2.0, "差值": 6.0},
-            "c": {"最大值": 5602250.0, "最小值": -0.1,
-                  "差值": 5602250.1},
-        }
-        b._feature_stats = lambda sid, metric, feature="": data[sid]
-        v, note = b._sibling_clean_extreme("vibration", "DZJSD(yJsd)",
-                                           "max")
-        self.assertAlmostEqual(v, 3.0, places=6)
-        self.assertIn("中位数", note)
+    def _bridge(self, tmp, stats_entry, sensor_id="636"):
+        pos = "汝城侧中跨1/4截面底板上游"
+        safe = re.sub(r'[\\/:*?"<>|]', "_", pos).strip()
+        d = os.path.join(tmp, "位置统计", safe)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "WD(temp).json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(stats_entry, f, ensure_ascii=False)
+        cfg = dict(json.load(open(
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "config",
+                "config_mishuihe.json"), encoding="utf-8"))["bridge_data"])
+        cfg["stats_dir"] = tmp
+        cfg["charts_dir"] = tmp
+        b = BridgeData(cfg)
+        b.load()
+        return b
+
+    @staticmethod
+    def _entry(**stats):
+        base = {"起始日期": "2026-07-01", "结束日期": "2026-09-30",
+                "覆盖天数": 90}
+        base.update(stats)
+        return {"汝城侧中跨1/4截面底板上游": {
+            "测点1": {"统计": base, "传感器编号": "636",
+                      "特征": "WD(temp)"}}}
+
+    def test_values_are_read_verbatim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._bridge(tmp, self._entry(平均值=19.066287, 最大值=20.75,
+                                              最小值=0.0, 差值=20.75))
+            period = {"start": dt.date(2026, 7, 1),
+                      "end": dt.date(2026, 9, 30), "label": "2026.7~9"}
+            got = {s: b._sensor_stat("636", "structure_temperature", s, period,
+                                     feature="WD(temp)")
+                   for s in ("平均温度", "最高温度", "最低温度", "最大温差")}
+            # 库里的原值原样回填（不做“极值可疑就改写/借别的测点”）
+            self.assertAlmostEqual(got["平均温度"], 19.066287, places=6)
+            self.assertAlmostEqual(got["最高温度"], 20.75, places=6)
+            self.assertAlmostEqual(got["最低温度"], 0.0, places=6)
+            self.assertAlmostEqual(got["最大温差"], 20.75, places=6)
+
+    def test_missing_stat_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._bridge(tmp, self._entry(平均值=19.0, 最大值=20.0))
+            period = {"start": dt.date(2026, 7, 1),
+                      "end": dt.date(2026, 9, 30), "label": "2026.7~9"}
+            self.assertIsNone(b._sensor_stat("636", "structure_temperature",
+                                             "最小值", period,
+                                             feature="WD(temp)"))
+            self.assertAlmostEqual(
+                b._sensor_stat("636", "structure_temperature", "平均值",
+                               period, feature="WD(temp)"), 19.0, places=6)
+
+    def test_stored_value_wins_over_daily_recompute(self):
+        """整体统计里有的字段直接回填，不再用每日明细“重算清洗”。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self._bridge(tmp, self._entry(
+                平均值=5.0e-4, 最大值=5602250.0, 最小值=-0.0975,
+                差值=5602250.1,
+                每日统计=[{"日期": "2026-07-01", "最大值": 4.75,
+                           "最小值": -1.64, "平均值": 0.0}]))
+            period = {"start": dt.date(2026, 7, 1),
+                      "end": dt.date(2026, 9, 30), "label": "2026.7~9"}
+            v = b._sensor_stat("636", "structure_temperature", "max", period,
+                               feature="WD(temp)")
+            self.assertAlmostEqual(v, 5602250.0, places=1)
 
 
 class SelfCheckPhysicsTest(unittest.TestCase):
@@ -612,6 +657,31 @@ class MissSevereThresholdTest(unittest.TestCase):
         f = self.bq.is_missing_severe
         self.assertFalse(f({"缺失小时数": 168, "缺失天数": 7}, "yearly"))
         self.assertTrue(f({"缺失小时数": 900, "缺失天数": 31}, "yearly"))
+
+    def test_report_missing_list_copies_quarterly_summary(self):
+        """缺失清单以季度总结为准，并按“≥7天/168h”复核（旧总结是 72h 口径）。"""
+        b = BridgeData({})
+        # 绕过“指标类别隔离”（单元测试里没有传感器对照表）
+        b._filter_pos_entries = lambda metric, pe: (pe, True)
+        pe = {"甲位置": {"测点1": {"统计": {"缺失小时数": 200,
+                                        "缺失天数": 8}}},
+              "乙位置": {"测点1": {"统计": {"缺失小时数": 72,
+                                        "缺失天数": 3}}}}
+        gs = {"数据缺失严重的传感器位置": ["甲位置", "乙位置",
+                                        "丙位置（无统计）"]}
+        _zero, _seg, miss = b._fault_positions(gs, pe, "WD(temp)",
+                                              "structure_temperature",
+                                              {"label": "2026.7~9"})
+        # 甲(≥168h) 保留；乙(72h，旧总结口径) 被复核掉；查不到的按总结保留
+        self.assertIn("甲位置", miss)
+        self.assertNotIn("乙位置", miss)
+        self.assertIn("丙位置（无统计）", miss)
+
+    def test_missing_label_says_over_seven_days(self):
+        b = BridgeData({})
+        self.assertIn("超过7天", b._miss_label(False))
+        self.assertIn("168h", b._miss_label(False))
+        self.assertIn("一个月", b._miss_label(True))
 
 
 class SensorMapParseTest(unittest.TestCase):

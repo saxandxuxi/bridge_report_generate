@@ -813,6 +813,19 @@ def main():
             json.dump(result, f, ensure_ascii=False, indent=2)
         print(f"[完成] 共 {done} 个特征 -> {out} "
               f"(用时 {time.time()-t0:.1f}s)")
+        # 缺失口径自检：列出“数据缺失严重的传感器位置”（≥168h/7天）
+        _miss = []
+        for _b in (result.get("桥") or {}).values():
+            for _fe, _fv in (_b or {}).items():
+                if not isinstance(_fv, dict):
+                    continue
+                for _p in ((_fv.get("全桥统计") or {})
+                           .get("数据缺失严重的传感器位置") or []):
+                    if _p not in _miss:
+                        _miss.append(_p)
+        print(f"  数据缺失超过7天(≥{_MISS_SEVERE_HOURS:.0f}h)的位置: "
+              f"{len(_miss)} 个" + ("（" + "、".join(_miss[:5]) + "）"
+                                   if _miss else ""))
         return
 
     # 年度统计: daily-root 传桥根目录, 汇总其下所有 daily_* 子目录

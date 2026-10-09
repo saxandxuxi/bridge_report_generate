@@ -1617,11 +1617,8 @@ class BridgeData:
                 for _pt, rec in pts.items():
                     if str(rec.get("传感器编号", "")) == str(sensor_id):
                         st = (rec.get("统计") or {})
-                        # 恒值故障（整季最大值==最小值，且非“0为正常值”特征）
-                        # 的回退聚合值必须排除，避免把 0℃ 故障当真实极值
-                        if self._constant_faulty(st, feat):
-                            break
-                        v = st.get(STAT_KEY_MAP.get(stat, stat))
+                        # 聚合库里有什么就填什么（不再按“疑似恒值”二次判断）
+                        v = self._full_period_stats(st, stat)
                         if v is not None:
                             break
             if v is None:
@@ -1631,9 +1628,7 @@ class BridgeData:
                     fe2 = pos.get(feat)
                     if isinstance(fe2, dict):
                         st = (fe2.get("统计") or {})
-                        if self._constant_faulty(st, feat):
-                            continue
-                        v = st.get(STAT_KEY_MAP.get(stat, stat))
+                        v = self._full_period_stats(st, stat)
             if v is not None:
                 return v
         return None
@@ -2249,9 +2244,8 @@ class BridgeData:
         if yearly:
             return "数据缺失一个月以上位置（缺失天数>30天）："
         thr = self._summary_miss_threshold()
-        return (f"数据缺失较多位置（缺失合计≥"
-                f"{format_report_number(thr / 24.0)}天/"
-                f"{format_report_number(thr)}h）：")
+        return (f"数据缺失超过{format_report_number(thr / 24.0)}天位置"
+                f"（缺失合计≥{format_report_number(thr)}h）：")
 
     @staticmethod
     def _cap_positions(items, cap: int = 5) -> str:
@@ -2361,14 +2355,55 @@ class BridgeData:
         zero_pos = _dedup(zero_pos)
         seg_pos = _dedup(seg_pos)
 
-        # 4) 数据缺失位置：只报缺失 ≥7 天（或达到配置阈值）的测点；
-        #    整日零星缺失不再进结论（图上橙色缺失带仍全画）。
-        #    summary_miss_hours 可配置（默认 168h）。
+        # 4) 数据缺失位置：**照抄季度/年度总结的清单**
+        #    （build_quarterly_stats 的 “数据缺失严重的传感器位置”，口径应为
+        #    缺失合计 ≥7 天/168h）。旧版本季度总结是按 72h 出的，直接抄会把
+        #    短时掉线又写回结论，所以用位置统计里的缺失小时数按 7 天口径复核
+        #    一遍；位置统计里查不到的位置（如完全无数据）按总结原样保留。
         miss_hours_thr = self._summary_miss_threshold()
         miss_pos = []
-        for pos, points in pos_entries.items():
+        for p in [str(x) for x in
+                  (gs.get("数据缺失严重的传感器位置") or []) if x]:
+            _sev = self._position_miss_severe(p, pos_entries, miss_hours_thr)
+            if _sev is None or _sev:
+                miss_pos.append(p)
+        # 旧库没有该键 → 按位置统计重算（同样 7 天口径）
+        if not (gs.get("数据缺失严重的传感器位置") or []):
+            for pos, points in pos_entries.items():
+                if not isinstance(points, dict):
+                    continue
+                for _pt, rec in points.items():
+                    st = (rec.get("统计") or {}) if isinstance(rec, dict) else {}
+                    try:
+                        mh = float(st.get("缺失小时数") or 0)
+                        md = float(st.get("缺失天数") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if mh >= miss_hours_thr or md >= 7:
+                        miss_pos.append(str(pos))
+                        break
+        # 补充完全无数据的监测部位（名称对照里属于该特征但统计库无记录）
+        for p in (self.abnormal_positions(metric, period) if metric else []):
+            if p not in miss_pos:
+                miss_pos.append(p)
+        miss_pos = _dedup(miss_pos)
+        return zero_pos, seg_pos, miss_pos
+
+    @staticmethod
+    def _position_miss_severe(pos: str, pos_entries: Dict,
+                              thr: float) -> Optional[bool]:
+        """某个位置是否达到“缺失严重”阈值（供复核季度总结清单用）。
+
+        统计库里查不到该位置时返回 None（无从复核，按总结原样保留）。
+        """
+        base = re.sub(r"（[^）]*）$", "", str(pos))
+        found, hit = False, False
+        for p, points in (pos_entries or {}).items():
+            if str(p) not in (base, str(pos)):
+                continue
             if not isinstance(points, dict):
                 continue
+            found = True
             for _pt, rec in points.items():
                 st = (rec.get("统计") or {}) if isinstance(rec, dict) else {}
                 try:
@@ -2376,15 +2411,9 @@ class BridgeData:
                     md = float(st.get("缺失天数") or 0)
                 except (TypeError, ValueError):
                     continue
-                if mh >= miss_hours_thr or md >= 7:
-                    miss_pos.append(str(pos))
-                    break
-        # 补充完全无数据的监测部位（名称对照里属于该特征但统计库无记录）
-        for p in (self.abnormal_positions(metric, period) if metric else []):
-            if p not in miss_pos:
-                miss_pos.append(p)
-        miss_pos = _dedup(miss_pos)
-        return zero_pos, seg_pos, miss_pos
+                if mh >= thr or md >= 7:
+                    hit = True
+        return hit if found else None
 
     def _metric_extreme(self, metric: str, stat: str, gs_key: str,
                         gs_loc_key: str, period: Dict, gs: Dict,
@@ -2805,117 +2834,7 @@ class BridgeData:
                 return True
         return False
 
-    @staticmethod
-    def _feature_limit(feature: str):
-        """特征物理量级上限（用于极值清洗/同族替代）。"""
-        code = _feature_code(feature)
-        if code == "rh":
-            return 100.0
-        if code == "temp":
-            return 75.0
-        if code == "spfs":
-            return 100.0
-        if code == "szfs":
-            return 60.0
-        if code.endswith("jsd") or code in ("xjsd", "yjsd", "zjsd"):
-            return 1000.0
-        if code == "rsg":
-            return 50000.0
-        if code in ("nd", "δx", "δy", "δz", "ax", "ay", "az"):
-            return 100000.0
-        return None
 
-    @staticmethod
-    def _stat_field(stat: str):
-        can = _canon_stat(STAT_KEY_MAP.get(stat, stat))
-        return {
-            "max": "最大值", "min": "最小值", "range": "差值",
-            "abs_max": "绝对最大值", "absmax": "绝对最大值",
-            "avg": "平均值", "rms": "均方根值",
-        }.get(can), can
-
-    def _daily_clean_extreme(self, fstats: Dict, feature: str, stat: str,
-                             period: Optional[Dict] = None):
-        """① 有每日统计明细时：剔除超物理范围的天，重算极值。"""
-        daily = fstats.get("每日统计")
-        if not isinstance(daily, list) or len(daily) < 2:
-            return None, ""
-        start = str((period or {}).get("start") or "")[:10]
-        end = str((period or {}).get("end") or "")[:10]
-        lim = self._feature_limit(feature)
-
-        def _num(rec, key):
-            try:
-                v = float(rec.get(key))
-                return v if v == v else None
-            except (TypeError, ValueError):
-                return None
-
-        maxs, mins, means = [], [], []
-        dropped = 0
-        for rec in daily:
-            if not isinstance(rec, dict):
-                continue
-            d = str(rec.get("日期") or "")[:10]
-            if (start and d and d < start) or (end and d and d > end):
-                continue
-            mx, mn, av = (_num(rec, "最大值"), _num(rec, "最小值"),
-                          _num(rec, "平均值"))
-            if lim is not None and ((mx is not None and abs(mx) > lim)
-                                    or (mn is not None and abs(mn) > lim)):
-                dropped += 1
-                continue
-            if mx is not None:
-                maxs.append(mx)
-            if mn is not None:
-                mins.append(mn)
-            if av is not None:
-                means.append(av)
-        if len(maxs) < 2 or len(mins) < 2:
-            return None, ""
-        if stat == "range":
-            v = max(maxs) - min(mins)
-        elif stat in ("abs_max", "absmax"):
-            v = max(abs(max(maxs)), abs(min(mins)))
-        elif stat == "max":
-            v = max(maxs)
-        elif stat == "min":
-            v = min(mins)
-        elif stat == "rms":
-            vals = [x * x for x in means]
-            v = float(math.sqrt(sum(vals) / len(vals))) if vals else None
-        else:
-            v = (sum(means) / len(means)) if means else None
-        if v is None:
-            return None, ""
-        note = f"按每日明细清洗后重算（剔除{dropped}天超范围极值）"
-        return float(v), note
-
-    def _sibling_clean_extreme(self, metric: str, feature: str, stat: str):
-        """② 无每日明细时：用同指标类别有效测点的极值中位数替代。"""
-        field, can = self._stat_field(stat)
-        if not field or can not in ("max", "min", "range", "abs_max"):
-            return None, ""
-        lim = self._feature_limit(feature)
-        vals = []
-        for sid in self.sensors_for_metric(metric):
-            st = self._feature_stats(str(sid), metric, feature=feature)
-            if not st or self._constant_faulty(st, feature):
-                continue
-            try:
-                v = float(st.get(field))
-            except (TypeError, ValueError):
-                continue
-            if v != v or (lim is not None and abs(v) > lim):
-                continue
-            vals.append(v)
-        if len(vals) < 2:
-            return None, ""
-        vals.sort()
-        n = len(vals)
-        med = (vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2)
-        return float(med), (f"同指标有效测点中位数替代（异常极值已剔除，"
-                            f"同族样本{n}个；精确极值需重跑统计库）")
 
     def _feature_stats(self, sensor_id: str, metric: str, feature: str = "") -> Optional[Dict]:
         data = self._load_sensor_stats(sensor_id)
@@ -2998,69 +2917,37 @@ class BridgeData:
 
     def _sensor_stat(self, sensor_id: str, metric: str, stat: str, period: Dict,
                      feature: str = "") -> Optional[float]:
-        """读取单个传感器（可指定特征）在报告期内的统计值。"""
+        """读取单个传感器（可指定特征）在报告期内的统计值。
+
+        原则：**统计库里有什么就填什么，没有就返回 None（填“—”）**。
+        报告只做只读回填，不再做“疑似故障/恒值/极值超限 → 改写或借同族
+        测点”的二次判断——清洗责任在预处理（build_chart_library）。
+        """
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
-        _feat = feature or self.metrics.get(metric, {}).get("feature", "")
-        if fstats and self._constant_faulty(fstats, _feat):
-            return None
-        if fstats and self._gross_stat_fault(fstats, _feat, stat):
-            # 优先用每日明细重算清洗后极值；无明细时用同族有效测点中位数；
-            # 两者都没有（数据确实为空/稀疏）才返回 None 填“—”。
-            v2, _note = self._daily_clean_extreme(fstats, _feat, stat, period)
-            if v2 is None:
-                v2, _note = self._sibling_clean_extreme(metric, _feat, stat)
-            return v2
         if not fstats:
+            # 位置统计里没有该测点：退到季度/年度聚合统计（也是“库里有的”）
             return self._aggregate_sensor_stat(sensor_id, metric, stat,
                                                feature=feature)
-        # 预计算型统计量（剔除温度/相关性系数）：只读 JSON 字段，不做逐日聚合
-        if _canon_stat(stat) in ("temp_rm_max", "temp_rm_min", "corr",
-                                 "剔除温度最大值", "剔除温度最小值", "相关性系数"):
-            return self._full_period_stats(fstats, stat)
-        # 差值/极差：报告期与 JSON 起止一致时直接读预处理好的“差值”字段，
-        # 不重新聚合（避免日最大-日最小把毛刺算进去）
-        if _canon_stat(stat) == "range" and self._json_period_matches(fstats, period):
-            v = self._full_period_stats(fstats, "range")
-            if v is not None:
-                return v
+        v = self._full_period_stats(fstats, stat)
+        if v is not None:
+            return v
+        # 该统计量整体统计里没有（如未生成“剔除温度差值”）：
+        # 用库内每日明细按报告期平算，同样不做额外清洗
         daily = self._period_daily(fstats, period)
         if daily:
-            return self._aggregate_daily(daily, stat, fstats=fstats)
-        return self._full_period_stats(fstats, stat)
+            return self._aggregate_daily(daily, stat, fstats=fstats,
+                                         clean=False)
+        return None
 
-    def _json_period_matches(self, fstats: Dict, period: Dict) -> bool:
-        """统计值 JSON 的 起始日期/结束日期 是否恰好覆盖报告期。"""
-        try:
-            js = dt.date.fromisoformat(str(fstats.get("起始日期")))
-            je = dt.date.fromisoformat(str(fstats.get("结束日期")))
-            return js == period.get("start") and je == period.get("end")
-        except (TypeError, ValueError):
-            return False
 
     def _stat_detail(self, sensor_id: str, metric: str, stat: str, period: Dict,
                      feature: str = "") -> Optional[Dict]:
-        """单个传感器统计 + 数据来源明细；读不到返回 None。"""
+        """单个传感器统计 + 数据来源明细；读不到返回 None（填“—”）。
+
+        与 _sensor_stat 同一原则：统计库有什么就回填什么，不做二次判断。
+        """
         fstats = self._feature_stats(sensor_id, metric, feature=feature)
         _feat = feature or self.metrics.get(metric, {}).get("feature", "")
-        if fstats and self._constant_faulty(fstats, _feat):
-            return None
-        if fstats and self._gross_stat_fault(fstats, _feat, stat):
-            v2, note = self._daily_clean_extreme(fstats, _feat, stat, period)
-            if v2 is None:
-                v2, note = self._sibling_clean_extreme(metric, _feat, stat)
-            if v2 is None:
-                return None
-            info = self.sensor_map.get(str(sensor_id), {})
-            return {
-                "传感器编号": str(sensor_id),
-                "监测部位": (info.get("名称")
-                             or info.get("监测部位") or ""),
-                "特征": _feat,
-                "统计文件": os.path.join(self.stats_dir, "位置统计"),
-                "数据来源": note or "异常极值清洗替代",
-                "天数": 0,
-                "值": v2,
-            }
         if not fstats:
             v = self._aggregate_sensor_stat(sensor_id, metric, stat,
                                             feature=feature)
@@ -3080,60 +2967,28 @@ class BridgeData:
         info = self.sensor_map.get(str(sensor_id), {})
         feat_resolved = feature or self.metrics.get(metric, {}).get("feature", "")
         src_file = self._actual_stats_path(sensor_id, feature=feat_resolved)
-        # 预计算型统计量（剔除温度/相关性系数）：只读 JSON 字段
-        canon_stat = _canon_stat(stat)
-        if canon_stat in ("temp_rm_max", "temp_rm_min", "temp_rm_range",
-                          "corr", "剔除温度最大值", "剔除温度最小值",
-                          "剔除温度差值", "相关性系数"):
-            if canon_stat in ("temp_rm_range", "剔除温度差值"):
-                mx = fstats.get("剔除温度最大值")
-                mn = fstats.get("剔除温度最小值")
-                if mx is not None and mn is not None:
-                    v = float(mx) - float(mn)
-                    return {
-                        "传感器编号": str(sensor_id),
-                        "监测部位": info.get("名称") or info.get("监测部位") or "",
-                        "特征": feature or self.metrics.get(metric, {}).get("feature", ""),
-                        "统计文件": src_file,
-                        "数据来源": "统计值JSON预计算字段（剔除温度残差差值）",
-                        "天数": 0,
-                        "值": v,
-                    }
-                return None
-            v = self._full_period_stats(fstats, stat)
-            if v is not None:
-                return {
-                    "传感器编号": str(sensor_id),
-                    "监测部位": info.get("名称") or info.get("监测部位") or "",
-                    "特征": feature or self.metrics.get(metric, {}).get("feature", ""),
-                    "统计文件": src_file,
-                    "数据来源": "统计值JSON预计算字段",
-                    "天数": 0,
-                    "值": v,
-                }
-            return None
-        # 差值/极差：报告期与 JSON 起止一致时直接读预处理好的“差值”字段
-        if _canon_stat(stat) == "range" and self._json_period_matches(fstats, period):
-            v = self._full_period_stats(fstats, "range")
-            if v is not None:
-                return {
-                    "传感器编号": str(sensor_id),
-                    "监测部位": info.get("名称") or info.get("监测部位") or "",
-                    "特征": feature or self.metrics.get(metric, {}).get("feature", ""),
-                    "统计文件": src_file,
-                    "数据来源": "统计值JSON预计算差值（预处理清洗后口径）",
-                    "天数": int(fstats.get("覆盖天数") or 0),
-                    "值": v,
-                }
+        # 1) 统计库里有的字段直接回填（预处理已清洗，报告不再二次判断）
+        v = self._full_period_stats(fstats, stat)
+        if v is None and _canon_stat(stat) in ("temp_rm_range", "剔除温度差值"):
+            mx = fstats.get("剔除温度最大值")
+            mn = fstats.get("剔除温度最小值")
+            if mx is not None and mn is not None:
+                v = float(mx) - float(mn)
+        if v is not None:
+            return {
+                "传感器编号": str(sensor_id),
+                "监测部位": info.get("名称") or info.get("监测部位") or "",
+                "特征": feature or self.metrics.get(metric, {}).get("feature", ""),
+                "统计文件": src_file,
+                "数据来源": "统计值JSON直读（预处理清洗后口径）",
+                "天数": int(fstats.get("覆盖天数") or 0),
+                "值": v,
+            }
+        # 2) 该统计量整体统计里没算：用库内每日明细按报告期平算（不加额外清洗）
         daily = self._period_daily(fstats, period)
-        if daily:
-            v = self._aggregate_daily(daily, stat, fstats=fstats)
-            source = "报告期逐日聚合"
-            days = len(daily)
-        else:
-            v = self._full_period_stats(fstats, stat)
-            source = "统计值JSON整体统计（报告期内无逐日数据）"
-            days = 0
+        if not daily:
+            return None
+        v = self._aggregate_daily(daily, stat, fstats=fstats, clean=False)
         if v is None:
             return None
         return {
@@ -3141,8 +2996,8 @@ class BridgeData:
             "监测部位": info.get("名称") or info.get("监测部位") or "",
             "特征": feature or self.metrics.get(metric, {}).get("feature", ""),
             "统计文件": src_file,
-            "数据来源": source,
-            "天数": days,
+            "数据来源": "库内每日明细按报告期平算",
+            "天数": len(daily),
             "值": v,
         }
 
@@ -3683,10 +3538,16 @@ class BridgeData:
         return out
 
     def _aggregate_daily(self, daily: List[Dict], stat: str,
-                         fstats: Optional[Dict] = None) -> Optional[float]:
-        """把每日统计聚合成报告期统计量。"""
+                         fstats: Optional[Dict] = None,
+                         clean: bool = True) -> Optional[float]:
+        """把每日统计聚合成报告期统计量。
+
+        clean=False 时不做额外的“零值/尖峰日”剔除（供报告只读回填使用：
+        库里有的数原样聚合，清洗在预处理已做）。
+        """
         stat = _canon_stat(stat)
-        daily = self._clean_daily(daily, fstats, stat)
+        if clean:
+            daily = self._clean_daily(daily, fstats, stat)
         if not daily:
             return None
         means = [float(d["平均值"]) for d in daily if d.get("平均值") is not None]
@@ -3722,8 +3583,15 @@ class BridgeData:
         return None
 
     def _full_period_stats(self, fstats: Dict, stat: str) -> Optional[float]:
-        """报告期不可用时，用 JSON 内的整体统计值。"""
+        """读取 JSON 内的整体统计值（预处理已清洗，报告直接回填）。
+
+        统计量名兼容三种写法：规范键(avg/max/…)、中文标准名(平均值/最大值)、
+        表头式名称(平均温度/最高温度/最大温差…)。
+        """
         key = STAT_KEY_MAP.get(stat)
+        if key is None:
+            can = _canon_stat(stat)
+            key = STAT_KEY_MAP.get(can, can)
         if key and fstats.get(key) is not None:
             return float(fstats[key])
         return None
