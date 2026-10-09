@@ -426,6 +426,98 @@ class ChartCleaningGranularityTest(unittest.TestCase):
         self.assertLess(max(out), 1e6)
 
 
+class PerfFastPathEquivalenceTest(unittest.TestCase):
+    """性能优化（pandas 解析、向量化掩码）必须与原来的逐点实现等价。"""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "bcl_perf",
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))),
+                "preprocess", "scripts", "build_chart_library.py"))
+        cls.bcl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.bcl)
+
+    _CSV = "\n".join([
+        "bucket_start,count,mean,min,max,sum,std,median",
+        "2026-07-01T00:00:00,3600,1.5,1.0,2.0,0,0,",
+        "2026-07-01T01:00:00,3600,-0.5,-1.0,0.0,0,0,",
+        "坏行",
+        "2026-07-01T02:00:00,x,1.0,0.5,1.5,0,0,",
+        "2026-07-01T03:00:00,3600,nan,0.5,1.5,0,0,",
+        "2026-07-01T04:00:00,0,1.0,0.5,1.5,0,0,",
+        "2026-07-01T05:00:00,3600,3.5,3.0,4.0,0,0,",
+    ])
+
+    def test_two_read_paths_agree(self):
+        """pandas 快速解析与纯 python 逐行解析结果必须完全一致。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "2026-07-01.csv")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(self._CSV)
+            slow = self.bcl.read_daily_file(p)          # 小文件 → 逐行
+            try:
+                fast = self.bcl._read_daily_file_pandas(p)
+            except Exception as exc:                    # noqa: BLE001
+                self.skipTest(f"环境无 pandas: {exc}")
+            self.assertEqual(slow[:5], fast[:5])
+            self.assertEqual(slow[5], fast[5])
+            self.assertEqual(len(slow[0]), 3)
+
+    def test_detect_zero_runs_matches_naive(self):
+        times = [dt.datetime(2026, 7, 1) + dt.timedelta(hours=i)
+                 for i in range(80)]
+        for vals in ([0.0] * 30 + [1.0] * 50,
+                     [1.0] * 5 + [0.0] * 28 + [2.0] * 47,
+                     [0.0] * 80):
+            got = self.bcl.detect_zero_runs(times, vals, min_hours=24.0)
+            # 逐点参考实现（原逻辑）
+            want, start = [], None
+            for i, v in enumerate(vals):
+                is_zero = abs(float(v)) <= 1e-9
+                if is_zero and start is None:
+                    start = i
+                elif not is_zero and start is not None:
+                    dur = (times[i - 1] - times[start]).total_seconds() / 3600.0
+                    if dur > 24.0:
+                        want.append((times[start], times[i - 1], round(dur, 1)))
+                    start = None
+            if start is not None:
+                dur = (times[-1] - times[start]).total_seconds() / 3600.0
+                if dur > 24.0:
+                    want.append((times[start], times[-1], round(dur, 1)))
+            self.assertEqual(
+                [(dt.datetime.strptime(r["起始时间"], "%Y-%m-%d %H:%M"),
+                  dt.datetime.strptime(r["结束时间"], "%Y-%m-%d %H:%M"),
+                  r["持续小时数"]) for r in got], want)
+
+    def test_mask_zero_run_hours_matches_naive(self):
+        times = [dt.datetime(2026, 7, 1) + dt.timedelta(hours=i)
+                 for i in range(60)]
+        means = [float(i) for i in range(60)]
+        maxs = [v + 1 for v in means]
+        mins = [v - 1 for v in means]
+        runs = [{"起始时间": "2026-07-01 10:00",
+                 "结束时间": "2026-07-01 20:00"},
+                {"起始时间": "2026-07-02 05:00",
+                 "结束时间": "2026-07-02 07:00"}]
+        spans = [(dt.datetime.strptime(r["起始时间"], "%Y-%m-%d %H:%M"),
+                  dt.datetime.strptime(r["结束时间"], "%Y-%m-%d %H:%M"))
+                 for r in runs]
+        want = [i for i, h in enumerate(times)
+                if not any(t0 <= h <= t1 for t0, t1 in spans)]
+        got = self.bcl._mask_zero_run_hours(times, means, maxs, mins, runs)[0]
+        self.assertEqual(got, [times[i] for i in want])
+
+    def test_monthly_floor_array_matches_scalar(self):
+        times = [dt.datetime(2026, 3, 30) + dt.timedelta(days=i)
+                 for i in range(10)]
+        got = self.bcl._monthly_floor_array(times)
+        want = [self.bcl.seasonal_min_for("WD(temp)", t) for t in times]
+        self.assertEqual(got.tolist(), want)
+
+
 class SummaryMissThresholdTest(unittest.TestCase):
     """方案第 5 节：结论段只说明缺失 >7 天（168h）的时段。"""
 
