@@ -889,6 +889,57 @@ class ChartBeautifyTest(unittest.TestCase):
             plt.close = orig_close
             plt.close("all")
 
+    def test_legend_matches_drawn_bands(self):
+        """图上画了色带，图例就必须有对应条目（不能“有彩带没图例”）。"""
+        import datetime as _dt
+        plt = self.bcl.plt
+        base = _dt.datetime(2026, 7, 1)
+        hours = [base + _dt.timedelta(hours=i) for i in range(24 * 20)]
+        means = []
+        for i, h in enumerate(hours):
+            means.append(0.0 if 100 <= i < 160
+                         else 20.0 + (h.hour % 24) * 0.2)
+        series = [{
+            "label": "434", "feature": "WD(temp)", "sensor": "434",
+            "hours": hours, "means": means,
+            "spike_pts": [(hours[20], 20.0)],
+            "range_pts": [(hours[30], 20.0)],
+            "gaps": [{"起始时间": "2026-07-05 00:00",
+                      "结束时间": "2026-07-06 12:00", "缺失小时数": 36}],
+            "records": [],
+            "shifts": [{"起始时间": "2026-07-08 00:00",
+                        "结束时间": "2026-07-10 00:00", "方向": "偏高"},
+                       {"起始时间": "2026-07-12 00:00",
+                        "结束时间": "2026-07-14 00:00", "方向": "偏低"}],
+        }]
+        orig_close = plt.close
+        plt.close = lambda *a, **k: None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "时间序列图.png")
+                self.bcl.plot_group_time_series("测试位置", "WD(temp)",
+                                                series, out)
+                fig = plt.figure(plt.get_fignums()[-1])
+                ax = [a for a in fig.axes if a.get_visible()][0]
+                bands = [p for p in ax.patches]          # axvspan 色带
+                labels = ([t.get_text() for t in fig.legends[0].get_texts()]
+                          if fig.legends else [])
+                self.assertEqual(len(bands), 4)          # 橙/红/绿/紫
+                for lb in ("数据缺失(已插值填充)", "长时间偏高",
+                           "长时间偏低", "可能故障(恒0超过24h)",
+                           "已替换尖峰(统计)", "已剔除异常值(范围外)"):
+                    self.assertIn(lb, labels)
+                # 图例必须完整落在画布内（不能被裁掉）
+                fig.canvas.draw()
+                ext = fig.legends[0].get_window_extent(
+                    fig.canvas.get_renderer())
+                h_px = fig.get_size_inches()[1] * fig.dpi
+                self.assertGreaterEqual(ext.y0, -1.0)
+                self.assertLessEqual(ext.y1, h_px + 1.0)
+        finally:
+            plt.close = orig_close
+            plt.close("all")
+
     def test_trim_legend_drops_ids_for_single_curve(self):
         labels = ["434", "长时间偏高", "可能故障(恒0超过24h)"]
         handles = [1, 2, 3]

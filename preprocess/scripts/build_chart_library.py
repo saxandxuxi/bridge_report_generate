@@ -1793,6 +1793,8 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
     # 突变区间 + 缺失段标注: 着色段全部画上；≤4 段文字标在带上，
     # >4 段文字挪到图右侧留白区，图上只留色带
     label_items = []   # [(label, color, xv, yv)]
+    any_gap = any_zero = False
+    shift_high = shift_low = False
     for s in shifts or []:
         try:
             t0 = dt.datetime.strptime(s["起始时间"], "%Y-%m-%d %H:%M")
@@ -1808,7 +1810,11 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
         except (ValueError, KeyError):
             continue
         color = "#d62728" if s["方向"] == "偏高" else "#2ca02c"
-        ax.axvspan(a - 0.5, b + 0.5, color=color, alpha=0.12)
+        ax.axvspan(a - 0.5, b + 0.5, color=color, alpha=_BAND_ALPHA)
+        if s["方向"] == "偏高":
+            shift_high = True
+        else:
+            shift_low = True
         yv = (plot_means[b] if b < len(plot_means)
               else plot_means[a] if a < len(plot_means) else 0.0)
         label_items.append(
@@ -1824,7 +1830,8 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
                     key=lambda i: abs((times[i] - t1).total_seconds()))
         except (ValueError, KeyError):
             continue
-        ax.axvspan(a - 0.5, b + 0.5, color="#ff7f0e", alpha=0.18)
+        ax.axvspan(a - 0.5, b + 0.5, color="#ff7f0e", alpha=_BAND_ALPHA)
+        any_gap = True
         yv = (plot_means[b] if b < len(plot_means)
               else plot_means[a] if a < len(plot_means) else 0.0)
         label_items.append(
@@ -1843,7 +1850,8 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
                     key=lambda i: abs((times[i] - t1).total_seconds()))
         except (ValueError, KeyError):
             continue
-        ax.axvspan(a - 0.5, b + 0.5, color="#9467bd", alpha=0.16)
+        ax.axvspan(a - 0.5, b + 0.5, color="#9467bd", alpha=_BAND_ALPHA)
+        any_zero = True
         yv = (plot_means[b] if b < len(plot_means)
               else plot_means[a] if a < len(plot_means) else 0.0)
         label_items.append(
@@ -1862,6 +1870,12 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
     ax.grid(True, alpha=0.3)
     _converge_ylim(ax, plot_means, feature)
     _handles, _labels = ax.get_legend_handles_labels()
+    # 尖峰/异常标记在画图时已自带 label，这里只补色带项，避免重复
+    _a_handles, _a_labels = _anno_legend_items(
+        any_gap=any_gap, shift_high=shift_high, shift_low=shift_low,
+        any_zero=any_zero)
+    _handles += _a_handles
+    _labels += _a_labels
     _labels, _handles = _trim_legend_items(_labels, _handles, 1)
     if _handles:
         fig.legend(_handles, _labels, loc="lower center",
@@ -1978,6 +1992,8 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
     # 突变区间 + 缺失段标注: 着色段全部画上；≤4 段文字标在带上，
     # >4 段文字挪到图右侧留白区，图上只留色带
     label_items = []   # [(label, color, xv, yv)]
+    any_gap = False
+    shift_high = shift_low = False
     for s in shifts or []:
         try:
             st = dt.datetime.strptime(s["起始时间"], "%Y-%m-%d %H:%M")
@@ -1989,7 +2005,11 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
         except (ValueError, KeyError):
             continue
         color = "#d62728" if s["方向"] == "偏高" else "#2ca02c"
-        ax.axvspan(xs[a] - 0.01, xs[b] + 0.01, color=color, alpha=0.12)
+        ax.axvspan(xs[a] - 0.01, xs[b] + 0.01, color=color, alpha=_BAND_ALPHA)
+        if s["方向"] == "偏高":
+            shift_high = True
+        else:
+            shift_low = True
         yv = (means[b] if b < len(means)
               else means[a] if a < len(means) else 0.0)
         label_items.append(
@@ -2005,7 +2025,8 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
                     key=lambda i: abs((times[i] - et).total_seconds()))
         except (ValueError, KeyError):
             continue
-        ax.axvspan(xs[a] - 0.01, xs[b] + 0.01, color="#ff7f0e", alpha=0.18)
+        ax.axvspan(xs[a] - 0.01, xs[b] + 0.01, color="#ff7f0e", alpha=_BAND_ALPHA)
+        any_gap = True
         yv = (means[b] if b < len(means)
               else means[a] if a < len(means) else 0.0)
         label_items.append(
@@ -2014,6 +2035,11 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
     # 方案第 2 节：图上不再画文字标注（彩色带保留）
     _converge_ylim(ax, means, feature)
     _handles, _labels = ax.get_legend_handles_labels()
+    _a_handles, _a_labels = _anno_legend_items(any_gap=any_gap,
+                                               shift_high=shift_high,
+                                               shift_low=shift_low)
+    _handles += _a_handles
+    _labels += _a_labels
     _labels, _handles = _trim_legend_items(_labels, _handles, 1)
     if _handles:
         fig.legend(_handles, _labels, loc="lower center",
@@ -2698,17 +2724,74 @@ def _make_legend_fit(fig, handles, labels, fontsize=12):
         return leg, ext
 
 
+# 色带/图例色块统一透明度：太低（0.12~0.18）在白底上淡成灰白看不出
+# 颜色（红/绿/紫都像灰带），太高会盖住曲线。图上色带与图例色块必须同值，
+# 保证“图上所见 = 图例所示”。
+_BAND_ALPHA = 0.30
+
+
 # 图例标注项的实用性排序（数值越小越优先保留）
 _LEGEND_ANNO_PRIORITY = {
     "长时间偏高": 0,
     "长时间偏低": 0,
     "已替换尖峰(统计)": 1,
     "已剔除异常值(范围外)": 1,
+    "已替换尖峰点(统计)": 1,
+    "已剔除异常值(物理范围外/分布极端)": 1,
     "剔除温度后-已替换尖峰(统计)": 1,
     "剔除温度后-已剔除异常值(范围外)": 1,
     "数据缺失(已插值填充)": 2,
     "可能故障(恒0超过24h)": 3,
 }
+
+
+def _anno_legend_items(any_spike: bool = False, any_range: bool = False,
+                       any_gap: bool = False, shift_high: bool = False,
+                       shift_low: bool = False,
+                       any_zero: bool = False,
+                       overlay_spike: bool = False,
+                       overlay_range: bool = False):
+    """按“图上实际画了什么”生成图例项（彩带/标记与图例必须一一对应）。
+
+    历史上这里是“把所有可能的项都塞进图例再裁到 4 条”，于是图上画着
+    缺失橙带/恒0紫带、图例里却没有对应条目——用户看到的就是“有彩带没图例”。
+    """
+    handles, labels = [], []
+    if any_spike:
+        handles.append(plt.Line2D([], [], marker="x", color="black",
+                                  linestyle="None", markersize=7, mew=1.8))
+        labels.append("已替换尖峰(统计)")
+    if any_range:
+        handles.append(plt.Line2D([], [], marker="x", color="#d62728",
+                                  linestyle="None", markersize=8, mew=1.8))
+        labels.append("已剔除异常值(范围外)")
+    if overlay_spike or overlay_range:
+        handles.append(plt.Line2D([], [], marker="x",
+                                  color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                  linestyle="None", markersize=7, mew=1.8))
+        labels.append("剔除温度后-已替换尖峰(统计)")
+        if overlay_range:
+            handles.append(plt.Line2D([], [], marker="D",
+                                      color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                      linestyle="None", markersize=6, mew=1.6))
+            labels.append("剔除温度后-已剔除异常值(范围外)")
+    if any_gap:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#ff7f0e",
+                                     alpha=_BAND_ALPHA))
+        labels.append("数据缺失(已插值填充)")
+    if shift_high:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#d62728",
+                                     alpha=_BAND_ALPHA))
+        labels.append("长时间偏高")
+    if shift_low:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#2ca02c",
+                                     alpha=_BAND_ALPHA))
+        labels.append("长时间偏低")
+    if any_zero:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#9467bd",
+                                     alpha=_BAND_ALPHA))
+        labels.append("可能故障(恒0超过24h)")
+    return handles, labels
 
 
 def _trim_legend_items(labels, handles, uniq_sensor_count,
@@ -2730,13 +2813,15 @@ def _trim_legend_items(labels, handles, uniq_sensor_count,
             if lb in _LEGEND_ANNO_PRIORITY:
                 return _LEGEND_ANNO_PRIORITY[lb] + 1
             return 0   # 传感器编号等其余标签优先保留
-        kept = sorted(items, key=lambda x: _pri(x[0]))[:8]
+        # 上限给足：图例项与图上画的彩带/标记一一对应，宁可行高两行，
+        # 也不要把已画出来的色带/标记从图例里裁掉
+        kept = sorted(items, key=lambda x: _pri(x[0]))[:11]
     else:
         # 单曲线（温度/湿度/挠度等，即使多面板）：编号已在子图标题里，
-        # 图例只留状态项，最多 4 条，保证一行放得下
+        # 图例只留状态项；状态项本身就代表“图上画了东西”，全部保留
+        # （最多 5~7 种），避免出现“有彩带没图例”
         kept = [(lb, h) for lb, h in items if lb in _LEGEND_ANNO_PRIORITY]
         kept.sort(key=lambda x: _LEGEND_ANNO_PRIORITY[x[0]])
-        kept = kept[:4]
     return [lb for lb, _ in kept], [h for _, h in kept]
 
 
@@ -2938,7 +3023,9 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
         ax = axes[pi]
         # 缺失/突变段全部着色并收集文字(带对应色带位置)
         any_gap = False
-        any_shift = any(s.get("shifts") for s in sub)
+        _shifts = [sh for s in sub for sh in (s.get("shifts") or [])]
+        shift_high = any(str(sh.get("方向")) == "偏高" for sh in _shifts)
+        shift_low = any(str(sh.get("方向")) == "偏低" for sh in _shifts)
         any_zero = False
         panel_labels = []   # [(label, color)]
         panel_pos = []      # [(label, color, xv, yv)] 与 panel_labels 同步
@@ -3022,7 +3109,7 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                             key=lambda k: abs(
                                 (s["hours"][k] - t1).total_seconds()))
                     ax.axvspan(xs[a], xs[b],
-                               color="#ff7f0e", alpha=0.18)
+                               color="#ff7f0e", alpha=_BAND_ALPHA)
                     panel_labels.append(
                         (_fmt_compact_range(g['起始时间'], g['结束时间']),
                          "#d2691e"))
@@ -3044,7 +3131,7 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                         key=lambda k: abs((s["hours"][k] - t1).total_seconds()))
                 color = "#d62728" if sh["方向"] == "偏高" else "#2ca02c"
                 ax.axvspan(xs[a], xs[b],
-                           color=color, alpha=0.12)
+                           color=color, alpha=_BAND_ALPHA)
                 panel_labels.append(
                     (f"{_fmt_compact_range(sh['起始时间'], sh['结束时间'])} "
                      f"{sh['方向']}", color))
@@ -3072,7 +3159,7 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                                     (s["hours"][k] - t1).total_seconds()))
                     except (ValueError, KeyError):
                         continue
-                    ax.axvspan(xs[a], xs[b], color="#9467bd", alpha=0.16)
+                    ax.axvspan(xs[a], xs[b], color="#9467bd", alpha=_BAND_ALPHA)
                     zrange = _fmt_compact_range(z['起始时间'], z['结束时间'])
                     zlabel = f"{plot_label}({zrange})可能故障"
                     panel_labels.append((zlabel, "#9467bd"))
@@ -3138,36 +3225,22 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
                                            for s in sub)))
 
         handles, labels = ax.get_legend_handles_labels()
-        handles += [plt.Line2D([], [], marker="x", color="black",
-                               linestyle="None", markersize=7, mew=1.8),
-                    plt.Line2D([], [], marker="x", color="#d62728",
-                               linestyle="None", markersize=8, mew=1.8)]
-        labels += ["已替换尖峰(统计)", "已剔除异常值(范围外)"]
-        if any(len(ov) >= 5 and (ov[3] or ov[4])
-               for ss in sub for ov in (ss.get("load_overlays") or [])):
-            handles += [plt.Line2D([], [], marker="x",
-                                   color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
-                                   linestyle="None", markersize=7, mew=1.8),
-                        plt.Line2D([], [], marker="D",
-                                   color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
-                                   linestyle="None", markersize=6, mew=1.6)]
-            labels += ["剔除温度后-已替换尖峰(统计)",
-                       "剔除温度后-已剔除异常值(范围外)"]
-        if any_gap:
-            handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#ff7f0e",
-                                         alpha=0.35))
-            labels.append("数据缺失(已插值填充)")
-        if any_shift:
-            handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#d62728",
-                                         alpha=0.25))
-            labels.append("长时间偏高")
-            handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#2ca02c",
-                                         alpha=0.25))
-            labels.append("长时间偏低")
-        if any_zero:
-            handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#9467bd",
-                                         alpha=0.25))
-            labels.append("可能故障(恒0超过24h)")
+        # 图例项按“本面板实际画了什么”生成：没画的不要凭空出现，
+        # 画了的（缺失橙带/恒0紫带/尖峰×/异常×）必须有对应图例
+        _any_spike = any(s.get("spike_pts") for s in sub)
+        _any_range = any(s.get("range_pts") for s in sub)
+        _ov_spike = any(ov[3] for ss in sub
+                        for ov in (ss.get("load_overlays") or [])
+                        if len(ov) >= 5)
+        _ov_range = any(ov[4] for ss in sub
+                        for ov in (ss.get("load_overlays") or [])
+                        if len(ov) >= 5)
+        _a_handles, _a_labels = _anno_legend_items(
+            any_spike=_any_spike, any_range=_any_range, any_gap=any_gap,
+            shift_high=shift_high, shift_low=shift_low, any_zero=any_zero,
+            overlay_spike=_ov_spike, overlay_range=_ov_range)
+        handles += _a_handles
+        labels += _a_labels
         # 子图不画图例(避免遮挡数据)；统一收集到整图底部一个全局图例
         for h, lb in zip(handles, labels):
             if lb not in global_labels:
@@ -3205,6 +3278,21 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
             for _, ss in panels)
         global_labels, global_handles = _trim_legend_items(
             global_labels, global_handles, uniq_sensor_count, _multi_curve)
+        # 自检：图上画出来的色带/标记必须都在图例里，缺了就告警
+        _drawn_kinds = []
+        if any_gap:
+            _drawn_kinds.append("数据缺失(已插值填充)")
+        if shift_high:
+            _drawn_kinds.append("长时间偏高")
+        if shift_low:
+            _drawn_kinds.append("长时间偏低")
+        if any_zero:
+            _drawn_kinds.append("可能故障(恒0超过24h)")
+        _missing_legend = [k for k in _drawn_kinds
+                           if k not in global_labels]
+        if _missing_legend:
+            print(f"[警告] 图例缺少已绘制的色带说明 {_missing_legend}: "
+                  f"{out_path}", flush=True)
         leg, leg_ext = _make_legend_fit(fig, global_handles, global_labels)
         fig_h_px = fig.get_size_inches()[1] * fig.dpi
         # 图例完整位于画布内，axes 下边界让出图例高度 + 间距
