@@ -71,6 +71,27 @@ def _derive_period_tag(daily_root="", start="", end=""):
     return ""
 
 
+# “数据缺失严重”（结论要报）的阈值：季度/月度 = 缺失小时合计 7 天(168h)；
+# 年度 = 缺失天数 > 30 天。不再用“整日缺失必报”的旧口径——零星掉一天
+# 不该写进结论段。
+_MISS_SEVERE_HOURS = 168.0
+
+
+def is_missing_severe(st, period_mode: str = "quarterly",
+                      threshold: float = _MISS_SEVERE_HOURS) -> bool:
+    """该测点是否属于“数据缺失严重”（季度总结/结论段要列出）。"""
+    if not isinstance(st, dict):
+        return False
+    try:
+        mh = float(st.get("缺失小时数") or 0)
+        md = float(st.get("缺失天数") or 0)
+    except (TypeError, ValueError):
+        return False
+    if str(period_mode) == "yearly":
+        return md > 30 or mh >= 720.0
+    return mh >= threshold or md >= threshold / 24.0
+
+
 def _zero_ok_feature(feature):
     """“0为正常值”特征：挠度(nd)/裂缝(LF)/风速。
     风速符号随服务器不同（FSFX2(spfs)/FSFX2(szfs)/FSFX2(s)/裸码），
@@ -641,17 +662,8 @@ def main():
                 except (TypeError, ValueError):
                     return False
 
-            def _is_missing_severe(st, threshold=72.0):
-                try:
-                    mh = float(st.get("缺失小时数") or 0)
-                    md = float(st.get("缺失天数") or 0)
-                except (TypeError, ValueError):
-                    return False
-                if period == "yearly":
-                    # 年度报告只报“缺失一个月以上”（30天=720h），
-                    # 数据缺失严重的传感器位置 不再混入 72h 级缺失
-                    return md > 30 or mh >= 720.0
-                return md > 0 or mh >= threshold
+            def _is_missing_severe(st, threshold=_MISS_SEVERE_HOURS):
+                return is_missing_severe(st, period, threshold)
 
             # 位置级故障/缺失清单：同一位置多个测点时具体到测点
             def _fmt_pos(pos, pts, all_pts):

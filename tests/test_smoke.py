@@ -531,6 +531,89 @@ class SummaryMissThresholdTest(unittest.TestCase):
         self.assertEqual(b._summary_miss_threshold(), 168.0)
 
 
+class RobustStatFaultTest(unittest.TestCase):
+    """极值故障不应把均值/中位数这类稳健统计量也打成“—”。"""
+
+    def _stats(self, **kw):
+        base = {"平均值": 12.47, "中位数": 12.4, "均方根值": 13.0,
+                "最大值": 51.19, "最小值": -21.90, "差值": 73.08}
+        base.update(kw)
+        return base
+
+    def test_extreme_fault_keeps_average(self):
+        f = self._stats()
+        # 最低温 -21.9℃、差值 73℃ 属故障 → 极值判失效
+        self.assertTrue(BridgeData._gross_stat_fault(f, "WD(temp)", "max"))
+        self.assertTrue(BridgeData._gross_stat_fault(f, "WD(temp)", "min"))
+        # 但平均 12.47℃ 正常 → 不能填“—”
+        for stat in ("avg", "平均温度", "median", "rms"):
+            self.assertFalse(BridgeData._gross_stat_fault(f, "WD(temp)", stat),
+                             stat)
+
+    def test_impossible_average_still_faulty(self):
+        self.assertTrue(BridgeData._gross_stat_fault(
+            self._stats(平均值=500.0), "WD(temp)", "avg"))
+        self.assertTrue(BridgeData._gross_stat_fault(
+            self._stats(平均值=-40.0), "WD(temp)", "avg"))
+
+    def test_contradictory_average_still_faulty(self):
+        """平均值不在 [最小值, 最大值] 内 → 口径自相矛盾，仍判失效。"""
+        self.assertTrue(BridgeData._gross_stat_fault(
+            self._stats(平均值=99.0), "WD(temp)", "avg"))
+
+    def test_humidity_same_rule(self):
+        # 极值离谱但均值本身合理（79.7%）→ 极值判失效、均值照常给
+        f = {"平均值": 79.7, "最大值": 525843000.0, "最小值": 18.06,
+             "差值": 525842980.0}
+        self.assertTrue(BridgeData._gross_stat_fault(f, "WSD(rh)", "max"))
+        self.assertTrue(BridgeData._gross_stat_fault(f, "WSD(rh)", "range"))
+        self.assertFalse(BridgeData._gross_stat_fault(f, "WSD(rh)", "avg"))
+        # 均值自己就超量程（>100%）→ 该行整体失效
+        f2 = {"平均值": 114.56, "最大值": 525843000.0, "最小值": 19.63,
+              "差值": 525842980.0}
+        self.assertTrue(BridgeData._gross_stat_fault(f2, "WSD(rh)", "avg"))
+
+    def test_header_style_stat_names_resolve(self):
+        """表头式列名（平均温度/最高温度/最低温度/最大温差）要能归一化。"""
+        from report_agent.bridge_source import _canon_stat
+        self.assertEqual(_canon_stat("平均温度"), "avg")
+        self.assertEqual(_canon_stat("平均湿度"), "avg")
+        self.assertEqual(_canon_stat("最高温度"), "max")
+        self.assertEqual(_canon_stat("最低温度"), "min")
+        self.assertEqual(_canon_stat("最大温差"), "range")
+        self.assertEqual(_canon_stat("均值"), "avg")
+        self.assertEqual(_canon_stat("绝对值最大"), "abs_max")
+
+
+class MissSevereThresholdTest(unittest.TestCase):
+    """缺失严重口径：季度/月度按“缺失合计≥7天(168h)”，年度按>30天。"""
+
+    @classmethod
+    def setUpClass(cls):
+        scripts = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "preprocess", "scripts")
+        spec = importlib.util.spec_from_file_location(
+            "bq_test", os.path.join(scripts, "build_quarterly_stats.py"))
+        cls.bq = importlib.util.module_from_spec(spec)
+        import sys as _sys
+        if scripts not in _sys.path:
+            _sys.path.insert(0, scripts)
+        spec.loader.exec_module(cls.bq)
+
+    def test_quarterly_uses_seven_days(self):
+        f = self.bq.is_missing_severe
+        self.assertFalse(f({"缺失小时数": 24, "缺失天数": 1}, "quarterly"))
+        self.assertFalse(f({"缺失小时数": 72, "缺失天数": 3}, "quarterly"))
+        self.assertFalse(f({"缺失小时数": 167, "缺失天数": 6}, "quarterly"))
+        self.assertTrue(f({"缺失小时数": 168, "缺失天数": 7}, "quarterly"))
+        self.assertTrue(f({"缺失小时数": 0, "缺失天数": 8}, "quarterly"))
+
+    def test_yearly_uses_one_month(self):
+        f = self.bq.is_missing_severe
+        self.assertFalse(f({"缺失小时数": 168, "缺失天数": 7}, "yearly"))
+        self.assertTrue(f({"缺失小时数": 900, "缺失天数": 31}, "yearly"))
+
+
 class SensorMapParseTest(unittest.TestCase):
     """《五座桥测点编号表格.docx》不会变 → 解析结果必须稳定、可复现。
 
@@ -799,6 +882,24 @@ class ChartBeautifyTest(unittest.TestCase):
             max_total_removals=0)
         self.assertEqual(rng, [])
         self.assertTrue(any("未硬过滤" in str(r.get("说明", ""))
+                            for r in recs))
+
+    def test_summer_zero_reading_removed(self):
+        """夏季(7~9月)恰好 0.0℃ 的掉零读数也要按季节异常剔除——
+        否则最小值会被打成 0、差值等于最大值（洣水河 636 那种情况）。"""
+        times = [dt.datetime(2026, 8, 1) + dt.timedelta(hours=i)
+                 for i in range(240)]
+        vals = [25.0 + (i % 24) * 0.05 for i in range(240)]
+        vals[100] = 0.0
+        vals[101] = 0.0
+        out, recs, _spike, rng = self.bcl.clean_series_value(
+            times, vals, "t", spike_k=0.0, hour_level=False,
+            vrange=(-30.0, 70.0), feature="WD(temp)", dist_k=0.0,
+            max_spikes=0, max_total_removals=0)
+        self.assertIn(100, rng)
+        self.assertIn(101, rng)
+        self.assertGreater(min(out), 1.0)
+        self.assertTrue(any("季节" in str(r.get("说明", ""))
                             for r in recs))
 
     def test_stat_window_catches_local_spike_global_misses(self):

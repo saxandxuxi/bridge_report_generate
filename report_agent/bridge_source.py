@@ -507,8 +507,34 @@ def _similarity(a: str, b: str) -> float:
 
 
 def _canon_stat(stat: str) -> str:
-    """把模板统计量统一成英文规范键。"""
-    return CN_STAT_MAP.get(stat, stat)
+    """把模板统计量统一成英文规范键。
+
+    除精确表以外加一层“表头式”兜底：模板里常写“平均温度/最高温度/
+    最低温度/最大温差”这类带物理量的列名，精确匹配不到就会一路返回 None
+    被填成“—”（历史上“平均值写—、最高/最低正常”就是这么来的）。
+    """
+    s = str(stat or "")
+    if s in CN_STAT_MAP:
+        return CN_STAT_MAP[s]
+    if "最大温差" in s or "最大差" in s or "差值" in s or "极差" in s:
+        return "range"
+    if "绝对" in s and "最大" in s:
+        return "abs_max"
+    if "均方根" in s:
+        return "rms"
+    if "中位" in s:
+        return "median"
+    if "标准" in s:
+        return "std"
+    if "覆盖" in s or "有效天数" in s:
+        return "days"
+    if "平均" in s or "均值" in s:
+        return "avg"
+    if "最高" in s or "最大" in s:
+        return "max"
+    if "最低" in s or "最小" in s:
+        return "min"
+    return s
 
 
 def _fuzzy_find(query: str, candidates: List[str], threshold: float) -> Optional[str]:
@@ -2139,12 +2165,10 @@ class BridgeData:
                 except (TypeError, ValueError):
                     pass
             month_miss = self._month_missing_positions(pos_entries, 30)
-        # 年度报告只报“缺失一个月以上”，季度/月度报 72h 阈值；
-        # 避免年度同时出现“一个月以上”和“72h以上”两套缺失口径。
+        # 年度报告只报“缺失一个月以上”，季度/月度报 summary_miss_hours
+        # （默认 168h=7 天）阈值；避免年度同时出现两套缺失口径。
         missing_pos = month_miss if _yearly else abnormal
-        missing_label = (
-            "数据缺失一个月以上位置（缺失天数>30天）：" if _yearly
-            else "数据缺失较多位置（72h以上）：")
+        missing_label = self._miss_label(_yearly)
         if missing_pos:
             prompts.append(missing_label + _cap(missing_pos))
         # 多数传感器公共缺失时间段（build_chart_library 生成的小时级区间）
@@ -2216,6 +2240,18 @@ class BridgeData:
             return float(self.cfg.get("summary_miss_hours", 168) or 168)
         except (TypeError, ValueError):
             return 168.0
+
+    def _miss_label(self, yearly: bool = False) -> str:
+        """缺失位置提示词：年度按“一个月以上”，季度/月度按配置阈值
+        （summary_miss_hours，默认 168h=7 天），与 abnormal_positions /
+        _fault_positions 的判定口径保持一致——避免文案写 72h、判定却用
+        7 天这种“说的和做的不一样”。"""
+        if yearly:
+            return "数据缺失一个月以上位置（缺失天数>30天）："
+        thr = self._summary_miss_threshold()
+        return (f"数据缺失较多位置（缺失合计≥"
+                f"{format_report_number(thr / 24.0)}天/"
+                f"{format_report_number(thr)}h）：")
 
     @staticmethod
     def _cap_positions(items, cap: int = 5) -> str:
@@ -2524,11 +2560,9 @@ class BridgeData:
         if _yearly:
             _fpos, _ = self._filter_pos_entries(metric, pos_entries)
             month_miss = self._month_missing_positions(_fpos, 30)
-        # 年度报告只报“缺失一个月以上”，季度/月度报 72h 阈值
+        # 年度报告只报“缺失一个月以上”，季度/月度报 summary_miss_hours 阈值
         missing_pos = month_miss if _yearly else abnormal
-        missing_label = (
-            "数据缺失一个月以上位置（缺失天数>30天）：" if _yearly
-            else "数据缺失较多位置（72h以上）：")
+        missing_label = self._miss_label(_yearly)
         if missing_pos:
             prompts.append(missing_label + _cap(missing_pos))
         cm_periods = gs_ax.get("多数传感器缺失时间段") or []
@@ -2652,6 +2686,65 @@ class BridgeData:
         return False
 
     @staticmethod
+    def _robust_stat_faulty(fstats: Dict, feature: str, can: str) -> bool:
+        """稳健统计量（平均/中位/均方根/标准差）**自身**是否已离谱。
+
+        用于“极值/差值异常、但均值这类量仍然可信”的场景：例如温度测点
+        最小值 -21.9℃ 属故障（差值随之 73℃ 超限），但平均值 12.5℃ 正常，
+        这时平均温度必须照常显示，不能整行填“—”。
+        """
+        key = {"avg": "平均值", "mean": "平均值", "value": "平均值",
+               "median": "中位数", "rms": "均方根值",
+               "std": "标准差"}.get(can)
+        if not key:
+            return False
+        try:
+            v = float(fstats.get(key))
+        except (TypeError, ValueError):
+            return False
+        code = _feature_code(feature)
+        if code == "rh":
+            if v > 100.0 or v < -10.0:
+                return True
+        elif code == "temp":
+            if v > 80.0 or v < -30.0:
+                return True
+        elif code == "spfs":
+            if v > 100.0 or v < 0.0:
+                return True
+        elif code == "szfs":
+            if v > 60.0 or v < -60.0:
+                return True
+        # 均值落在 [最小值, 最大值] 之外 → 统计口径自相矛盾，视为无效
+        try:
+            mx, mn = float(fstats.get("最大值")), float(fstats.get("最小值"))
+            tol = 1e-6 * max(abs(mx), abs(mn), 1.0)
+            if v < mn - tol or v > mx + tol:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return False
+
+    @staticmethod
+    def _zero_polluted_extreme(fstats: Dict) -> bool:
+        """极值被“恒0故障段”污染：JSON 已列出疑似故障时间段，且最小值恰为 0、
+        平均值明显不为 0（0 是掉零/缺数，不是真实读数）。
+
+        这类统计库（预处理漏剔恒0段的旧库）最小值会被打成 0、差值随之等于
+        最大值，报告里必须先走“每日重算 → 同族测点中位数”再用，不能照抄 0。
+        """
+        if not isinstance(fstats, dict):
+            return False
+        if not (fstats.get("疑似故障时间段") or fstats.get("持续为0位置")):
+            return False
+        try:
+            mn = float(fstats.get("最小值"))
+            av = float(fstats.get("平均值"))
+        except (TypeError, ValueError):
+            return False
+        return abs(mn) <= 1e-9 and abs(av) > 1e-6
+
+    @staticmethod
     def _gross_stat_fault(fstats: Dict, feature: str, stat: str) -> bool:
         """按“具体统计量”判断是否明显失真：
         - 温湿度/风速等整条序列异常的，整行无效；
@@ -2663,6 +2756,16 @@ class BridgeData:
             return False
         code = _feature_code(feature)
         if code in ("rh", "temp", "spfs", "szfs"):
+            # 平均/中位/均方根这类稳健量只按“自身是否离谱”判：
+            # 极值故障（如最低温 -21.9℃、差值 73℃）不应把均值也打成“—”
+            can = _canon_stat(STAT_KEY_MAP.get(stat, stat))
+            if can in ("avg", "mean", "value", "median", "rms", "std"):
+                return BridgeData._robust_stat_faulty(fstats, feature, can)
+            # 恒0故障段把最小值打成 0（差值跟着等于最大值）→ 极值不可信，
+            # 交给“每日重算 / 同族中位数”取值，不要照抄 0
+            if can in ("min", "range", "diff", "abs_max", "absmax"):
+                if BridgeData._zero_polluted_extreme(fstats):
+                    return True
             return BridgeData._gross_faulty(fstats, feature)
         limit = None
         if code.endswith("jsd") or code in ("xjsd", "yjsd", "zjsd"):
