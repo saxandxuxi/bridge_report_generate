@@ -27,6 +27,9 @@ PATTERNS = [
     "requirements.txt",
     "report_agent/*.py",
     "preprocess/scripts/*.py",
+    "preprocess/pipeline.py",
+    "web/app.py",
+    "web/static/index.html",
     "tests/*.py",
 ]
 # 明确要忽略的文件

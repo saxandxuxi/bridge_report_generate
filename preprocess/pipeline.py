@@ -346,7 +346,10 @@ def main() -> int:
             return 1
 
     # 2.5) 日级 -> 季度/年度统计值(按监测部位合并多传感器)
-    if (not args.skip_charts or stats_only) and not args.skip_stats:
+    #   季度/年度总结读的是“位置统计”库（已有就复用），与图库无关，所以
+    #   --stats-only（只补统计值）和 --skip-stats（只补图库）两种单补模式
+    #   都要跑这一步，只有两个库都跳过时才整体跳过。
+    if not (args.skip_charts and args.skip_stats):
         if args.period == "yearly" and daily_base:
             stats_daily_root = daily_base      # 桥根目录, 汇总所有 daily_*
         else:
@@ -388,7 +391,10 @@ def main() -> int:
             map_docx, out_map,
         ], status)
         if not ok:
-            status["error"] = "传感器对照表生成步骤失败"
+            status["error"] = (
+                "传感器对照表生成步骤失败（若日志提示“重新解析会丢失已有内容”，"
+                "说明本次解析结果比现有对照表少：请核对 docx 与解析器；"
+                "确认要覆盖时手工执行 parse_sensor_map.py ... --force）")
             status["running"] = False
             save_status(status)
             return 1

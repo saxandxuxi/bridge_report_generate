@@ -147,7 +147,7 @@
         <button onclick="startRun()">开始生成</button>
       </div>
       <div class="row">
-        <label style="font-size:13px"><input type="checkbox" id="runAutoPre" checked> 缺数据时自动预处理（秒级→日级→图库/统计值）</label>
+        <label style="font-size:13px"><input type="checkbox" id="runAutoPre" checked> 缺数据时自动预处理（缺什么补什么：秒级→日级→图库/统计值→季度/年度总结）</label>
         <button class="ghost" onclick="checkPeriod()">检查该周期数据</button>
       </div>
       <div id="periodInfo" class="muted"></div>
@@ -710,7 +710,10 @@ function checkPeriod() {
       "图库: " + esc(p.charts_dir) + "　" + (p.charts_exists ? "✔ 已存在" : "✘ 缺失") + "<br>" +
       "统计值: " + esc(p.stats_dir) + "　" + (p.stats_exists ? "✔ 已存在" : "✘ 缺失") + "<br>" +
       (p.data_ready ? '<span class="green">数据就绪，将跳过预处理直接生成报告</span>'
-                    : '<span class="yellow">该周期图库/统计值缺失，勾选“自动预处理”会先跑数据处理</span>');
+                    : '<span class="yellow">' +
+                      esc(p.preprocess_plan_text ||
+                          "该周期图库/统计值缺失，勾选“自动预处理”会先跑数据处理") +
+                      "</span>");
   }).catch(function (e) {
     $("periodInfo").innerHTML = '<span class="err">' + esc(String(e)) + "</span>";
   });

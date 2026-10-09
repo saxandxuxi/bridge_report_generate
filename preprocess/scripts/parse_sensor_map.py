@@ -304,11 +304,16 @@ def bridge_of(info):
 
 def build_position_map(sensors, bridge_full):
     """
-    结构应变/振动监测表: 断面位置 -> 测点N -> 编号(按编号表顺序)。
+    结构应变/振动/结构温度监测表: 断面位置 -> 测点N -> 编号(按编号表顺序)。
+
+    结构温度必须一起生成：报告填表时 bridge_source 会读
+    测点映射["结构温度监测表"] 来定位“XX温度监测统计”这类表格的
+    行↔传感器（不依赖名称对照里的顺序），漏掉它会退化成按名称模糊匹配。
     """
     result = {}
     for cat, table_name in (("应变", "结构应变监测表"),
-                            ("振动", "结构振动监测表")):
+                            ("振动", "结构振动监测表"),
+                            ("结构温度", "结构温度监测表")):
         groups = defaultdict(list)
         for num, info in sensors.items():
             if bridge_of(info) != bridge_full or info.get("类别") != cat:
@@ -399,11 +404,11 @@ def build_table_map(sensors, bridge_full, data_feats):
     return tm
 
 
-def write_name_map_files(bridges, sensors, data_feats, out_dir,
+def build_name_map_files(bridges, sensors, data_feats, out_dir,
                          feat_ref=None):
-    """把完善后的按桥名称对照写成 5 个 JSON 文件。"""
+    """生成 5 个按桥名称对照的内容，返回 [(路径, dict)]（不落盘）。"""
     os.makedirs(out_dir, exist_ok=True)
-    written = []
+    files = []
     for bridge in BRIDGE_ORDER:
         if bridge not in bridges:
             continue
@@ -423,11 +428,79 @@ def write_name_map_files(bridges, sensors, data_feats, out_dir,
             data["测点映射"] = pos_map
         if table_map:
             data["表格映射"] = table_map
-        path = os.path.join(out_dir, bridge + ".json")
+        files.append((os.path.join(out_dir, bridge + ".json"), data))
+    return files
+
+
+def _load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def loss_of(old, new):
+    """列出“新解析结果相对已有文件丢了什么”（空列表=没有退步）。
+
+    文件不变时重复解析必须完全一致；这里挡住的是解析器改动/文档异常
+    导致的**静默丢表、丢测点**——报告填表依赖这些映射，一旦丢掉只会
+    表现为某些表格解析不到数据，很难排查。
+    """
+    out = []
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return out
+    old_s = old.get("传感器") or {}
+    new_s = new.get("传感器") or {}
+    if old_s:
+        lost = sorted(set(old_s) - set(new_s), key=lambda x: str(x))
+        if lost:
+            out.append(f"传感器编号少 {len(lost)} 个（如 {lost[:5]}）")
+    for key in ("测点映射", "表格映射", "传感器名称"):
+        o, n = old.get(key) or {}, new.get(key) or {}
+        if not isinstance(o, dict) or not isinstance(n, dict):
+            continue
+        for t in sorted(set(o) - set(n), key=str):
+            out.append(f"{key} 少了 “{t}”")
+        for t in sorted(set(o) & set(n), key=str):
+            oo, nn = o[t], n[t]
+            if isinstance(oo, list) and isinstance(nn, list):
+                o_pos = {str(x.get("断面位置")) for x in oo
+                         if isinstance(x, dict) and x.get("断面位置")}
+                n_pos = {str(x.get("断面位置")) for x in nn
+                         if isinstance(x, dict) and x.get("断面位置")}
+                miss = sorted(o_pos - n_pos)
+                if miss:
+                    out.append(f"{key}[{t}] 少了断面位置 {miss[:3]}")
+            elif isinstance(oo, dict) and isinstance(nn, dict):
+                miss = sorted(set(oo) - set(nn), key=str)
+                if miss:
+                    out.append(f"{key}[{t}] 少了 {miss[:3]}")
+    return out
+
+
+def write_name_map_files(bridges, sensors, data_feats, out_dir,
+                         feat_ref=None, force=False):
+    """把完善后的按桥名称对照写成 5 个 JSON 文件。
+
+    写之前先与已有文件对比：一旦会丢失表/断面位置/传感器，默认**不覆盖**
+    并返回失败清单，由调用方决定是否 --force。
+    返回 (写出路径列表, 丢失说明列表)；(None, losses) 表示已中止写入。
+    """
+    files = build_name_map_files(bridges, sensors, data_feats, out_dir,
+                                 feat_ref)
+    losses = []
+    for path, data in files:
+        for item in loss_of(_load_json(path), data):
+            losses.append(f"{os.path.basename(path)}: {item}")
+    if losses and not force:
+        return None, losses
+    written = []
+    for path, data in files:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         written.append(path)
-    return written
+    return written, losses
 
 
 def main():
@@ -435,6 +508,11 @@ def main():
     out_path = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_OUT
     stats_dir = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_STATS
     merge_mode = "--merge" in sys.argv
+    force = "--force" in sys.argv
+    name_map_dir = DEFAULT_NAME_MAP_DIR
+    for i, a in enumerate(sys.argv):
+        if a == "--name-map-dir" and i + 1 < len(sys.argv):
+            name_map_dir = sys.argv[i + 1]
 
     if not os.path.exists(docx_path):
         print(f"[错误] 找不到文档: {docx_path}")
@@ -480,14 +558,33 @@ def main():
         },
     }
 
+    # 按桥分组的 名称 -> 编号/特征 JSON(完善版)
+    bridges = build_name_map(sensors)
+    name_files = build_name_map_files(bridges, sensors, data_feats,
+                                      name_map_dir, feat_ref)
+    # 落盘前统一做“不丢内容”校验：任何一份文件会退步就整体不写，
+    # 保证要么全部更新、要么保持原样（不会出现半新半旧）
+    losses = [f"{os.path.basename(out_path)}: {x}"
+              for x in loss_of(_load_json(out_path), data)]
+    for _path, _data in name_files:
+        losses += [f"{os.path.basename(_path)}: {x}"
+                   for x in loss_of(_load_json(_path), _data)]
+    if losses and not force:
+        print("[中止] 重新解析会丢失已有内容，已保留原文件（确认要覆盖请加 --force）:")
+        for x in losses:
+            print("   -", x)
+        sys.exit(2)
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
-    # 按桥分组的 名称 -> 编号/特征 JSON(完善版)
-    bridges = build_name_map(sensors)
-    name_files = write_name_map_files(bridges, sensors, data_feats,
-                                      DEFAULT_NAME_MAP_DIR, feat_ref)
+    written = []
+    for _path, _data in name_files:
+        os.makedirs(os.path.dirname(_path), exist_ok=True)
+        with open(_path, "w", encoding="utf-8") as f:
+            json.dump(_data, f, ensure_ascii=False, indent=2)
+        written.append(_path)
+    name_files = written
 
     print(f"共解析出 {len(sensors)} 个传感器")
     print(f"已保存: {out_path}")

@@ -531,6 +531,135 @@ class SummaryMissThresholdTest(unittest.TestCase):
         self.assertEqual(b._summary_miss_threshold(), 168.0)
 
 
+class SensorMapParseTest(unittest.TestCase):
+    """《五座桥测点编号表格.docx》不会变 → 解析结果必须稳定、可复现。
+
+    这里把“解析基线”钉住：传感器总数、各桥数量、测点/表格映射的结构与
+    内容摘要。解析器一旦漏表（历史上就漏过 结构温度监测表，而报告填表
+    依赖它）或文档被改动，测试会立刻失败。
+    """
+
+    # 解析基线摘要（文档/解析器没变时应保持不变；故意调整需同步更新）
+    BASELINE_DIGEST = ("d4108adf5ec7cb25b251c0066198993"
+                       "5e545c5112e52215050038737c089f04a")
+    BRIDGE_COUNTS = {"湘江特大桥": 185, "洣水河特大桥": 213, "矮寨大桥": 286,
+                     "赤石大桥": 223, "洞庭湖大桥": 250}
+
+    @classmethod
+    def setUpClass(cls):
+        import hashlib
+        import json as _json
+        from collections import Counter
+        cls.hashlib, cls.json, cls.Counter = hashlib, _json, Counter
+        docx = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "inputs",
+            "五座桥测点编号表格.docx")
+        if not os.path.isfile(docx):
+            raise unittest.SkipTest("缺少测点编号表 docx")
+        spec = importlib.util.spec_from_file_location(
+            "psm_test",
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))),
+                "preprocess", "scripts", "parse_sensor_map.py"))
+        cls.m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.m)
+        cls.sensors = cls.m.parse_docx(docx)
+
+    def test_sensor_counts_pinned(self):
+        self.assertEqual(len(self.sensors), sum(self.BRIDGE_COUNTS.values()))
+        got = self.Counter(self.m.bridge_of(i) for i in self.sensors.values())
+        for bridge, n in self.BRIDGE_COUNTS.items():
+            self.assertEqual(got.get(bridge), n, bridge)
+
+    def test_position_and_table_map_digest_stable(self):
+        blob = {b: {"测点映射": self.m.build_position_map(self.sensors, b),
+                    "表格映射": self.m.build_table_map(self.sensors, b, {})}
+                for b in self.m.BRIDGE_ORDER}
+        raw = self.json.dumps(blob, ensure_ascii=False, sort_keys=True)
+        self.assertEqual(
+            self.hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            self.BASELINE_DIGEST,
+            "解析结果与基线不一致：解析器改动或 docx 被替换，"
+            "请核对差异（确认无误再更新 BASELINE_DIGEST）")
+
+    def test_struct_temp_position_map_present(self):
+        """结构温度监测表必须在测点映射里（报告按它定位行↔传感器）。"""
+        for bridge in self.m.BRIDGE_ORDER:
+            pm = self.m.build_position_map(self.sensors, bridge)
+            self.assertIn("结构温度监测表", pm, bridge)
+        plans = self.m.build_position_map(
+            self.sensors, "洞庭湖大桥")["结构温度监测表"]
+        by_pos = {p["断面位置"]: p["测点"] for p in plans}
+        pts = by_pos.get("君山侧塔梁交接处钢桁梁") or {}
+        self.assertEqual(len(pts), 20)
+        self.assertEqual(pts.get("测点1"), "3268")
+
+    def test_loss_of_detects_dropped_content(self):
+        """写入前的护栏：新结果少表/少断面位置时必须报出来。"""
+        old = {"测点映射": {"结构温度监测表": [
+                  {"断面位置": "君山侧塔梁交接处钢桁梁", "测点": {}}]},
+               "传感器": {"3268": {}}}
+        new = {"测点映射": {"结构应变监测表": []}}
+        losses = self.m.loss_of(old, new)
+        self.assertTrue(any("结构温度监测表" in x for x in losses), losses)
+        self.assertTrue(any("传感器编号少" in x for x in losses), losses)
+        # 只新增（不丢）不算退步；少了表要报出来
+        base = {"测点映射": {"结构应变监测表": []}}
+        more = {"测点映射": {"结构应变监测表": [],
+                             "结构温度监测表": []}}
+        self.assertEqual(self.m.loss_of(base, more), [])
+        self.assertTrue(self.m.loss_of(more, base))
+
+
+class PreprocessPlanTest(unittest.TestCase):
+    """前端“缺什么补什么”：统计值在、图库缺 → 只补图库（+季度/年度总结）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location(
+            "web_app",
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "web", "app.py"))
+        cls.app = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(cls.app)
+        except Exception as exc:  # noqa: BLE001
+            raise unittest.SkipTest(f"web.app 不可导入: {exc}")
+
+    @staticmethod
+    def _make(tmp, charts: bool, stats: bool):
+        charts_dir = os.path.join(tmp, "图库_2026.7~9", "测试桥")
+        stats_dir = os.path.join(tmp, "统计值_2026.7~9", "测试桥")
+        if charts:
+            d = os.path.join(charts_dir, "某位置", "WD(temp)")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "时间序列图.png"), "wb") as f:
+                f.write(b"x")
+        if stats:
+            d = os.path.join(stats_dir, "位置统计", "某位置")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "WD(temp).json"), "w",
+                      encoding="utf-8") as f:
+                f.write("{}")
+        return charts_dir, stats_dir
+
+    def test_plan_by_missing_parts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for charts, stats, daily, want in (
+                    (True, True, True, "skipped"),
+                    (False, True, True, "charts_only"),
+                    (True, False, True, "stats_only"),
+                    (False, False, True, "full"),
+                    (False, True, False, "full"),   # 日级也要补 → 走完整流程
+            ):
+                charts_dir, stats_dir = self._make(
+                    os.path.join(tmp, f"{charts}{stats}{daily}"), charts, stats)
+                self.assertEqual(
+                    self.app._preprocess_plan(charts_dir, stats_dir, daily),
+                    want, (charts, stats, daily))
+                self.assertIn(want, self.app.PREPROCESS_PLAN_TEXT)
+
+
 class ChartBeautifyTest(unittest.TestCase):
     """方案第 2/3/4/6 节：图上不画文字、子图等宽等高、图例精简、Z-score。"""
 

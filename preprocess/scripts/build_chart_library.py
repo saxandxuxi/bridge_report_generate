@@ -2789,6 +2789,27 @@ def _apply_group_layout(fig, bottom, top=0.95):
                             hspace=0.32, wspace=0.20)
 
 
+def _suptitle_top(fig, gap_lines: float = 0.5, min_top: float = 0.80,
+                  max_top: float = 0.99) -> float:
+    """按总标题的实际行高给出 axes 区域上边界。
+
+    总标题与第一行子图标题之间只留约 gap_lines 倍行高（0.5 行 ≈ 1.5 倍
+    行距的观感）。原实现按"图高的固定比例"留白（0.92/0.84…），子图一多、
+    画布一高，物理间距就被放大成好几厘米的空白带。
+    """
+    h_in = float(fig.get_size_inches()[1]) or 1.0
+    st = getattr(fig, "_suptitle", None)
+    try:
+        fs = float(st.get_fontsize()) if st is not None else 14.0
+    except (TypeError, ValueError):
+        fs = 14.0
+    if not (fs > 0):
+        fs = 14.0
+    line = fs * 1.2 / 72.0 / h_in            # 一行文字高度（figure 比例）
+    top = 1.0 - line - gap_lines * line - 0.004
+    return max(min_top, min(max_top, top))
+
+
 def _finalize_layout(fig, rows: int = 1, bottom: float = 0.0) -> None:
     """统一的标题/图例安全区：
     - 顶部为 fig.suptitle 预留空间，避免总标题与第一行子图标题重合；
@@ -2796,15 +2817,7 @@ def _finalize_layout(fig, rows: int = 1, bottom: float = 0.0) -> None:
     tight_layout 不会自动为 suptitle 留白，这里显式收紧 rect 并把 suptitle
     顶到画布上沿（bbox_inches='tight' 保存时不会裁掉）。
     """
-    top = 0.92 if rows <= 1 else max(0.84, 0.92 - 0.025 * (rows - 1))
     bottom = min(0.45, max(0.0, bottom))
-    try:
-        fig.tight_layout(rect=(0.0, bottom, 1.0, top))
-    except Exception:  # noqa: BLE001
-        try:
-            fig.subplots_adjust(top=top, bottom=bottom)
-        except Exception:  # noqa: BLE001
-            pass
     st = getattr(fig, "_suptitle", None)
     if st is not None:
         try:
@@ -2812,6 +2825,50 @@ def _finalize_layout(fig, rows: int = 1, bottom: float = 0.0) -> None:
             st.set_va("top")
         except Exception:  # noqa: BLE001
             pass
+    _fit_suptitle_gap(fig, bottom, _suptitle_top(fig))
+
+
+def _fit_suptitle_gap(fig, bottom, top, gap_lines: float = 0.5,
+                      ) -> float:
+    """布好局后实测“总标题底 ↔ 第一行子图标题顶”的空白，必要时收紧一次
+    rect 上边界，让两行标题呈约 1.5 倍行距（gap_lines=0.5 行）。
+
+    matplotlib 的 tight_layout 会在 rect 内额外留出 pad 与子图标题高度，
+    实测比按公式推算更可靠。修正用一次 subplots_adjust 完成（不再跑第二遍
+    tight_layout——它会重新测量全部文字，代价远高于本修正）；渲染器取文字
+    包围盒不需要整图 draw，开销很小。
+    返回最终使用的 rect 上边界。
+    """
+    _apply_group_layout(fig, bottom, top=top)
+    st = getattr(fig, "_suptitle", None)
+    if st is None:
+        return top
+    try:
+        renderer = fig.canvas.get_renderer()
+        h_px = float(fig.get_size_inches()[1]) * fig.dpi
+    except Exception:  # noqa: BLE001
+        return top
+    try:
+        su = st.get_window_extent(renderer)
+        axes = [a for a in fig.axes if a.get_visible() and a.lines] or \
+            [a for a in fig.axes if a.get_visible()]
+        if not axes:
+            return top
+        title_top = max(a.title.get_window_extent(renderer).y1
+                        for a in axes)
+    except Exception:  # noqa: BLE001
+        return top
+    want = gap_lines * su.height
+    gap = su.y0 - title_top              # 正数=两行标题之间的空白
+    if abs(gap - want) <= 0.15 * su.height:
+        return top
+    try:
+        new_top = min(0.995, max(0.5,
+                                 fig.subplotpars.top + (gap - want) / h_px))
+        fig.subplots_adjust(top=new_top)
+        return new_top
+    except Exception:  # noqa: BLE001
+        return top
 
 
 def _converge_ylim(ax, values, feature: str = "",
@@ -3120,7 +3177,6 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
     _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
     _gran = _granularity_label(panels)
     _rows = (n + ncols - 1) // ncols if ncols else 1
-    _top = 0.92 if _rows <= 1 else max(0.84, 0.92 - 0.025 * (_rows - 1))
     if day_mode:
         fig.suptitle(
             f"{position}｜{group} {_gran}时间序列（{n} 个测点）｜"
@@ -3134,6 +3190,8 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
         fig._suptitle.set_va("top")
     except Exception:  # noqa: BLE001
         pass
+    # 顶部留白只按总标题行高给（约 1.5 倍行距），再按实测间距微调
+    _top = _suptitle_top(fig)
     if global_handles:
         uniq_sensor_count = len({s["sensor"] for _, sub in panels
                                  for s in sub})
@@ -3148,9 +3206,9 @@ def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
         fig_h_px = fig.get_size_inches()[1] * fig.dpi
         # 图例完整位于画布内，axes 下边界让出图例高度 + 间距
         bottom = min(0.35, max(0.08, leg_ext.y1 / fig_h_px + 0.03))
-        _apply_group_layout(fig, bottom, top=_top)
+        _fit_suptitle_gap(fig, bottom, _top)
     else:
-        _apply_group_layout(fig, 0.0, top=_top)
+        _fit_suptitle_gap(fig, 0.0, _top)
     # 不再有右侧文字标注：子图占满画布宽度（等宽等高），统一 tight 保存
     _save_group_fig(fig, out_path, dpi, tight=True)
     plt.close(fig)

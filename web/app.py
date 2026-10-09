@@ -369,6 +369,40 @@ def _has_sensor_products(charts_dir: str, stats_dir: str) -> bool:
                 os.path.join(stats_dir, "位置统计")))
 
 
+# 自动预处理动作 -> 前端提示文案
+PREPROCESS_PLAN_TEXT = {
+    "skipped": "数据就绪，将跳过预处理直接生成报告",
+    "charts_only": "统计值已存在、图库缺失：自动预处理将只补图库"
+                   "（并重算季度/年度总结），统计值保留",
+    "stats_only": "图库已存在、统计值缺失：自动预处理将只补统计值"
+                  "（并重算季度/年度总结），图库保留",
+    "full": "图库与统计值都缺失：自动预处理将跑完整流程"
+            "（日级→图库+统计值→季度/年度总结）",
+}
+
+
+def _preprocess_plan(charts_dir: str, stats_dir: str,
+                     daily_ready: bool = True) -> str:
+    """缺什么补什么：返回 skipped / charts_only / stats_only / full。
+
+    - 统计值在、图库缺 → charts_only（只补图库，季度/年度总结会重算）
+    - 图库在、统计值缺 → stats_only（只补统计值，季度/年度总结会重算）
+    - 日级数据也要补时 → full（--stats-only 会强制跳过“秒级->日级”，
+      不能直接进单补模式）
+    """
+    charts_ok = _has_non_traffic_products(charts_dir)
+    stats_ok = _has_non_traffic_products(os.path.join(stats_dir, "位置统计"))
+    if charts_ok and stats_ok:
+        return "skipped"
+    if not daily_ready:
+        return "full"
+    if stats_ok:
+        return "charts_only"
+    if charts_ok:
+        return "stats_only"
+    return "full"
+
+
 def _period_quarters(period: Dict) -> list:
     """报告期 -> 需要的季度标签列表（如 2026.4~6 -> ['2026Q2']；
     2025年 -> ['2025Q1'..'2025Q4']）。"""
@@ -1993,15 +2027,21 @@ def api_bridge_period(bridge_id):
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
     charts_dir, stats_dir = _quarter_dirs(cfg, period["label"])
+    charts_ok = _has_non_traffic_products(charts_dir)
+    stats_ok = _has_non_traffic_products(os.path.join(stats_dir, "位置统计"))
+    data_ready = charts_ok and stats_ok
+    # 勾选“自动预处理”时会执行的动作（缺什么补什么，总结都会重算）
+    plan = _preprocess_plan(charts_dir, stats_dir)
     return jsonify({
         **period,
         "charts_dir": charts_dir,
         "stats_dir": stats_dir,
         # “已存在”指存在交通荷载之外的传感器产物；只处理过交通时不算
-        "charts_exists": _has_non_traffic_products(charts_dir),
-        "stats_exists": _has_non_traffic_products(
-            os.path.join(stats_dir, "位置统计")),
-        "data_ready": _has_sensor_products(charts_dir, stats_dir),
+        "charts_exists": charts_ok,
+        "stats_exists": stats_ok,
+        "data_ready": data_ready,
+        "preprocess_plan": plan,
+        "preprocess_plan_text": PREPROCESS_PLAN_TEXT[plan],
     })
 
 
@@ -2413,14 +2453,32 @@ def api_bridge_run(bridge_id):
                             "续跑 秒级->日级(--resume)",
                             bridge_id, period.get("label") or "")
                     st["preprocess"] = "running"
-                    # 图库或统计库任一缺失都跑完整 pipeline：
-                    # 图库+统计值+季度/年度总结一起重建，避免“只出图库”
-                    # 导致 季度总结/公共缺失时间段 缺失、结论段为空。
+                    # 按“缺什么补什么”选模式，避免重复劳动：
+                    #   统计值在、图库缺 → 只补图库（含季度/年度总结）
+                    #   图库在、统计值缺 → 只补统计值（含季度/年度总结）
+                    #   两个都缺 → 跑完整 pipeline（图库+统计值+总结）
+                    # 说明：季度/年度总结读的是“位置统计”库，两种单补模式
+                    # 都会重新生成，所以不会出现“只出图库导致总结为空”。
+                    # --stats-only 会强制跳过“秒级->日级”，所以只有日级已就绪
+                    # 时才用单补模式；日级也要补时按完整流程走（先续跑日级）。
+                    plan = _preprocess_plan(charts_dir, stats_dir,
+                                            daily_ready=daily_ready)
+                    st["preprocess_mode"] = plan
+                    if plan == "charts_only":
+                        log.info("桥 %s 本期统计值已存在、图库缺失（%s）："
+                                 "只补图库 + 季度/年度总结，统计值保留",
+                                 bridge_id, period.get("label") or "")
+                    elif plan == "stats_only":
+                        log.info("桥 %s 本期图库已存在、统计值缺失（%s）："
+                                 "只补统计值 + 季度/年度总结，图库保留",
+                                 bridge_id, period.get("label") or "")
                     rc = _run_pipeline(
                         period, charts_dir, stats_dir, st,
                         bridge=bridge_name,
                         skip_preprocess=daily_ready,
-                        period_mode=mode)
+                        period_mode=mode,
+                        stats_only=(plan == "stats_only"),
+                        charts_only=(plan == "charts_only"))
                     st["preprocess"] = (
                         "skipped_daily" if (rc == 0 and daily_ready)
                         else ("done" if rc == 0 else "failed"))
