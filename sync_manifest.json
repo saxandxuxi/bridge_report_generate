@@ -2,15 +2,16 @@
   "说明": "关键文件 MD5 基线；服务器上运行 check_sync.py 校验",
   "文件": {
     "analyze_report.py": "D9E69759B54A0D8F66E6A358AD0BBCEE",
-    "check_sync.py": "ECA07114D4383F7EA964C451D6CA3A91",
+    "check_sync.py": "D25BA2213C713458252232D18D5238B8",
     "preprocess/pipeline.py": "917C85C102285DF0B159B05944773C18",
-    "preprocess/scripts/build_chart_library.py": "1CD912B3D0E4510EE67CC3DFBF6A5EF9",
+    "preprocess/scripts/build_chart_library.py": "6D37E450F557692106F06B9E6C6C603A",
     "preprocess/scripts/build_quarterly_stats.py": "27357E7F176BED1C6AB5FE032F4FFB27",
     "preprocess/scripts/build_summary_from_daily.py": "F373C68779B5593801A56BEF7ABD2950",
     "preprocess/scripts/parse_sensor_map.py": "FF7C50D1696E51AE74C2317E03211A5A",
     "preprocess/scripts/preprocess_sensor_data.py": "18B036F57893D888080FA69E87401E97",
     "preprocess/scripts/run_preprocess_100_101.py": "36A119D2A3EA6AB792FFB376FE4498E7",
     "preprocess/scripts/run_preprocess_all_sensors.py": "7DBF30CF0CDF71C3390BE70DD5BD995A",
+    "preprocess/清洗限值.json": "4FF9CA9E0936D483A2D9435416D3F0C5",
     "report_agent/__init__.py": "CB630B37F0631133C9864AFB063ED59C",
     "report_agent/agent.py": "D593E9030789FDC88CE441910BB12095",
     "report_agent/bridge_source.py": "5AB17FF83C3F8658D79C7DC30FD86737",
@@ -31,7 +32,7 @@
     "report_agent/template_analyzer.py": "60CA7A27431668F6D39B68E4F87179CB",
     "requirements.txt": "A0D538E62C5CCA3A3420F27E6A9D3DEC",
     "run_agent.py": "087D76BBA750876416B16B61E2DD7ED7",
-    "tests/test_smoke.py": "9CD7076017853BDC71181620559F3ACB",
+    "tests/test_smoke.py": "9780F009C78BD3C280291E12E90ED066",
     "web/app.py": "162ECB0CA5BC12A833030F79B933597A",
     "web/static/index.html": "DD38BE5E4A6164F401B0FD0CA806987F"
   }

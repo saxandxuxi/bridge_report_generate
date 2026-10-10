@@ -27,6 +27,7 @@ PATTERNS = [
     "requirements.txt",
     "report_agent/*.py",
     "preprocess/scripts/*.py",
+    "preprocess/清洗限值.json",
     "preprocess/pipeline.py",
     "web/app.py",
     "web/static/index.html",

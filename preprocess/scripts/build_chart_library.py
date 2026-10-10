@@ -75,42 +75,212 @@ DEFAULT_SENSOR_MAP_DIR = os.path.join(
 # ---------------------------------------------------------------------
 
 # 特征英文代号 -> 中文名（便于中文查询，未列出的按原名显示）
-FEATURE_CN = {
-    "rh": "湿度", "temp": "温度",
-    "nd": "挠度", "rsg": "应变", "sl": "索力", "lf": "裂缝",
-    "xJsd": "X向加速度", "xJd": "X向倾角", "yJd": "Y向倾角",
-    "spfs": "风速", "spfx": "风向", "szfs": "竖向风速", "szfx": "竖向风向",
-    "Δx": "X方向", "Δy": "Y方向", "Δz": "Z方向",
-    "Ax": "X方向", "Ay": "Y方向", "Az": "Z方向",
-}
+# ============================================================================
+# 清洗限值：全部集中在 preprocess/清洗限值.json，代码里不保留任何副本
+#   —— 物理量程 / 温度季节上下限 / 恒0正常特征 / 统计值判定窗口 /
+#      剔除预算 / 绘图阈值 / 特征中文名
+# 改阈值只改那个 JSON。文件缺失、配置块或键缺失、值非法一律直接报错，
+# 不做静默降级（否则会悄悄少做一层清洗，报告里看不出来）。
+# ============================================================================
+_PREPROCESS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLEANING_LIMITS_FILE = os.path.join(_PREPROCESS_DIR, "清洗限值.json")
 
-# 特征括号内代号 -> 物理合理范围(超出即视为错误值，统计/绘图前剔除)
-FEATURE_RANGES = {
-    "rh": (0.0, 100.0),            # 湿度 %
-    "temp": (-30.0, 70.0),         # 温度 ℃ 物理范围（清洗与统计共用同一套，
-                                   # 保证时间序列图与表格统计一致）
-    "rsg": (-50000.0, 50000.0),    # 应变 με
-    "xJsd": (-10000.0, 10000.0),   # 加速度 mg
-    "spfs": (0.0, 100.0),          # 水平风速 m/s
-    "szfs": (-100.0, 100.0),       # 竖向风速(带符号) m/s
-    "spfx": (0.0, 360.0),          # 风向 °
-    "szfx": (-360.0, 360.0),       # 竖向风向(数据为带符号小值)
-    "xJd": (-90.0, 90.0),          # 倾角 °
-    "yJd": (-90.0, 90.0),
-    "nd": (-100000.0, 100000.0),   # 挠度 mm
-    "sl": (0.0, 100000.0),         # 索力 KN
-    "lf": (-10000.0, 10000.0),     # 裂缝 mm
-    "Δx": (-100000.0, 100000.0),   # 位移/空间变位 mm
-    "Δy": (-100000.0, 100000.0),
-    "Δz": (-100000.0, 100000.0),
-}
+# 生效值：由 apply_cleaning_limits() 在 import 时填充，各函数直接引用
+FEATURE_CN = {}
+FEATURE_RANGES = {}
+TEMP_MONTHLY_MIN = {}
+TEMP_MONTHLY_MAX = {}
+VRANGE_MIN_RATIO = 0.98
+DEFAULT_DIST_K = 20.0
+ZERO_OK_CODES = set()
+ZERO_OK_PREFIXES = set()
+ZERO_OK_MIN_HOURS = 168.0
+STAT_WINDOW_BY_GRANULARITY = {}
+_CLEAN_BUDGET = {}
+_BAND_ALPHA = 0.30
+_MAX_GAP_ANNOTS = 12
+_GROUP_MIN_PANEL_GAP = 0.055
+_TEMP_FLOOR_LUT = np.full(12, np.nan, dtype=float)
+_TEMP_CEIL_LUT = np.full(12, np.nan, dtype=float)
 
-DEFAULT_DIST_K = 20.0   # --dist-k 默认值；dist_k=0 时"突变段"剔除仍用该带宽
-VRANGE_MIN_RATIO = 0.98  # 物理范围仅当 >=98% 数据落在区间内才生效，否则仅作绘图参考
+_REQUIRED_SECTIONS = ("特征中文名", "物理量程", "温度季节下限", "温度季节上限",
+                      "物理范围生效门槛", "分布极端带宽倍数", "恒0正常特征",
+                      "统计值判定窗口_按粒度", "清洗预算_按粒度", "绘图阈值")
 
-# 风向类特征(spfx/szfx)是圆形量，线性"尖峰"没有意义，不做统计尖峰替代；
-# 风速(spfs/szfs)按普通特征处理：允许剔除零散尖峰，长段持续偏高/低只标注不剔除。
 
+def _limits_error(msg: str):
+    raise ValueError(
+        f"清洗限值配置有问题：{msg}\n  文件: {CLEANING_LIMITS_FILE}\n"
+        f"  该 JSON 是唯一的阈值来源（物理量程/温度季节上下限/恒0正常特征/"
+        f"统计值判定窗口/清洗预算/绘图阈值/特征中文名），请补齐或修正后重跑。")
+
+
+def _as_float(v, what: str) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        _limits_error(f"{what} 不是数字: {v!r}")
+
+
+def _as_int(v, what: str) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        _limits_error(f"{what} 不是整数: {v!r}")
+
+
+def _month_table(raw, what: str) -> dict:
+    """月份键支持写 "1" 或 1；必须 1~12 齐全。"""
+    if not isinstance(raw, dict):
+        _limits_error(f"{what} 应为对象（键 1~12）")
+    out = {}
+    for m in range(1, 13):
+        v = raw.get(str(m), raw.get(m))
+        if v is None:
+            _limits_error(f"{what} 缺少第 {m} 月")
+        out[m] = _as_float(v, f"{what}[{m}]")
+    return out
+
+
+def load_cleaning_limits(path: str = "") -> dict:
+    """读取并严格校验 preprocess/清洗限值.json，返回解析后的限值。"""
+    fpath = path or CLEANING_LIMITS_FILE
+    if not os.path.isfile(fpath):
+        _limits_error(f"文件不存在: {fpath}")
+    try:
+        with open(fpath, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        _limits_error(f"读取失败: {exc}")
+    if not isinstance(raw, dict):
+        _limits_error("顶层应为 JSON 对象")
+    miss = [k for k in _REQUIRED_SECTIONS if k not in raw]
+    if miss:
+        _limits_error(f"缺少配置块: {miss}")
+
+    cn_raw = raw["特征中文名"]
+    if not isinstance(cn_raw, dict) or not cn_raw:
+        _limits_error("特征中文名 应为非空对象")
+    cn = {str(k): str(v) for k, v in cn_raw.items()}
+
+    rng_raw = raw["物理量程"]
+    if not isinstance(rng_raw, dict) or not rng_raw:
+        _limits_error("物理量程 应为非空对象")
+    ranges = {}
+    for code, v in rng_raw.items():
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            _limits_error(f"物理量程[{code}] 应为 [下限, 上限]")
+        lo = _as_float(v[0], f"物理量程[{code}]下限")
+        hi = _as_float(v[1], f"物理量程[{code}]上限")
+        if hi <= lo:
+            _limits_error(f"物理量程[{code}] 上限必须大于下限: {v!r}")
+        ranges[str(code)] = (lo, hi)
+
+    tmin = _month_table(raw["温度季节下限"], "温度季节下限")
+    tmax = _month_table(raw["温度季节上限"], "温度季节上限")
+    for m in range(1, 13):
+        if tmax[m] <= tmin[m]:
+            _limits_error(f"温度季节上下限矛盾（{m} 月上限<=下限）")
+
+    zk = raw["恒0正常特征"]
+    if not isinstance(zk, dict):
+        _limits_error("恒0正常特征 应为对象")
+    for k in ("codes", "prefixes", "min_hours"):
+        if k not in zk:
+            _limits_error(f"恒0正常特征 缺少 {k}")
+    if not isinstance(zk["codes"], list) or not isinstance(zk["prefixes"], list):
+        _limits_error("恒0正常特征.codes / prefixes 应为数组")
+    zero_ok = {"codes": [str(x) for x in zk["codes"]],
+               "prefixes": [str(x) for x in zk["prefixes"]],
+               "min_hours": _as_float(zk["min_hours"], "恒0正常特征.min_hours")}
+
+    sw_raw = raw["统计值判定窗口_按粒度"]
+    if not isinstance(sw_raw, dict):
+        _limits_error("统计值判定窗口_按粒度 应为对象")
+    stat_window = {}
+    for k in ("second", "10min", "hour"):
+        if k not in sw_raw:
+            _limits_error(f"统计值判定窗口_按粒度 缺少 {k}")
+        stat_window[k] = _as_int(sw_raw[k], f"统计值判定窗口[{k}]")
+
+    cb_raw = raw["清洗预算_按粒度"]
+    if not isinstance(cb_raw, dict) or not cb_raw:
+        _limits_error("清洗预算_按粒度 应为非空对象")
+    budgets = {}
+    for k, v in cb_raw.items():
+        if not isinstance(v, (list, tuple)) or len(v) != 3:
+            _limits_error(f"清洗预算[{k}] 应为 [尖峰数, 分布极端点数, 总剔除数]")
+        budgets[str(k)] = tuple(_as_int(x, f"清洗预算[{k}]") for x in v)
+
+    dr = raw["绘图阈值"]
+    if not isinstance(dr, dict):
+        _limits_error("绘图阈值 应为对象")
+    for k in ("色带透明度", "缺失段标注上限", "子图最小间隙"):
+        if k not in dr:
+            _limits_error(f"绘图阈值 缺少 {k}")
+    draw = {
+        "色带透明度": _as_float(dr["色带透明度"], "绘图阈值.色带透明度"),
+        "缺失段标注上限": _as_int(dr["缺失段标注上限"],
+                                  "绘图阈值.缺失段标注上限"),
+        "子图最小间隙": _as_float(dr["子图最小间隙"],
+                                  "绘图阈值.子图最小间隙"),
+    }
+    return {
+        "特征中文名": cn,
+        "物理量程": ranges,
+        "温度季节下限": tmin,
+        "温度季节上限": tmax,
+        "物理范围生效门槛": _as_float(raw["物理范围生效门槛"],
+                                      "物理范围生效门槛"),
+        "分布极端带宽倍数": _as_float(raw["分布极端带宽倍数"],
+                                      "分布极端带宽倍数"),
+        "恒0正常特征": zero_ok,
+        "统计值判定窗口_按粒度": stat_window,
+        "清洗预算_按粒度": budgets,
+        "绘图阈值": draw,
+    }
+
+
+def apply_cleaning_limits(path: str = "") -> dict:
+    """加载限值并写入模块级生效值（import 时自动调用一次）。"""
+    global VRANGE_MIN_RATIO, DEFAULT_DIST_K, ZERO_OK_CODES
+    global ZERO_OK_PREFIXES, ZERO_OK_MIN_HOURS, STAT_WINDOW_BY_GRANULARITY
+    global _CLEAN_BUDGET, _BAND_ALPHA, _MAX_GAP_ANNOTS, _GROUP_MIN_PANEL_GAP
+    global _TEMP_FLOOR_LUT, _TEMP_CEIL_LUT
+    lim = load_cleaning_limits(path)
+    FEATURE_CN.clear()
+    FEATURE_CN.update(lim["特征中文名"])
+    FEATURE_RANGES.clear()
+    FEATURE_RANGES.update(lim["物理量程"])
+    TEMP_MONTHLY_MIN.clear()
+    TEMP_MONTHLY_MIN.update(lim["温度季节下限"])
+    TEMP_MONTHLY_MAX.clear()
+    TEMP_MONTHLY_MAX.update(lim["温度季节上限"])
+    VRANGE_MIN_RATIO = lim["物理范围生效门槛"]
+    DEFAULT_DIST_K = lim["分布极端带宽倍数"]
+    ZERO_OK_CODES = set(lim["恒0正常特征"]["codes"])
+    ZERO_OK_PREFIXES = set(lim["恒0正常特征"]["prefixes"])
+    ZERO_OK_MIN_HOURS = lim["恒0正常特征"]["min_hours"]
+    STAT_WINDOW_BY_GRANULARITY = dict(lim["统计值判定窗口_按粒度"])
+    _CLEAN_BUDGET = dict(lim["清洗预算_按粒度"])
+    _BAND_ALPHA = lim["绘图阈值"]["色带透明度"]
+    _MAX_GAP_ANNOTS = lim["绘图阈值"]["缺失段标注上限"]
+    _GROUP_MIN_PANEL_GAP = lim["绘图阈值"]["子图最小间隙"]
+    _TEMP_FLOOR_LUT = np.array([TEMP_MONTHLY_MIN[m] for m in range(1, 13)],
+                               dtype=float)
+    _TEMP_CEIL_LUT = np.array([TEMP_MONTHLY_MAX[m] for m in range(1, 13)],
+                              dtype=float)
+    # 限值变了要清掉这些 lru_cache（import 时部分函数可能还没定义，按名字取）
+    for _name in ("feature_range", "_is_temperature_feature",
+                  "feature_granularity", "feature_code",
+                  "_is_direction_feature"):
+        _fn = globals().get(_name)
+        if _fn is not None and hasattr(_fn, "cache_clear"):
+            _fn.cache_clear()
+    return lim
+
+
+apply_cleaning_limits()
 
 @lru_cache(maxsize=1024)
 def feature_range(feature):
@@ -142,18 +312,6 @@ def feature_range(feature):
     return None
 
 
-# ---- 统计值异常剔除：按特征粒度取判定窗口（小时） ------------------------
-# 统计值清洗默认沿用原逻辑（全局稳健基线 + 尖峰/分布极端点），只是判定
-# “相对谁异常”的窗口按数据粒度取：
-#   second（加速度/振动/地震，JSD 族）：统计序列本身已是 1 小时粒度，
-#          窗口=0（全局）即“按 1 小时粒度判定”；
-#   10min（风速 FSFX 族）：24 小时局部窗口——阵风/大风是常态，只有相对
-#          当日上下文明显异常才剔除；
-#   hour（温度/湿度/挠度/应变等）：窗口=0，与修改前的逻辑完全一致。
-# 绘图路径不传 stat_window，始终走原逻辑（全局基线 + 重合窗口尖峰检测）。
-STAT_WINDOW_BY_GRANULARITY = {"second": 0, "10min": 24, "hour": 0}
-
-
 def _stat_window_for(feature, window=0) -> int:
     """统计值清洗的判定窗口（小时）：>0 显式指定；0=按特征粒度自动
     （风速 24h，其余 0=全局）；负数=强制全局。"""
@@ -169,30 +327,11 @@ def _stat_window_for(feature, window=0) -> int:
         feature_granularity(feature), 0) or 0)
 
 
-# ---- 温度的季节性合理下限（湖南地区，单位 ℃） --------------------------
-# 例：7~9 月湖南不可能出现 0℃ 以下的气温/结构温度，出现即不合常理
-# （传感器故障），按异常值剔除。上限沿用 FEATURE_RANGES["temp"]
-# （结构温度夏季可达 60℃+）。取值取“保守下限”，宁可少剔也不误删：
-# 与物理范围一样有 98% 命中率兜底——若整个序列都低于当月下限（量程不同），
-# 自动降级为“仅作绘图参考，不硬过滤”。
-# 夏季（6~9 月）下限取 2~3℃ 而不是 0℃：既满足“7~9 月不可能低于 0℃”，
-# 又能捉住传感器掉零造成的**恰好 0.0** 读数（取 0 时 0<0 不成立会漏掉，
-# 这类零点会直接把“最小值”打成 0、差值等于最大值）。
-TEMP_MONTHLY_MIN = {
-    1: -15.0, 2: -12.0, 3: -8.0, 4: -4.0, 5: -1.0, 6: 2.0,
-    7: 3.0, 8: 3.0, 9: 2.0, 10: -1.0, 11: -5.0, 12: -12.0,
-}
-
-
 @lru_cache(maxsize=1024)
 def _is_temperature_feature(feature) -> bool:
     """温度类特征（WD(temp)/WSD(temp)/环境温度…）：按括号内轴码含 temp。"""
     return "temp" in str(feature_code(feature)).lower()
 
-
-# 温度下限查表（下标 0 = 1 月），供按点向量化取用
-_TEMP_FLOOR_LUT = np.array([TEMP_MONTHLY_MIN[m] for m in range(1, 13)],
-                           dtype=float)
 
 
 def _monthly_floor_array(times):
@@ -215,6 +354,24 @@ def _monthly_floor_array(times):
     except (TypeError, ValueError):
         return None
     return _TEMP_FLOOR_LUT[months]
+
+
+def _monthly_ceil_array(times):
+    """按时间序列向量化给出每个点的当月温度上限（无逐点 Python/regex）。"""
+    if times is None or len(times) == 0:
+        return None
+    try:
+        m0 = int(times[0].month)
+        m1 = int(times[-1].month)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if m0 == m1:
+        return np.full(len(times), _TEMP_CEIL_LUT[m0 - 1], dtype=float)
+    try:
+        months = np.asarray(times, dtype="datetime64[M]").astype("int64") % 12
+    except (TypeError, ValueError):
+        return None
+    return _TEMP_CEIL_LUT[months]
 
 
 def seasonal_min_for(feature, when):
@@ -285,14 +442,13 @@ def feature_granularity(feature):
 
 def granularity_cleaning_budget(feature, max_spikes, max_dist,
                                 max_removals):
-    """按粒度给尖峰/分布极端点预算：秒级样本多，允许更多替换。"""
+    """按粒度给尖峰/分布极端点预算：秒级样本多，允许更多替换。
+    预算表见 preprocess/清洗限值.json → 清洗预算_按粒度。"""
     gr = feature_granularity(feature)
-    if gr == "second":
-        return (max(max_spikes, 200), max(max_dist, 100),
-                max(max_removals, 100))
-    if gr == "10min":
-        return (max(max_spikes, 20), max(max_dist, 20),
-                max(max_removals, 20))
+    bump = _CLEAN_BUDGET.get(gr)
+    if bump:
+        return (max(max_spikes, bump[0]), max(max_dist, bump[1]),
+                max(max_removals, bump[2]))
     return max_spikes, max_dist, max_removals
 
 
@@ -589,31 +745,39 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
     if vrange_note:
         records.append({"说明": vrange_note})
 
-    # 0a) 季节合理性（温度类）：低于当月“不可能下限”的点不合常理 → 剔除。
-    #     与物理范围同样有 98% 命中率兜底：整段低于下限时视为量程不同，
-    #     只记录不硬过滤，避免把整条序列清空。
+    # 0a) 季节合理性（温度类）：超出当月“不可能范围”的点不合常理 → 剔除。
+    #     下限示例：湖南 7~9 月不会低于 0℃（下限取 2~3℃，恰好 0.0 的掉零
+    #     读数也算异常）；上限示例：冬季不可能出现 30~40℃，夏季结构温度
+    #     上限取 65℃。与物理范围一样有兜底：整体超范围（量程不同）时只
+    #     记录不硬过滤，避免把整条序列清空。
     season_bad = np.zeros(n, dtype=bool)
     if feature and _is_temperature_feature(feature):
-        # 只有温度类特征需要季节下限；非温度特征直接跳过（避免逐点判定）
+        # 只有温度类特征需要季节上下限；非温度特征直接跳过（避免逐点判定）
         floors = _monthly_floor_array(times)
+        ceils = _monthly_ceil_array(times)
+        _lo_hit = _hi_hit = np.zeros(n, dtype=bool)
         if floors is not None and np.isfinite(floors).any():
-            _season_hit = finite & np.isfinite(floors) & (arr < floors)
-            n_season = int(_season_hit.sum())
-            if n_season:
-                # 只有“大部分点都低于下限”（整段量程/单位不同）才降级；
-                # 少数点（含连续几天的传感器故障）一律按异常剔除。
-                if 2 * n_season <= n:
-                    season_bad = _season_hit
-                    in_range &= ~season_bad
-                    records.append({
-                        "说明": f"{n_season} 个点低于当月合理下限"
-                                f"(季节异常)，按异常值剔除",
-                    })
-                else:
-                    records.append({
-                        "说明": f"{n_season} 个点低于当月合理下限，"
-                                f"占比过半视为量程不同，未硬过滤",
-                    })
+            _lo_hit = finite & np.isfinite(floors) & (arr < floors)
+        if ceils is not None and np.isfinite(ceils).any():
+            _hi_hit = finite & np.isfinite(ceils) & (arr > ceils)
+        _season_hit = _lo_hit | _hi_hit
+        n_season = int(_season_hit.sum())
+        if n_season:
+            n_lo, n_hi = int(_lo_hit.sum()), int(_hi_hit.sum())
+            if 2 * n_season <= n:
+                season_bad = _season_hit
+                in_range &= ~season_bad
+                records.append({
+                    "说明": f"{n_season} 个点超出当月合理范围"
+                            f"(季节异常，低于下限{n_lo}个/高于上限{n_hi}个)，"
+                            f"按异常值剔除",
+                })
+            else:
+                records.append({
+                    "说明": f"{n_season} 个点超出当月合理范围"
+                            f"(低于下限{n_lo}个/高于上限{n_hi}个)，"
+                            f"占比过半视为量程不同，未硬过滤",
+                })
 
     # 0c) 判定窗口：统计值清洗按特征粒度取局部稳健基线/尺度（风速 24h），
     #     窗口=0（绘图路径与其余特征）时 mo/so 恒等于全局基线/尺度，
@@ -640,9 +804,15 @@ def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
             if not finite[t]:
                 reason = "非有限值(inf/nan)"
             elif season_bad[t]:
-                reason = (f"低于当月合理下限"
-                          f"({seasonal_min_for(feature, times[t]):g}℃)，"
-                          f"不合季节常理")
+                _fl = seasonal_min_for(feature, times[t])
+                _ce = _monthly_ceil_array([times[t]])
+                _ce = float(_ce[0]) if _ce is not None and len(_ce) else None
+                if _fl is not None and float(arr[t]) < float(_fl):
+                    reason = (f"低于当月合理下限({_fl:g}℃)，不合季节常理")
+                elif _ce is not None:
+                    reason = (f"高于当月合理上限({_ce:g}℃)，不合季节常理")
+                else:
+                    reason = "超出当月合理范围，不合季节常理"
             else:
                 reason = "超出合理范围"
             records.append({
@@ -1595,9 +1765,7 @@ def _label_in_margin(fig, axes_region, items, fontsize=12):
 # 0 为正常值的特征：风速(代号 spfs/szfs)、裂缝(前缀 LF，如 LF(Δx))、
 # 挠度(代号 nd / 前缀 ND)。静风、裂缝闭合、挠度空载时长时间为 0 属正常，
 # 不按 24h 标注；只有连续恒 0 超过一周才标“可能故障”。
-ZERO_OK_CODES = {"spfs", "szfs", "nd"}
-ZERO_OK_PREFIXES = {"LF", "ND"}
-ZERO_OK_MIN_HOURS = 24.0 * 7
+# 具体代号/前缀/小时数见 preprocess/清洗限值.json → 恒0正常特征。
 
 
 def zero_min_hours(feature, default=24.0):
@@ -1876,7 +2044,8 @@ def plot_time_series(sensor_id, sensor_name, feature, times, means,
         any_zero=any_zero)
     _handles += _a_handles
     _labels += _a_labels
-    _labels, _handles = _trim_legend_items(_labels, _handles, 1)
+    _labels, _handles = _trim_legend_items(_labels, _handles, 1,
+                                              keep_curve_labels=True)
     if _handles:
         fig.legend(_handles, _labels, loc="lower center",
                    bbox_to_anchor=(0.5, 0.005),
@@ -1933,15 +2102,17 @@ def plot_correlation(feat_a, feat_b, x, y, sensor_name, sensor_id, out_path):
     fig, ax = plt.subplots(figsize=(9, 6))
     density = density2d(x, y)
     if density is not None:
-        ax.scatter(x, y, c=density, s=8, cmap="GnBu")
+        ax.scatter(x, y, c=density, s=8, cmap="GnBu",
+                   label="测点（颜色=密度）")
     else:
-        ax.scatter(x, y, s=8, alpha=0.6, color="#4c72b0")
+        ax.scatter(x, y, s=8, alpha=0.6, color="#4c72b0", label="测点")
     slope, intercept, r = np.polyfit(x, y, 1)[0], 0.0, 0.0
     if len(x) >= 2:
         slope, intercept = np.polyfit(x, y, 1)
         r = np.corrcoef(x, y)[0, 1]
     xq = np.linspace(min(x), max(x), 100)
     ax.plot(xq, slope * xq + intercept, "k:", linewidth=1.5, label="回归直线")
+    ax.legend(loc="upper right", fontsize=9)
     ax.set_title(f"{sensor_name}（编号{sensor_id}）相关性分析")
     ax.set_xlabel(feature_display(feat_a))
     ax.set_ylabel(feature_display(feat_b))
@@ -2040,7 +2211,8 @@ def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
                                                shift_low=shift_low)
     _handles += _a_handles
     _labels += _a_labels
-    _labels, _handles = _trim_legend_items(_labels, _handles, 1)
+    _labels, _handles = _trim_legend_items(_labels, _handles, 1,
+                                              keep_curve_labels=True)
     if _handles:
         fig.legend(_handles, _labels, loc="lower center",
                    bbox_to_anchor=(0.5, 0.005),
@@ -2726,8 +2898,7 @@ def _make_legend_fit(fig, handles, labels, fontsize=12):
 
 # 色带/图例色块统一透明度：太低（0.12~0.18）在白底上淡成灰白看不出
 # 颜色（红/绿/紫都像灰带），太高会盖住曲线。图上色带与图例色块必须同值，
-# 保证“图上所见 = 图例所示”。
-_BAND_ALPHA = 0.30
+# 保证“图上所见 = 图例所示”。取值见 preprocess/清洗限值.json → 绘图阈值。
 
 
 # 图例标注项的实用性排序（数值越小越优先保留）
@@ -2795,7 +2966,8 @@ def _anno_legend_items(any_spike: bool = False, any_range: bool = False,
 
 
 def _trim_legend_items(labels, handles, uniq_sensor_count,
-                       multi_curve: bool = False):
+                       multi_curve: bool = False,
+                       keep_curve_labels: bool = False):
     """图例项限量，避免底部图例行数过多把子图挤扁。
 
     单传感器组（如 3#柱墩墩底左幅 SZJSD 的 X/Y/Z 三面板）：传感器编号
@@ -2807,30 +2979,29 @@ def _trim_legend_items(labels, handles, uniq_sensor_count,
     if not labels:
         return labels, handles
     items = list(zip(labels, handles))
+    # 标注项（色带/×标记）永远保留：图上画了就必须有图例
+    annos = [(lb, h) for lb, h in items if lb in _LEGEND_ANNO_PRIORITY]
+    others = [(lb, h) for lb, h in items if lb not in _LEGEND_ANNO_PRIORITY]
+    if keep_curve_labels and others:
+        # 单曲线图（逐传感器/按天振动）：曲线本身也是“图上画的东西”，
+        # 标签说明聚合粒度（小时均值/10分钟均值…），一并保留
+        kept = others[:1] + annos
+        return [lb for lb, _ in kept], [h for _, h in kept]
     if multi_curve:
         # 多曲线子图（应变原始+剔除温度叠加/同面板多测点）：保留编号区分线型
-        def _pri(lb):
-            if lb in _LEGEND_ANNO_PRIORITY:
-                return _LEGEND_ANNO_PRIORITY[lb] + 1
-            return 0   # 传感器编号等其余标签优先保留
-        # 上限给足：图例项与图上画的彩带/标记一一对应，宁可行高两行，
-        # 也不要把已画出来的色带/标记从图例里裁掉
-        kept = sorted(items, key=lambda x: _pri(x[0]))[:11]
+        # 编号优先保留，剩余容量给标注项（标注项已保证全部保留）
+        room = max(0, 10 - len(annos))
+        kept = others[:room] + annos
     else:
         # 单曲线（温度/湿度/挠度等，即使多面板）：编号已在子图标题里，
         # 图例只留状态项；状态项本身就代表“图上画了东西”，全部保留
         # （最多 5~7 种），避免出现“有彩带没图例”
-        kept = [(lb, h) for lb, h in items if lb in _LEGEND_ANNO_PRIORITY]
+        kept = list(annos)
         kept.sort(key=lambda x: _LEGEND_ANNO_PRIORITY[x[0]])
     return [lb for lb, _ in kept], [h for _, h in kept]
 
 
-# 面板间最小垂直间隙（图高比例）：低于该值视为上下挤在一起
-_GROUP_MIN_PANEL_GAP = 0.055
-
-# 单个测点在一张图上的缺失段标注上限：超过后不再逐段画色带/文字，
-# 只提示“缺失时段过多”（秒级数据常每隔一两分钟掉几十秒，段数成百上千）
-_MAX_GAP_ANNOTS = 12
+# 面板间最小垂直间隙、单图缺失段标注上限：见 preprocess/清洗限值.json → 绘图阈值
 
 
 def _apply_group_layout(fig, bottom, top=0.95):
@@ -3489,10 +3660,12 @@ def plot_group_correlation(position, group, series, out_path, dpi=200):
             continue
         slope, intercept = np.polyfit(xs, ys, 1)
         r = np.corrcoef(xs, ys)[0, 1]
-        ax.scatter(xs, ys, s=7, alpha=0.5, color="#4c72b0")
+        ax.scatter(xs, ys, s=7, alpha=0.5, color="#4c72b0", label="测点")
         xq = np.linspace(min(xs), max(xs), 100)
-        ax.plot(xq, slope * xq + intercept, "k:", linewidth=1.3)
+        ax.plot(xq, slope * xq + intercept, "k:", linewidth=1.3,
+                label="回归直线")
         ax.set_title(f"{a} vs {b}　r = {r:.4f}", fontsize=13)
+        ax.legend(loc="upper right", fontsize=8)
         ax.grid(True, alpha=0.3)
     if not single:
         for j in range(len(pairs), len(axes)):
@@ -3562,9 +3735,12 @@ def plot_position_correlation(position, series, pos_dir, dpi=200):
         for k, (label, xs, ys) in enumerate(valid):
             ax = axes[k]
             slope, intercept = np.polyfit(xs, ys, 1)
-            ax.scatter(xs, ys, s=7, alpha=0.5, color="#4c72b0")
+            ax.scatter(xs, ys, s=7, alpha=0.5, color="#4c72b0",
+                       label="测点")
             xq = np.linspace(min(xs), max(xs), 100)
-            ax.plot(xq, slope * xq + intercept, "k:", linewidth=1.3)
+            ax.plot(xq, slope * xq + intercept, "k:", linewidth=1.3,
+                    label="回归直线")
+            ax.legend(loc="upper right", fontsize=8)
             # 相关性系数 = 回归斜率 a（ε_temp = a·T + b），与统计表一致
             ax.set_title(f"{label}　a = {slope:.4f}", fontsize=13)
             ax.set_xlabel(feature_display(a), fontsize=11)
@@ -3706,6 +3882,10 @@ def main():
     ap.add_argument("--features", default="",
                     help="只生成指定特征(逗号分隔，如 DZJSD(xJsd),YB(rsg))；"
                          "留空=全部。用于对不满意的特征选择性重新生成")
+    ap.add_argument("--limits", default="",
+                    help="清洗限值 JSON 路径(默认 preprocess/清洗限值.json："
+                         "物理量程、温度季节上下限、恒0判定、统计窗口、"
+                         "剔除预算、绘图阈值)")
     ap.add_argument("--traffic-only", action="store_true",
                     help="只处理交通荷载(车道统计)：检查 inputs 原始数据、"
                          "必要时先转日级，再生成 交通荷载 图库/统计值；"
@@ -3758,6 +3938,8 @@ def main():
     ap.add_argument("--start", default="", help="起始日期 YYYY-MM-DD(可选)")
     ap.add_argument("--end", default="", help="结束日期 YYYY-MM-DD(可选)")
     args = ap.parse_args()
+    if args.limits:
+        apply_cleaning_limits(args.limits)
 
     # --year/--quarter 自动推导：起止日期、期号(daily 根目录在桥名推导后统一拼接)
     if args.year and args.quarter:
