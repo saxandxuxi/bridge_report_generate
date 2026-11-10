@@ -1,0 +1,5275 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+图库生成脚本（集成版）
+======================
+
+读取预处理结果，为每个传感器、每个特征：
+  1) 计算统计值（中文键）      -> 统计值/<传感器编号>.json
+  2) 生成统计图                -> 图库/<传感器编号>/<特征>/时间序列图.png
+                                图库/<传感器编号>/<特征>/频率分布图.png
+可选 --correlation：同一传感器不同特征间的相关性分析
+                                -> 图库/<传感器编号>/相关性_<特征A>_<特征B>.png
+
+数据源（自动选择）:
+  A) daily 目录(小时级明细，优先): daily/<传感器>/<特征>/<日期>.csv，
+     每天 24 行，按小时描点(一天 24 个点)，横轴仍标日期
+  仅使用 daily 目录（小时级/10 分钟级/秒级明细），已取消 summary.csv 日级回退。
+
+进一步预处理(小时级):
+  - 零散尖峰点(均值/最大/最小各自检测): 用去掉上下 5% 极端值后的
+    稳健基线判定，连续 <=3 小时、且总占比 <=2% 才替代;
+    同一小时在多天重复出现的"规律性高峰"(如早晚高峰)视为常态不替代;
+    尖峰占比 >2% 时判定疑似传感器异常，不替代并在图上/JSON 里警告;
+  - 长时间突变段: 当天"偏高/偏低小时"占多数(>=60%)且连续 >= 7 天，
+    才判定为突变区间，图上着色标注 起始时间~结束时间(精确到小时);
+
+统计值覆盖参考脚本的目标口径：
+  平均值 / 最大值 / 最小值 / 差值 / 绝对最大值 / 均方根值 / 标准差 / 中位数
+  有效小时数 / 缺失小时数 / 有效天数 / 缺失天数，以及每日统计明细。
+
+用法:
+    python build_chart_library.py [--daily-root ...] [--lib-root ...]
+                                  [--correlation] [--limit-sensors N]
+"""
+
+import argparse
+import bisect
+import calendar
+import csv
+import datetime as dt
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import warnings
+from collections import defaultdict
+from functools import lru_cache
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
+plt.rcParams["axes.unicode_minus"] = False
+
+try:
+    from scipy import stats as scipy_stats
+    HAS_SCIPY = True
+except Exception:
+    HAS_SCIPY = False
+
+# ---------------- 默认路径（可按需修改/用命令行参数覆盖） ----------------
+DEFAULT_DAILY_ROOT = r"D:\preprocess_sensor_data\daily"   # 预处理后的 daily 目录
+# 图库/统计值的上级目录 = 项目 preprocess/ 目录（按脚本位置计算，与运行目录无关）
+DEFAULT_LIB_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 传感器对照表（固定产物，不随季度变化，统一挂在 preprocess/ 下）
+DEFAULT_SENSOR_MAP_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "传感器对照")
+# ---------------------------------------------------------------------
+
+# 特征英文代号 -> 中文名（便于中文查询，未列出的按原名显示）
+# ============================================================================
+# 清洗限值：全部集中在 preprocess/清洗限值.json，代码里不保留任何副本
+#   —— 物理量程 / 温度季节上下限 / 恒0正常特征 / 统计值判定窗口 /
+#      剔除预算 / 绘图阈值 / 特征中文名
+# 改阈值只改那个 JSON。文件缺失、配置块或键缺失、值非法一律直接报错，
+# 不做静默降级（否则会悄悄少做一层清洗，报告里看不出来）。
+# ============================================================================
+_PREPROCESS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLEANING_LIMITS_FILE = os.path.join(_PREPROCESS_DIR, "清洗限值.json")
+
+# 生效值：由 apply_cleaning_limits() 在 import 时填充，各函数直接引用
+FEATURE_CN = {}
+FEATURE_RANGES = {}
+TEMP_MONTHLY_MIN = {}
+TEMP_MONTHLY_MAX = {}
+VRANGE_MIN_RATIO = 0.98
+DEFAULT_DIST_K = 20.0
+ZERO_OK_CODES = set()
+ZERO_OK_PREFIXES = set()
+ZERO_OK_MIN_HOURS = 168.0
+STAT_WINDOW_BY_GRANULARITY = {}
+_CLEAN_BUDGET = {}
+_BAND_ALPHA = 0.30
+_MAX_GAP_ANNOTS = 12
+_GROUP_MIN_PANEL_GAP = 0.055
+_TEMP_FLOOR_LUT = np.full(12, np.nan, dtype=float)
+_TEMP_CEIL_LUT = np.full(12, np.nan, dtype=float)
+
+_REQUIRED_SECTIONS = ("特征中文名", "物理量程", "温度季节下限", "温度季节上限",
+                      "物理范围生效门槛", "分布极端带宽倍数", "恒0正常特征",
+                      "统计值判定窗口_按粒度", "清洗预算_按粒度", "绘图阈值")
+
+
+def _limits_error(msg: str):
+    raise ValueError(
+        f"清洗限值配置有问题：{msg}\n  文件: {CLEANING_LIMITS_FILE}\n"
+        f"  该 JSON 是唯一的阈值来源（物理量程/温度季节上下限/恒0正常特征/"
+        f"统计值判定窗口/清洗预算/绘图阈值/特征中文名），请补齐或修正后重跑。")
+
+
+def _as_float(v, what: str) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        _limits_error(f"{what} 不是数字: {v!r}")
+
+
+def _as_int(v, what: str) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        _limits_error(f"{what} 不是整数: {v!r}")
+
+
+def _month_table(raw, what: str) -> dict:
+    """月份键支持写 "1" 或 1；必须 1~12 齐全。"""
+    if not isinstance(raw, dict):
+        _limits_error(f"{what} 应为对象（键 1~12）")
+    out = {}
+    for m in range(1, 13):
+        v = raw.get(str(m), raw.get(m))
+        if v is None:
+            _limits_error(f"{what} 缺少第 {m} 月")
+        out[m] = _as_float(v, f"{what}[{m}]")
+    return out
+
+
+def load_cleaning_limits(path: str = "") -> dict:
+    """读取并严格校验 preprocess/清洗限值.json，返回解析后的限值。"""
+    fpath = path or CLEANING_LIMITS_FILE
+    if not os.path.isfile(fpath):
+        _limits_error(f"文件不存在: {fpath}")
+    try:
+        with open(fpath, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as exc:  # noqa: BLE001
+        _limits_error(f"读取失败: {exc}")
+    if not isinstance(raw, dict):
+        _limits_error("顶层应为 JSON 对象")
+    miss = [k for k in _REQUIRED_SECTIONS if k not in raw]
+    if miss:
+        _limits_error(f"缺少配置块: {miss}")
+
+    cn_raw = raw["特征中文名"]
+    if not isinstance(cn_raw, dict) or not cn_raw:
+        _limits_error("特征中文名 应为非空对象")
+    cn = {str(k): str(v) for k, v in cn_raw.items()}
+
+    rng_raw = raw["物理量程"]
+    if not isinstance(rng_raw, dict) or not rng_raw:
+        _limits_error("物理量程 应为非空对象")
+    ranges = {}
+    for code, v in rng_raw.items():
+        if not isinstance(v, (list, tuple)) or len(v) != 2:
+            _limits_error(f"物理量程[{code}] 应为 [下限, 上限]")
+        lo = _as_float(v[0], f"物理量程[{code}]下限")
+        hi = _as_float(v[1], f"物理量程[{code}]上限")
+        if hi <= lo:
+            _limits_error(f"物理量程[{code}] 上限必须大于下限: {v!r}")
+        ranges[str(code)] = (lo, hi)
+
+    tmin = _month_table(raw["温度季节下限"], "温度季节下限")
+    tmax = _month_table(raw["温度季节上限"], "温度季节上限")
+    for m in range(1, 13):
+        if tmax[m] <= tmin[m]:
+            _limits_error(f"温度季节上下限矛盾（{m} 月上限<=下限）")
+
+    zk = raw["恒0正常特征"]
+    if not isinstance(zk, dict):
+        _limits_error("恒0正常特征 应为对象")
+    for k in ("codes", "prefixes", "min_hours"):
+        if k not in zk:
+            _limits_error(f"恒0正常特征 缺少 {k}")
+    if not isinstance(zk["codes"], list) or not isinstance(zk["prefixes"], list):
+        _limits_error("恒0正常特征.codes / prefixes 应为数组")
+    zero_ok = {"codes": [str(x) for x in zk["codes"]],
+               "prefixes": [str(x) for x in zk["prefixes"]],
+               "min_hours": _as_float(zk["min_hours"], "恒0正常特征.min_hours")}
+
+    sw_raw = raw["统计值判定窗口_按粒度"]
+    if not isinstance(sw_raw, dict):
+        _limits_error("统计值判定窗口_按粒度 应为对象")
+    stat_window = {}
+    for k in ("second", "10min", "hour"):
+        if k not in sw_raw:
+            _limits_error(f"统计值判定窗口_按粒度 缺少 {k}")
+        stat_window[k] = _as_int(sw_raw[k], f"统计值判定窗口[{k}]")
+
+    cb_raw = raw["清洗预算_按粒度"]
+    if not isinstance(cb_raw, dict) or not cb_raw:
+        _limits_error("清洗预算_按粒度 应为非空对象")
+    budgets = {}
+    for k, v in cb_raw.items():
+        if not isinstance(v, (list, tuple)) or len(v) != 3:
+            _limits_error(f"清洗预算[{k}] 应为 [尖峰数, 分布极端点数, 总剔除数]")
+        budgets[str(k)] = tuple(_as_int(x, f"清洗预算[{k}]") for x in v)
+
+    dr = raw["绘图阈值"]
+    if not isinstance(dr, dict):
+        _limits_error("绘图阈值 应为对象")
+    for k in ("色带透明度", "缺失段标注上限", "子图最小间隙"):
+        if k not in dr:
+            _limits_error(f"绘图阈值 缺少 {k}")
+    draw = {
+        "色带透明度": _as_float(dr["色带透明度"], "绘图阈值.色带透明度"),
+        "缺失段标注上限": _as_int(dr["缺失段标注上限"],
+                                  "绘图阈值.缺失段标注上限"),
+        "子图最小间隙": _as_float(dr["子图最小间隙"],
+                                  "绘图阈值.子图最小间隙"),
+    }
+    return {
+        "特征中文名": cn,
+        "物理量程": ranges,
+        "温度季节下限": tmin,
+        "温度季节上限": tmax,
+        "物理范围生效门槛": _as_float(raw["物理范围生效门槛"],
+                                      "物理范围生效门槛"),
+        "分布极端带宽倍数": _as_float(raw["分布极端带宽倍数"],
+                                      "分布极端带宽倍数"),
+        "恒0正常特征": zero_ok,
+        "统计值判定窗口_按粒度": stat_window,
+        "清洗预算_按粒度": budgets,
+        "绘图阈值": draw,
+    }
+
+
+def apply_cleaning_limits(path: str = "") -> dict:
+    """加载限值并写入模块级生效值（import 时自动调用一次）。"""
+    global VRANGE_MIN_RATIO, DEFAULT_DIST_K, ZERO_OK_CODES
+    global ZERO_OK_PREFIXES, ZERO_OK_MIN_HOURS, STAT_WINDOW_BY_GRANULARITY
+    global _CLEAN_BUDGET, _BAND_ALPHA, _MAX_GAP_ANNOTS, _GROUP_MIN_PANEL_GAP
+    global _TEMP_FLOOR_LUT, _TEMP_CEIL_LUT
+    lim = load_cleaning_limits(path)
+    FEATURE_CN.clear()
+    FEATURE_CN.update(lim["特征中文名"])
+    FEATURE_RANGES.clear()
+    FEATURE_RANGES.update(lim["物理量程"])
+    TEMP_MONTHLY_MIN.clear()
+    TEMP_MONTHLY_MIN.update(lim["温度季节下限"])
+    TEMP_MONTHLY_MAX.clear()
+    TEMP_MONTHLY_MAX.update(lim["温度季节上限"])
+    VRANGE_MIN_RATIO = lim["物理范围生效门槛"]
+    DEFAULT_DIST_K = lim["分布极端带宽倍数"]
+    ZERO_OK_CODES = set(lim["恒0正常特征"]["codes"])
+    ZERO_OK_PREFIXES = set(lim["恒0正常特征"]["prefixes"])
+    ZERO_OK_MIN_HOURS = lim["恒0正常特征"]["min_hours"]
+    STAT_WINDOW_BY_GRANULARITY = dict(lim["统计值判定窗口_按粒度"])
+    _CLEAN_BUDGET = dict(lim["清洗预算_按粒度"])
+    _BAND_ALPHA = lim["绘图阈值"]["色带透明度"]
+    _MAX_GAP_ANNOTS = lim["绘图阈值"]["缺失段标注上限"]
+    _GROUP_MIN_PANEL_GAP = lim["绘图阈值"]["子图最小间隙"]
+    _TEMP_FLOOR_LUT = np.array([TEMP_MONTHLY_MIN[m] for m in range(1, 13)],
+                               dtype=float)
+    _TEMP_CEIL_LUT = np.array([TEMP_MONTHLY_MAX[m] for m in range(1, 13)],
+                              dtype=float)
+    # 限值变了要清掉这些 lru_cache（import 时部分函数可能还没定义，按名字取）
+    for _name in ("feature_range", "_is_temperature_feature",
+                  "feature_granularity", "feature_code",
+                  "_is_direction_feature"):
+        _fn = globals().get(_name)
+        if _fn is not None and hasattr(_fn, "cache_clear"):
+            _fn.cache_clear()
+    return lim
+
+
+apply_cleaning_limits()
+
+@lru_cache(maxsize=1024)
+def feature_range(feature):
+    """按特征名(如 WSD(rh)/GNSS(Δx))取物理合理范围，取不到返回 None。
+    轴码大小写/别名不统一（Δx/Ax/x、xJsd/yJsd/zJsd、XJSD 等）时，
+    按特征族归一取范围：加速度(JSD 族)/倾角(JD 族)/位移(轴 x/y/z)
+    各自共用同一量程；风速按 _is_wind_speed_code 规则。"""
+    s = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", s)
+    code = m.group(1) if m else s
+    module = s[:s.rfind("(")].strip() if "(" in s else ""
+    cl = str(code).lower()
+    for k, v in FEATURE_RANGES.items():
+        if k.lower() == cl:
+            return v
+    # 风速符号随服务器不同（FSFX2(s) 等），按风速规则回退到水平风速范围
+    if _is_wind_speed_code(feature) and "spfs" in FEATURE_RANGES:
+        return FEATURE_RANGES["spfs"]
+    mu = module.upper()
+    # JSD 族：加速度（DZJSD/SZJSD/EZJSD…，x/y/z 各向同量程）
+    if "JSD" in mu:
+        return FEATURE_RANGES.get("xJsd")
+    # JD 族：倾角（EZJD(xJd/yJd)）
+    if "JD" in mu:
+        return FEATURE_RANGES.get("xJd")
+    # 位移/空间变位：Δx/Ax/x 等轴写法
+    if _axis_canon(code):
+        return FEATURE_RANGES.get("Δx")
+    return None
+
+
+def _stat_window_for(feature, window=0) -> int:
+    """统计值清洗的判定窗口（小时）：>0 显式指定；0=按特征粒度自动
+    （风速 24h，其余 0=全局）；负数=强制全局。"""
+    try:
+        w = int(window or 0)
+    except (TypeError, ValueError):
+        w = 0
+    if w < 0:
+        return 0
+    if w > 0:
+        return w
+    return int(STAT_WINDOW_BY_GRANULARITY.get(
+        feature_granularity(feature), 0) or 0)
+
+
+@lru_cache(maxsize=1024)
+def _is_temperature_feature(feature) -> bool:
+    """温度类特征（WD(temp)/WSD(temp)/环境温度…）：按括号内轴码含 temp。"""
+    return "temp" in str(feature_code(feature)).lower()
+
+
+
+def _monthly_floor_array(times):
+    """按时间序列向量化给出每个点的当月温度下限（无逐点 Python/regex）。
+
+    返回与 times 等长的数组；无法转换时返回 None。
+    """
+    if times is None or len(times) == 0:
+        return None
+    # 快路径：整段在同一个自然月内（按天文件/单月季度最常见）→ 常数下限
+    try:
+        m0 = int(times[0].month)
+        m1 = int(times[-1].month)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if m0 == m1:
+        return np.full(len(times), _TEMP_FLOOR_LUT[m0 - 1], dtype=float)
+    try:
+        months = np.asarray(times, dtype="datetime64[M]").astype("int64") % 12
+    except (TypeError, ValueError):
+        return None
+    return _TEMP_FLOOR_LUT[months]
+
+
+def _monthly_ceil_array(times):
+    """按时间序列向量化给出每个点的当月温度上限（无逐点 Python/regex）。"""
+    if times is None or len(times) == 0:
+        return None
+    try:
+        m0 = int(times[0].month)
+        m1 = int(times[-1].month)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if m0 == m1:
+        return np.full(len(times), _TEMP_CEIL_LUT[m0 - 1], dtype=float)
+    try:
+        months = np.asarray(times, dtype="datetime64[M]").astype("int64") % 12
+    except (TypeError, ValueError):
+        return None
+    return _TEMP_CEIL_LUT[months]
+
+
+def seasonal_min_for(feature, when):
+    """温度类特征按月份给出“不可能低于”的下限；非温度/无时间返回 None。"""
+    if not _is_temperature_feature(feature):
+        return None
+    month = getattr(when, "month", 0)
+    if month in TEMP_MONTHLY_MIN:
+        return TEMP_MONTHLY_MIN[month]
+    return None
+
+
+def _rolling_robust(arr, window, min_points=6):
+    """滑动窗口局部稳健基线/尺度（中位数 + 1.4826×MAD），逐点返回。
+
+    用于统计值清洗按特征粒度判定“相对谁异常”：窗口=24h 时，某小时的风速
+    只与前后 12 小时比，而不与整季比（避免大风天被整季基线误判）。
+    窗口退化（序列两端不足 min_points 点）的位置回退全局基线/尺度。
+    返回 (mo, so) 两个与 arr 等长的数组；so 为 0/NaN 时视为无尺度信息。
+
+    实现用 stride_tricks 一次成窗 + 沿轴中位数（C 循环），比逐点
+    np.median 快一个量级。
+    """
+    n = arr.size
+    if n == 0:
+        return np.zeros(0), np.zeros(0)
+    half = max(1, int(window) // 2)
+    w_len = 2 * half + 1
+    if n < min_points or w_len < 3:
+        return np.full(n, np.nan, dtype=float), np.full(n, np.nan, dtype=float)
+    pad = np.full(n + 2 * half, np.nan, dtype=float)
+    pad[half:half + n] = arr
+    win = np.lib.stride_tricks.sliding_window_view(pad, w_len)
+    finite_n = np.isfinite(win).sum(axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mo = np.nanmedian(win, axis=1)
+        mad = np.nanmedian(np.abs(win - mo[:, None]), axis=1)
+    so = 1.4826 * mad
+    # MAD 退化（>50% 同值）时用窗口标准差；再退化则交由调用方回落全局尺度
+    bad = ~(so > 0) & (finite_n >= min_points)
+    if np.any(bad):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            so[bad] = np.nanstd(win[bad], axis=1)
+    ok = finite_n >= min_points
+    mo = np.where(ok, mo, np.nan)
+    so = np.where(ok, so, np.nan)
+    return mo, so
+
+
+@lru_cache(maxsize=1024)
+def feature_granularity(feature):
+    """数据原生粒度（决定清洗粒度与尖峰预算）：
+      second — 加速度/振动/地震（JSD 族，秒级采样）
+      10min  — 风速/风向（FSFX 族，10min）
+      hour   — 温度/湿度/应变/位移/倾角/索力/裂缝等小时级
+    """
+    m = re.search(r"\(([^)]+)\)$", str(feature or ""))
+    code = (m.group(1) if m else str(feature or "")).lower()
+    if code.endswith("jsd") or code in ("xjsd", "yjsd", "zjsd"):
+        return "second"
+    if code in ("spfs", "szfs", "spfx", "szfx") \
+            or code.endswith("fs") or code.endswith("fx"):
+        return "10min"
+    return "hour"
+
+
+def granularity_cleaning_budget(feature, max_spikes, max_dist,
+                                max_removals):
+    """按粒度给尖峰/分布极端点预算：秒级样本多，允许更多替换。
+    预算表见 preprocess/清洗限值.json → 清洗预算_按粒度。"""
+    gr = feature_granularity(feature)
+    bump = _CLEAN_BUDGET.get(gr)
+    if bump:
+        return (max(max_spikes, bump[0]), max(max_dist, bump[1]),
+                max(max_removals, bump[2]))
+    return max_spikes, max_dist, max_removals
+
+
+def _is_wind_speed_code(feature):
+    """风速判定（跨服务器符号不统一）：轴码 spfs/szfs、以 fs 结尾，
+    或风模块(FSFX*)下轴码 s，都按风速处理；风向(spfx/szfx)不算。"""
+    s = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", s)
+    inner = (m.group(1) if m else s).lower()
+    module = s[:s.rfind("(")].strip() if "(" in s else ""
+    return (inner in ("spfs", "szfs") or inner.endswith("fs")
+            or (inner == "s" and module.upper().startswith("FSFX")))
+
+
+@lru_cache(maxsize=1024)
+def feature_code(feature):
+    m = re.search(r"\(([^)]+)\)$", feature)
+    return m.group(1) if m else feature
+
+
+# 轴写法归一（大小写/别名不统一：Δx/Ax/x、XJSD/yJsd…的括号内轴码）
+_AXIS_CANON = {
+    "Δx": "x", "Δy": "y", "Δz": "z",
+    "δx": "x", "δy": "y", "δz": "z",
+    "x": "x", "y": "y", "z": "z",
+    "ax": "x", "ay": "y", "az": "z",
+}
+
+
+def _axis_canon(code):
+    """把各种轴写法统一成 x/y/z；不是轴返回空串。"""
+    c = str(code or "")
+    if c in _AXIS_CANON:
+        return _AXIS_CANON[c]
+    return _AXIS_CANON.get(c.lower(), "")
+
+
+def feature_display(feature):
+    """把 WSD(rh) 之类的特征名补上中文说明。"""
+    m = re.search(r"\(([^)]+)\)$", feature)
+    if m:
+        for k, v in FEATURE_CN.items():
+            if k.lower() == m.group(1).lower():
+                return f"{feature}（{v}）"
+    return feature
+
+
+# 交通荷载：daily/交通荷载/车道N/日期.csv，统计库位置统计/交通荷载/交通荷载.json
+# 内以 车道X 为键（报告 cell.vehicle_count.车道X.count/ratio 引用）
+TRAFFIC_SENSOR = "交通荷载"
+TRAFFIC_STAT_FEATURE = "交通荷载"
+TRAFFIC_TOTAL_FEATURE = "总共"
+TRAFFIC_CHART_NAMES = (
+    "各车道车辆累计通过数量图.png",
+    "各车道通过数量比例图.png",
+    "各车道频率分布图.png",
+)
+
+
+def _traffic_outputs_exist(chart_dir, stats_dir):
+    """图库/统计值是否已包含交通荷载产物（跨车道图 + 位置统计 JSON）。"""
+    chart_ok = any(
+        os.path.isfile(os.path.join(chart_dir, TRAFFIC_SENSOR, fn))
+        for fn in TRAFFIC_CHART_NAMES)
+    stats_ok = os.path.isfile(os.path.join(
+        stats_dir, "位置统计", TRAFFIC_SENSOR, "交通荷载.json"))
+    return chart_ok and stats_ok
+
+
+def _traffic_period_quarters(tag):
+    """由期号标签(2026.1~3 / 2026.1~12)推导需要的季度标签列表。"""
+    m = re.match(r"^(\d{4})\.(\d{1,2})~(\d{1,2})$", str(tag or ""))
+    if not m:
+        return []
+    year, qs, qe = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    out = []
+    for q in range((qs - 1) // 3 + 1, (qe - 1) // 3 + 2):
+        if q <= 4:
+            out.append(f"{year}Q{q}")
+    return out
+
+
+def _ensure_traffic_daily(args, bridge, tag):
+    """交通荷载 原始数据(xls) -> 日级数据 兜底：
+    - inputs/<桥>_车道统计_<期> 无原始数据 -> 打印提醒（不报错）；
+    - 有原始数据但 daily 缺 交通荷载/车道N -> 调用 preprocess_sensor_data.py
+      --traffic-only 生成日级；
+    - 已有日级 -> 跳过。返回 True 表示已有（或已生成）交通日级数据。
+    """
+    if not bridge:
+        return False
+
+    def _has_daily():
+        roots = args.daily_root if isinstance(args.daily_root, (list, tuple)) \
+            else [args.daily_root]
+        for root in roots:
+            tdir = os.path.join(str(root or ""), TRAFFIC_SENSOR)
+            if os.path.isdir(tdir) and any(
+                    os.path.isdir(os.path.join(tdir, d))
+                    for d in os.listdir(tdir)):
+                return True
+        return False
+
+    if _has_daily():
+        return True
+
+    # 检查 inputs 原始数据（项目根目录的 inputs/）
+    proj_root = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+    inputs_dir = os.path.join(proj_root, "inputs")
+    quarters = _traffic_period_quarters(tag)
+    raw_dirs = []
+    for q in quarters:
+        d = os.path.join(inputs_dir, f"{bridge}_车道统计_{q}")
+        if os.path.isdir(d) and any(
+                re.match(r"车道统计_\d{4}-\d{2}-\d{2}_\d{4}-\d{2}-\d{2}\.xls$",
+                         fn) for fn in os.listdir(d)):
+            raw_dirs.append(d)
+    if not raw_dirs:
+        print("[提醒] 未找到交通荷载原始数据 "
+              f"inputs/{bridge}_车道统计_{'、'.join(quarters) or tag}。"
+              "请先在 web“数据处理-交通荷载预处理”里下载（需开 VPN），"
+              "或命令行运行 download_monitor_data.py 后再处理。")
+        return False
+
+    # 有原始数据但没日级 -> 调用 preprocess_sensor_data.py --traffic-only
+    if isinstance(args.daily_root, (list, tuple)):
+        bridge_root = (os.path.dirname(str(args.daily_root[0]))
+                       if args.daily_root else "")
+    else:
+        bridge_root = os.path.dirname(str(args.daily_root or ""))
+    if not bridge_root:
+        return False
+    py = sys.executable
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "preprocess_sensor_data.py")
+    cmd = [py, script, "--traffic-only", "--bridge", bridge,
+           "--output-root", bridge_root,
+           "--traffic-root", inputs_dir, "--resume"]
+    if args.start:
+        cmd += ["--start", args.start]
+    if args.end:
+        cmd += ["--end", args.end]
+    print("[交通荷载] 原始数据已就绪，生成日级数据: " + " ".join(cmd),
+          flush=True)
+    try:
+        r = subprocess.run(cmd, cwd=os.path.dirname(script), timeout=7200)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[警告] 交通荷载日级预处理失败: {exc}", flush=True)
+        return False
+    if r.returncode != 0:
+        print(f"[警告] 交通荷载日级预处理失败，返回码 {r.returncode}", flush=True)
+        return False
+    return _has_daily()
+
+
+def _true_runs(mask):
+    """返回连续 True 段的 (start, end_exclusive) 列表（numpy 向量化，O(n) 在 C 层）。"""
+    m = np.asarray(mask, dtype=bool)
+    padded = np.concatenate(([False], m, [False]))
+    diff = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(diff == 1)
+    ends = np.flatnonzero(diff == -1)
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _fmt_cn_date(d):
+    """2026-02-05 -> 2月5日(图上标注用)。"""
+    try:
+        y, m, day = d.split("-")
+        return f"{int(m)}月{int(day)}日"
+    except ValueError:
+        return d
+
+
+def _fmt_compact_time(t, with_year=False):
+    """紧凑时间: 1.18 3；with_year=True 时 2026.1.18 3。"""
+    if with_year:
+        return f"{t.year}.{t.month}.{t.day} {t.hour}"
+    return f"{t.month}.{t.day} {t.hour}"
+
+
+def _fmt_compact_range(start_s, end_s):
+    """紧凑时间段: 1.18 3~1.19 5(同年省年份)；跨年时两端带年份。"""
+    try:
+        t0 = dt.datetime.strptime(str(start_s), "%Y-%m-%d %H:%M")
+        t1 = dt.datetime.strptime(str(end_s), "%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return f"{start_s}~{end_s}"
+    if t0.year != t1.year:
+        return f"{_fmt_compact_time(t0, True)}~{_fmt_compact_time(t1, True)}"
+    return f"{_fmt_compact_time(t0)}~{_fmt_compact_time(t1)}"
+
+
+def clean_series_value(times, values, label, spike_k=5.0, max_run=3,
+                       hour_level=True, vrange=None, max_spikes=3,
+                       dist_k=20.0, max_dist_outliers=5,
+                       max_total_removals=5, feature="", stat_window=0):
+    """
+    尖峰替代 v3（统计值清洗按特征粒度判定；绘图路径不传 feature/stat_window，
+    行为与 v2 完全一致）：
+      0) 物理范围过滤(vrange=(min,max)): 超出合理范围的值(如错误码 435000、
+         9e7 等)一律用稳健基线替代，不论连续多长；边界给微小容差
+         (量程的百万分之一)，避免基线贴近边界(如索力≈0)时把
+         微小测量噪声(-1e-06)误判为超范围导致满图红点。
+        仅当 >=98% 数据落在区间内(VRANGE_MIN_RATIO)才做硬过滤；
+         否则认为该范围与传感器量程不符，仅作绘图参考、不硬过滤，
+         交由分布极端点/尖峰逻辑处理。
+      0a) 季节合理性(feature=温度类时)：温度类特征按月份有“不可能低于”的
+         下限（如湖南 7~9 月不会低于 0℃），低于下限的点不合常理，按异常
+         值剔除（不占剔除限额）；同样有 98% 命中率兜底，整段低于下限时
+         只记录不硬过滤。
+      0c) 判定窗口(stat_window): 统计值清洗专用。>0 时用滑动窗口内的局部
+         稳健基线/尺度判定“相对谁异常”（风速按 24h），=0 时沿用全局基线
+         （原始逻辑）。绘图路径不传，保持原状。
+      0b) 分布极端点过滤(dist_k): 单个孤立点偏离超过 dist_k×尺度(默认20)
+         视为异常值，按偏离程度排名最多剔除 max_total_removals 个；
+         连续超过 max_run 个点的异常段不剔除，由 detect_deviation_blocks
+         在图上标注"XX时间段偏高/低"(精确到数据粒度)。
+        dist_k=0 时关闭散点异常值剔除(异常段标注仍用默认带宽)。
+      1) 稳健基线: 去掉上下 5% 极端值后的中位数(不被少数大值拉偏);
+      2) 稳健尺度: 修剪后的 MAD(1.4826 倍);
+      3) 候选异常: |x - 基线| > spike_k * 尺度(仅对范围内值);
+      4) 零散尖峰: 滑动(重合)窗口法——每个窗口去掉 1 个最小+1 个最大后
+         看局部分布，被去掉的极值偏离窗口中心超过 spike_k×窗口尺度、
+         且被 >=2 个重合窗口命中才算尖峰；连续 > max_run 个点的长段
+         属于持续偏高/偏低，不剔除，只标注;
+      5) 规律性高峰: 小时级数据中，同一小时在多天(>=20%天数)重复出现
+         的高点视为常态(如早晚高峰)，不替代只记录;
+      6) 数量上限: 分布极端点 + 零散尖峰合计最多剔除 max_total_removals
+         (默认5)个：分布极端点按偏离程度排名先占名额，
+         剩余额度给零散尖峰(仍受 max_spikes 上限约束)；
+         物理范围外/非有限值不计入。
+    返回 (新序列, 记录, 尖峰替代下标, 范围外替代下标)。
+    """
+    n = len(values)
+    if n < 10:
+        return list(values), [], [], []
+    arr = np.array(values, dtype=float)
+    finite = np.isfinite(arr)
+    in_range = finite.copy()
+    vrange_note = None
+    n_gross = 0
+    if vrange:
+        rlo, rhi = vrange
+        tol = max(1e-9, (rhi - rlo) * 1e-6)
+        n_finite = int(finite.sum())
+        # 超量级毛刺（超出量程 10 倍以上，如振动 5.6e6 m/s²）：无条件剔除，
+        # 不受 98% 命中率门槛影响——秒级/10min 特征尖峰占比高时门槛会失效。
+        _span = max(rhi - rlo, 1e-9)
+        gross = finite & ((arr > rhi + 10 * _span)
+                          | (arr < rlo - 10 * _span))
+        n_gross = int(gross.sum())
+        _ok = finite & ~gross
+        ratio = ((arr >= rlo) & (arr <= rhi) & _ok).sum() / int(_ok.sum()) \
+            if int(_ok.sum()) else 0.0
+        if ratio >= VRANGE_MIN_RATIO:
+            # 数据大部分落在区间内 → 物理范围可信，做硬过滤(边界带微小容差)
+            in_range &= (arr >= rlo - tol) & (arr <= rhi + tol)
+        else:
+            # 数据大量落在区间外(如传感器量程/单位不同) → 范围失去参考意义，
+            # 仅作绘图参考，不硬过滤，交由分布极端点/尖峰逻辑处理
+            vrange_note = (f"物理范围({rlo:g}~{rhi:g})与数据量程不符"
+                           f"(命中率{ratio * 100:.1f}%)，仅作绘图参考未硬过滤")
+        if n_gross:
+            in_range &= ~gross
+            vrange_note = ((vrange_note + "；") if vrange_note else "") \
+                + f"超量级毛刺{n_gross}个无条件剔除"
+
+    # 1) 稳健基线(只用范围内、去 5%~95% 极值的数据)
+    base_arr = arr[in_range]
+    if base_arr.size < 5:
+        return list(values), [], [], []
+    lo, hi = np.percentile(base_arr, [5.0, 95.0])
+    trim = base_arr[(base_arr >= lo) & (base_arr <= hi)]
+    if trim.size < 5:
+        return list(values), [], [], []
+    base = float(np.median(trim))
+    mad = float(np.median(np.abs(trim - base)))
+    if mad > 0:
+        scale = 1.4826 * mad
+    else:
+        # MAD 退化(>50% 值相同，如静止传感器恒为 0)时，用中央 68% 分位距
+        # 估计尺度，避免被少数极端长段(如连续 24h = 3000)把 std 撑大，
+        # 导致分布极端值/长段连续异常全部漏检。
+        p84, p16 = np.percentile(trim, [84.0, 16.0])
+        scale = max(0.0, (p84 - p16) / 2.0)
+        if scale <= 0:
+            scale = float(trim.std()) if trim.std() > 0 else 1.0
+    fixed = arr.copy()
+    indices = []
+    range_indices = []
+    records = []
+    if vrange_note:
+        records.append({"说明": vrange_note})
+
+    # 0a) 季节合理性（温度类）：超出当月“不可能范围”的点不合常理 → 剔除。
+    #     下限示例：湖南 7~9 月不会低于 0℃（下限取 2~3℃，恰好 0.0 的掉零
+    #     读数也算异常）；上限示例：冬季不可能出现 30~40℃，夏季结构温度
+    #     上限取 65℃。与物理范围一样有兜底：整体超范围（量程不同）时只
+    #     记录不硬过滤，避免把整条序列清空。
+    season_bad = np.zeros(n, dtype=bool)
+    if feature and _is_temperature_feature(feature):
+        # 只有温度类特征需要季节上下限；非温度特征直接跳过（避免逐点判定）
+        floors = _monthly_floor_array(times)
+        ceils = _monthly_ceil_array(times)
+        _lo_hit = _hi_hit = np.zeros(n, dtype=bool)
+        if floors is not None and np.isfinite(floors).any():
+            _lo_hit = finite & np.isfinite(floors) & (arr < floors)
+        if ceils is not None and np.isfinite(ceils).any():
+            _hi_hit = finite & np.isfinite(ceils) & (arr > ceils)
+        _season_hit = _lo_hit | _hi_hit
+        n_season = int(_season_hit.sum())
+        if n_season:
+            n_lo, n_hi = int(_lo_hit.sum()), int(_hi_hit.sum())
+            if 2 * n_season <= n:
+                season_bad = _season_hit
+                in_range &= ~season_bad
+                records.append({
+                    "说明": f"{n_season} 个点超出当月合理范围"
+                            f"(季节异常，低于下限{n_lo}个/高于上限{n_hi}个)，"
+                            f"按异常值剔除",
+                })
+            else:
+                records.append({
+                    "说明": f"{n_season} 个点超出当月合理范围"
+                            f"(低于下限{n_lo}个/高于上限{n_hi}个)，"
+                            f"占比过半视为量程不同，未硬过滤",
+                })
+
+    # 0c) 判定窗口：统计值清洗按特征粒度取局部稳健基线/尺度（风速 24h），
+    #     窗口=0（绘图路径与其余特征）时 mo/so 恒等于全局基线/尺度，
+    #     与修改前的逻辑完全一致。
+    _win = int(stat_window or 0)
+    if _win >= 6 and n >= _win:
+        _mo, _so = _rolling_robust(arr, _win)
+        mo = np.where(np.isfinite(_mo), _mo, base)
+        so = np.where(np.isfinite(_so) & (_so > 1e-12), _so, scale)
+        records.append({
+            "说明": f"统计值清洗按 {_win}h 局部窗口判定异常"
+                    f"(特征粒度={feature_granularity(feature)})",
+        })
+    else:
+        mo = np.full(n, base, dtype=float)
+        so = np.full(n, scale, dtype=float)
+
+    # 0) 范围外/非有限值: 一律替代(不论连续长短，物理错误不占剔除限额)
+    bad = ~in_range
+    if np.any(bad):
+        for t in np.flatnonzero(bad):
+            fixed[t] = mo[t]
+            range_indices.append(int(t))
+            if not finite[t]:
+                reason = "非有限值(inf/nan)"
+            elif season_bad[t]:
+                _fl = seasonal_min_for(feature, times[t])
+                _ce = _monthly_ceil_array([times[t]])
+                _ce = float(_ce[0]) if _ce is not None and len(_ce) else None
+                if _fl is not None and float(arr[t]) < float(_fl):
+                    reason = (f"低于当月合理下限({_fl:g}℃)，不合季节常理")
+                elif _ce is not None:
+                    reason = (f"高于当月合理上限({_ce:g}℃)，不合季节常理")
+                else:
+                    reason = "超出当月合理范围，不合季节常理"
+            else:
+                reason = "超出合理范围"
+            records.append({
+                "时间": str(times[int(t)]),
+                "系列": label,
+                "原值": round(float(arr[t]), 6),
+                "处理": f"{reason}，用稳健基线替代",
+            })
+
+    # 0b) 分布极端点：单个孤立点偏离超过 dist_k×尺度(默认20)才剔除；
+    #     连续 > max_run 个点的段视为持续偏高/偏低，不剔除，
+    #     由 detect_deviation_blocks 负责标注(精确到数据粒度)。
+    budget = max(0, int(max_total_removals))
+    block_k = dist_k if dist_k > 0 else DEFAULT_DIST_K
+    dev_arr = np.abs(arr - mo)           # 相对判定窗口基线的偏离（排名用）
+    # 窗口很平（局部尺度≈0）时用全局带宽的 25% 兜底，避免把平静时段的
+    # 正常小波动当异常剔除；窗口=0（so=scale）时该兜底不改变原逻辑。
+    _floor = 0.25 * block_k * scale
+    dist_band = np.maximum(block_k * np.maximum(so, 1e-12), _floor)
+    if budget > 0 and np.any(dist_band > 0):
+        cand = in_range & (dev_arr > dist_band)
+        idx = np.flatnonzero(cand)
+        iso = [int(t) for t in idx
+               if (t == 0 or not cand[t - 1])
+               and (t == n - 1 or not cand[t + 1])]
+        if iso:
+            dev = dev_arr[iso]
+            order = np.argsort(-dev, kind="stable")
+            take = min(len(iso), budget)
+            for k in range(take):
+                t = iso[order[k]]
+                bad[t] = True
+                fixed[t] = mo[t]
+                range_indices.append(t)
+                records.append({
+                    "时间": str(times[t]),
+                    "系列": label,
+                    "原值": round(float(arr[t]), 6),
+                    "处理": "超出分布极端范围，用稳健基线替代",
+                })
+            budget -= take
+
+    # 4) 零散尖峰：滑动(重合)窗口法，在每个窗口内去掉 1 个最小+1 个最大后
+    #     看局部分布，被去掉的极值远离窗口中心才记为候选(需 >=2 个重合窗口
+    #     命中)；再用全局带的连续段长度过滤，长段(> max_run)内的点属于
+    #     持续偏高/偏低(走标注)，不当尖峰。
+    spike_pos = set()
+    if spike_k > 0 and budget > 0:
+        cand_idx, _v = detect_window_spikes(
+            times, values, k=spike_k, min_votes=2)
+        # 长段过滤: 全局 spike 带中连续 > max_run 的点 → 突变段, 不判尖峰
+        _spike_band = np.maximum(spike_k * np.maximum(so, 1e-12),
+                                 0.25 * spike_k * scale)
+        glob_cand = in_range & ~bad & (dev_arr > _spike_band)
+        long_exclude = np.zeros(n, dtype=bool)
+        for a, b in _true_runs(glob_cand):
+            if b - a > max_run:
+                long_exclude[a:b] = True
+        spike_pos = set(t for t in cand_idx
+                        if in_range[t] and not bad[t]
+                        and not long_exclude[t])
+
+    # 5) 规律性高峰(小时级)
+    regular_hours = set()
+    if hour_level and spike_pos:
+        total_days = len({t.date() for t in times})
+        by_hour = defaultdict(set)
+        for t in spike_pos:
+            by_hour[times[t].hour].add(times[t].date())
+        for hour, days in by_hour.items():
+            if len(days) >= max(3, int(0.2 * total_days)):
+                regular_hours.add(hour)
+
+    if hour_level:
+        real = sorted(t for t in spike_pos
+                      if times[t].hour not in regular_hours)
+    else:
+        real = sorted(spike_pos)
+
+    if regular_hours:
+        records.append({
+            "说明": f"规律性高峰小时 {sorted(regular_hours)}，"
+                    f"视为常态未替代",
+        })
+    if not real:
+        return fixed.tolist(), records, indices, range_indices
+
+    # 6) 数量上限: 与分布极端点合计最多剔除 max_total_removals 个
+    if len(real) > min(max_spikes, budget):
+        real = sorted(real, key=lambda t: abs(arr[t] - mo[t]),
+                      reverse=True)[:min(max_spikes, budget)]
+        records.append({
+            "说明": f"尖峰候选超过上限，只替代最极端的 "
+                    f"{min(max_spikes, budget)} 个，"
+                    f"其余视为正常分布尾部未替代",
+        })
+
+    for t in real:
+        fixed[t] = mo[t]
+        indices.append(t)
+        records.append({
+            "时间": str(times[t]),
+            "系列": label,
+            "原值": round(float(arr[t]), 6),
+            "处理": "零散尖峰，用稳健基线替代",
+        })
+    return fixed.tolist(), records, indices, range_indices
+
+
+def fill_long_gaps(hours, means, maxs, mins, min_gap_hours=24):
+    """
+    检测连续缺失 >= min_gap_hours(默认 24 小时)的数据段：
+      1) 在有效小时序列中，相邻两点间隔 >= 24h 即为缺段;
+      2) 缺失小时用首尾有效值之间的线性插值填充(只用于绘图，不改统计);
+      3) 返回 (填充后的 4 个序列, 缺段记录)。
+    """
+    n = len(hours)
+    if n < 2:
+        return (list(hours), list(means), list(maxs), list(mins)), []
+    filled_hours = list(hours)
+    filled_means = list(means)
+    filled_maxs = list(maxs)
+    filled_mins = list(mins)
+    gaps = []
+    for i in range(n - 1):
+        t0, t1 = hours[i], hours[i + 1]
+        gap_h = (t1 - t0).total_seconds() / 3600.0
+        if gap_h < min_gap_hours:
+            continue
+        miss_count = int(round(gap_h)) - 1
+        gaps.append({
+            "起始时间": t0.strftime("%Y-%m-%d %H:%M"),
+            "结束时间": t1.strftime("%Y-%m-%d %H:%M"),
+            "缺失小时数": miss_count,
+        })
+        v0m, v1m = filled_means[i], filled_means[i + 1]
+        v0x, v1x = filled_maxs[i], filled_maxs[i + 1]
+        v0n, v1n = filled_mins[i], filled_mins[i + 1]
+        for k in range(1, int(round(gap_h))):
+            frac = k / gap_h
+            filled_hours.append(t0 + dt.timedelta(hours=k))
+            filled_means.append(v0m + (v1m - v0m) * frac)
+            filled_maxs.append(v0x + (v1x - v0x) * frac)
+            filled_mins.append(v0n + (v1n - v0n) * frac)
+    # 按时间排序(填充点插在中间)
+    order = sorted(range(len(filled_hours)), key=lambda k: filled_hours[k])
+    filled_hours = [filled_hours[k] for k in order]
+    filled_means = [filled_means[k] for k in order]
+    filled_maxs = [filled_maxs[k] for k in order]
+    filled_mins = [filled_mins[k] for k in order]
+    return (filled_hours, filled_means, filled_maxs, filled_mins), gaps
+
+
+def _find_runs(labels):
+    """找出连续非零段 [(起点, 终点)]。"""
+    runs = []
+    i, n = 0, len(labels)
+    while i < n:
+        if labels[i] != 0:
+            j = i
+            while j < n and labels[j] == labels[i]:
+                j += 1
+            runs.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def detect_level_shifts(hours, values, min_days=7, k=2.5, max_iter=4,
+                        day_frac=0.6):
+    """
+    小时级突变段检测：
+      1) 用基线(中位数)与稳健尺度给每个小时打 高/低/正常 标签；
+      2) 按天统计"偏高/偏低小时占比"，占比 >= day_frac 的天才是突变天；
+      3) 3 天多数票平滑，剔除最长段后重估基线(迭代)；
+      4) 连续 >= min_days 的突变天合并为区间，起止精确到小时。
+    返回 [{起始时间, 结束时间, 方向, 段内平均值, 段内最大/最小值,
+           基线平均值}]。
+    """
+    arr = np.array(values, dtype=float)
+    n = len(arr)
+    if n < 24 * (min_days + 2) or k <= 0:
+        return []
+    # 按天分组
+    day_index = {}
+    for i, h in enumerate(hours):
+        day_index.setdefault(h.date().isoformat(), []).append(i)
+    day_dates = sorted(day_index)
+
+    med = np.median(arr)
+    mad = np.median(np.abs(arr - med))
+    scale = 1.4826 * mad if mad > 0 else (arr.std() if arr.std() > 0 else 1.0)
+    day_labels = np.zeros(len(day_dates), dtype=int)
+
+    for _ in range(max_iter):
+        dev = arr - med
+        high = dev > k * scale
+        low = dev < -k * scale
+        lab = np.zeros(len(day_dates), dtype=int)
+        for di, d in enumerate(day_dates):
+            pos = day_index[d]
+            nh = int(np.count_nonzero(high[pos]))
+            nl = int(np.count_nonzero(low[pos]))
+            if nh >= day_frac * len(pos) and nh > nl:
+                lab[di] = 1
+            elif nl >= day_frac * len(pos) and nl > nh:
+                lab[di] = -1
+        # 3 天多数票平滑，去掉零散标签
+        sm = np.zeros(len(day_dates), dtype=int)
+        for i in range(len(day_dates)):
+            w = lab[max(0, i - 1):min(len(day_dates), i + 2)]
+            if np.count_nonzero(w == 1) >= 2:
+                sm[i] = 1
+            elif np.count_nonzero(w == -1) >= 2:
+                sm[i] = -1
+        day_labels = sm
+        # 剔除最长段后重估基线，避免长突变污染"正常"水平
+        runs = _find_runs(day_labels)
+        if not runs:
+            break
+        longest = max(runs, key=lambda r: r[1] - r[0] + 1)
+        exclude_days = set(day_dates[longest[0]:longest[1] + 1])
+        mask = np.array([h.date().isoformat() not in exclude_days
+                         for h in hours])
+        if mask.sum() < 24 * 5:
+            break
+        new_med = np.median(arr[mask])
+        if abs(new_med - med) < 1e-12:
+            break
+        med = new_med
+        mad = np.median(np.abs(arr[mask] - med))
+        scale = (1.4826 * mad if mad > 0
+                 else (arr[mask].std() if arr[mask].std() > 0 else 1.0))
+
+    shifts = []
+    for a, b in _find_runs(day_labels):
+        if b - a + 1 < min_days:
+            continue
+        d0, d1 = day_dates[a], day_dates[b]
+        start_dt = dt.datetime.fromisoformat(d0)
+        end_dt = dt.datetime.fromisoformat(d1).replace(hour=23, minute=59)
+        pos = [i for i in range(n)
+               if day_dates[a] <= hours[i].date().isoformat() <= day_dates[b]]
+        seg = arr[pos]
+        shifts.append({
+            "起始时间": start_dt.strftime("%Y-%m-%d %H:%M"),
+            "结束时间": end_dt.strftime("%Y-%m-%d %H:%M"),
+            "方向": "偏高" if day_labels[a] == 1 else "偏低",
+            "段内平均值": round(float(seg.mean()), 6),
+            "段内最大值": round(float(seg.max()), 6),
+            "段内最小值": round(float(seg.min()), 6),
+            "基线平均值": round(float(med), 6),
+        })
+    return shifts
+
+
+def detect_deviation_blocks(times, values, k=DEFAULT_DIST_K, min_points=2):
+    """检测连续偏离稳健基线超过 k×尺度的异常段（不剔除，仅用于图上标注）。
+    起始/结束时间精确到数据粒度(小时/10分钟/秒)。
+    返回与 detect_level_shifts 相同结构的记录列表：
+    [{起始时间, 结束时间, 方向(偏高/偏低), 段内平均值, 段内最大值,
+      段内最小值, 基线平均值, 来源}]。
+    """
+    arr = np.asarray(values, dtype=float)
+    n = len(arr)
+    if n < 2 or k <= 0:
+        return []
+    finite = np.isfinite(arr)
+    base_arr = arr[finite]
+    if base_arr.size < 5:
+        return []
+    lo, hi = np.percentile(base_arr, [5.0, 95.0])
+    trim = base_arr[(base_arr >= lo) & (base_arr <= hi)]
+    if trim.size < 5:
+        return []
+    base = float(np.median(trim))
+    mad = float(np.median(np.abs(trim - base)))
+    if mad > 0:
+        scale = 1.4826 * mad
+    else:
+        p84, p16 = np.percentile(trim, [84.0, 16.0])
+        scale = max(0.0, (p84 - p16) / 2.0)
+        if scale <= 0:
+            scale = float(trim.std()) if trim.std() > 0 else 1.0
+    if scale <= 0:
+        return []
+    cand = finite & (np.abs(arr - base) > k * scale)
+    blocks = []
+    for a, b in _true_runs(cand):
+        if b - a < min_points:
+            continue
+        seg = arr[a:b]
+        direction = "偏高" if float(np.median(seg)) >= base else "偏低"
+        blocks.append({
+            "起始时间": times[a].strftime("%Y-%m-%d %H:%M"),
+            "结束时间": times[b - 1].strftime("%Y-%m-%d %H:%M"),
+            "方向": direction,
+            "段内平均值": round(float(seg.mean()), 6),
+            "段内最大值": round(float(seg.max()), 6),
+            "段内最小值": round(float(seg.min()), 6),
+            "基线平均值": round(base, 6),
+            "来源": "持续偏高/偏低段标注",
+        })
+    return blocks
+
+
+def detect_window_spikes(times, values, k=5.0, min_votes=2,
+                         window_points=None, overlap=0.5):
+    """滑动(重合)窗口尖峰检测：
+    在每个窗口内去掉 1 个最小值+1 个最大值，用剩余值估计窗口的稳健中心/尺度；
+    被去掉的极值若偏离中心超过 k×尺度，记为尖峰候选(1票)；
+    同一数据点被 >= min_votes 个重合窗口同时命中才确认为尖峰，
+    从而避免在波动较大的区间把局部极值误判为尖峰。
+    返回 (候选下标列表, {下标: 票数})。
+    说明：重合窗口下数据点被 1~2 个窗口覆盖，票数取
+    min(min_votes, 覆盖窗口数)，避免边界点永远凑不够票被漏检。
+    """
+    arr = np.asarray(values, dtype=float)
+    n = len(arr)
+    if n < 10:
+        return [], {}
+    if window_points is None:
+        bucket = _series_bucket_seconds(times)
+        window_points = max(12, int(round(86400.0 / bucket)))  # 默认约一天
+        # 数据不足一天(如振动按天出图)时收缩窗口，保证仍有多个滑动窗口
+        window_points = min(window_points, max(24, n // 4))
+    stride = max(1, int(round(window_points * (1.0 - overlap))))
+    votes = {}
+    appears = {}
+    i = 0
+    while i < n:
+        a = i
+        b = min(n, i + window_points)
+        m = b - a
+        if m >= 5:
+            seg = arr[a:b]
+            finite_seg = np.isfinite(seg)
+            if finite_seg.sum() >= 5:
+                seg = seg[finite_seg]
+                imin = a + int(np.flatnonzero(finite_seg)[int(np.argmin(seg))])
+                imax = a + int(np.flatnonzero(finite_seg)[int(np.argmax(seg))])
+                keep = np.ones(finite_seg.sum(), dtype=bool)
+                keep[int(np.argmin(seg))] = False
+                keep[int(np.argmax(seg))] = False
+                rest = seg[keep]
+                if rest.size >= 3:
+                    center = float(np.median(rest))
+                    mad = float(np.median(np.abs(rest - center)))
+                    scale = (1.4826 * mad if mad > 0
+                             else (float(rest.std()) if rest.std() > 0 else 1.0))
+                    for idx, val in ((imin, float(arr[imin])),
+                                     (imax, float(arr[imax]))):
+                        appears[idx] = appears.get(idx, 0) + 1
+                        if abs(val - center) > k * scale:
+                            votes[idx] = votes.get(idx, 0) + 1
+        i += stride
+    cand = sorted(t for t, v in votes.items()
+                  if v >= min(min_votes, appears.get(t, 0)))
+    return cand, votes
+
+
+def load_sensor_map(path):
+    """读取 传感器编号名称.json，返回 {编号: {信息}} 或 {}。"""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("传感器", {})
+    except Exception as exc:
+        print(f"[警告] 传感器编号名称.json 读取失败: {exc}")
+        return {}
+
+
+def discover_sensor_features(daily_root):
+    """扫描 daily/<传感器>/<特征>/ 目录结构。"""
+    roots = daily_root if isinstance(daily_root, (list, tuple)) \
+        else [daily_root]
+    result = {}
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for sensor in sorted(os.listdir(root)):
+            sroot = os.path.join(root, sensor)
+            if not os.path.isdir(sroot):
+                continue
+            feats = result.setdefault(sensor, [])
+            for feature in sorted(os.listdir(sroot)):
+                froot = os.path.join(sroot, feature)
+                if os.path.isdir(froot) and any(
+                        fn.lower().endswith(".csv")
+                        for fn in os.listdir(froot)):
+                    if feature not in feats:
+                        feats.append(feature)
+    return result
+
+
+def read_hourly_series(feature_dir):
+    """
+    读取某个特征目录下的全部 daily CSV(每天 24 行小时统计)。
+    返回 (hours, hmeans, hmaxs, hmins, day_dates, day_means,
+          day_maxs, day_mins, day_secs, day_miss)。
+    hours 为每个非空小时的起点(datetime)，对应的小时均值/最大/最小
+    分别放在 hmeans/hmaxs/hmins；同时给出清洗前的每日聚合。
+    """
+    dirs = feature_dir if isinstance(feature_dir, (list, tuple)) \
+        else [feature_dir]
+    hours, hmeans, hmaxs, hmins = [], [], [], []
+    day_dates, day_means, day_maxs, day_mins = [], [], [], []
+    day_secs, day_miss = [], []
+    seen_hours = set()
+    for fdir in dirs:
+        if not os.path.isdir(fdir):
+            continue
+        for fn in sorted(os.listdir(fdir)):
+            if not fn.lower().endswith(".csv"):
+                continue
+            date = fn[:-4]
+            path = os.path.join(fdir, fn)
+            d_means, d_maxs, d_mins, d_secs = [], [], [], 0
+            try:
+                with open(path, "r", newline="", encoding="utf-8",
+                          errors="replace") as f:
+                    reader = csv.reader(f)
+                    next(reader, None)
+                    for row in reader:
+                        if len(row) < 6:
+                            continue
+                        try:
+                            count = int(row[1])
+                            mean = float(row[2])
+                            vmin = float(row[3])
+                            vmax = float(row[4])
+                        except ValueError:
+                            continue
+                        if (count <= 0 or not (math.isfinite(mean)
+                                               and math.isfinite(vmin)
+                                               and math.isfinite(vmax))):
+                            continue
+                        try:
+                            t = dt.datetime.fromisoformat(row[0])
+                        except ValueError:
+                            continue
+                        if t in seen_hours:
+                            continue
+                        seen_hours.add(t)
+                        hours.append(t)
+                        hmeans.append(mean)
+                        hmaxs.append(vmax)
+                        hmins.append(vmin)
+                        d_means.append(mean)
+                        d_maxs.append(vmax)
+                        d_mins.append(vmin)
+                        d_secs += count
+            except OSError:
+                continue
+            if d_means:
+                day_dates.append(date)
+                day_means.append(float(np.mean(d_means)))
+                day_maxs.append(float(np.max(d_maxs)))
+                day_mins.append(float(np.min(d_mins)))
+                day_secs.append(d_secs)
+                day_miss.append(max(0, 86400 - d_secs))
+    # 年度多季度目录按字符串排序（2025.10~12 会在 2025.1~3 之前），
+    # 读出的 hours 可能不是时间顺序；下游 filled_map/缺段检测都要求
+    # 严格递增，这里统一按时间排序（hmeans/hmaxs/hmins 同步）。
+    if len(hours) > 1:
+        order = sorted(range(len(hours)), key=lambda k: hours[k])
+        hours = [hours[k] for k in order]
+        hmeans = [hmeans[k] for k in order]
+        hmaxs = [hmaxs[k] for k in order]
+        hmins = [hmins[k] for k in order]
+    if len(day_dates) > 1:
+        dorder = sorted(range(len(day_dates)), key=lambda k: day_dates[k])
+        day_dates = [day_dates[k] for k in dorder]
+        day_means = [day_means[k] for k in dorder]
+        day_maxs = [day_maxs[k] for k in dorder]
+        day_mins = [day_mins[k] for k in dorder]
+        day_secs = [day_secs[k] for k in dorder]
+        day_miss = [day_miss[k] for k in dorder]
+    return (hours, hmeans, hmaxs, hmins,
+            day_dates, day_means, day_maxs, day_mins, day_secs, day_miss)
+
+
+def _is_second_level_feature(feature: str) -> bool:
+    """振动/地震类特征(JSD 族)为秒级全量数据，按天出图。
+    符号随服务器不同（DZJSD(xJsd)/SZJSD(yJsd)/…JSD(裸轴) 等）：
+    括号内轴码以 jsd 结尾，或模块名含 JSD，都按秒级处理。"""
+    s = str(feature or "")
+    m = re.search(r"\(([^)]+)\)$", s)
+    inner = (m.group(1) if m else s).lower()
+    module = s[:s.rfind("(")].strip() if "(" in s else ""
+    return inner.endswith("jsd") or "jsd" in module.lower()
+
+
+_READ_CSV_PANDAS_MIN_BYTES = 150000   # 大文件(秒级/10分钟级)走 pandas 快速解析
+
+
+def _read_daily_file_pandas(path):
+    """pandas 快速解析（列数/格式不符时抛异常，由调用方回退纯 python）。"""
+    import pandas as pd
+    cols = ["t", "count", "mean", "min", "max"]
+    try:
+        # header=None + skiprows=1：跳掉表头行，且不用数据行当表头
+        df = pd.read_csv(path, header=None, skiprows=1,
+                         usecols=[0, 1, 2, 3, 4], names=cols, engine="c",
+                         dtype={"count": "float64", "mean": "float64",
+                                "min": "float64", "max": "float64"})
+    except ValueError:
+        # 个别单元格是非数值脏数据 → 按字符串读再强制转数值（慢一点但不报错）
+        df = pd.read_csv(path, header=None, skiprows=1,
+                         usecols=[0, 1, 2, 3, 4], names=cols, engine="c",
+                         dtype=str)
+        for c in ("count", "mean", "min", "max"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if df.shape[1] < 5:
+        raise ValueError("列数不足")
+    try:
+        ts = pd.to_datetime(df["t"], format="ISO8601", errors="coerce")
+    except (TypeError, ValueError):     # 旧版 pandas 不认 "ISO8601"
+        ts = pd.to_datetime(df["t"], errors="coerce")
+    ts = ts.to_numpy(dtype="datetime64[us]")
+    cnt = df["count"].to_numpy(dtype="float64")
+    mean = df["mean"].to_numpy(dtype="float64")
+    vmin = df["min"].to_numpy(dtype="float64")
+    vmax = df["max"].to_numpy(dtype="float64")
+    ok = ((cnt > 0) & np.isfinite(mean) & np.isfinite(vmin)
+          & np.isfinite(vmax) & ~np.isnat(ts))
+    secs = int(cnt[ok].sum())
+    return (ts[ok].astype(object).tolist(), mean[ok].tolist(),
+            vmax[ok].tolist(), vmin[ok].tolist(), secs, max(0, 86400 - secs))
+
+
+def read_daily_file(path):
+    """读取单个 daily CSV(一天)：返回 (hours, means, maxs, mins, secs, miss)。
+    秒级特征一天 86400 行，小时级一天 24 行。
+
+    大文件优先用 pandas(C 解析，实测约快 3 倍)，小文件/无 pandas/格式异常
+    时回退纯 python 逐行解析，两种路径的取值口径完全一致。
+    """
+    try:
+        if os.path.getsize(path) >= _READ_CSV_PANDAS_MIN_BYTES:
+            return _read_daily_file_pandas(path)
+    except Exception:  # noqa: BLE001  pandas 不可用/格式不符 → 回退
+        pass
+    hours, means, maxs, mins = [], [], [], []
+    secs = 0
+    try:
+        with open(path, "r", newline="", encoding="utf-8",
+                  errors="replace") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) < 6:
+                    continue
+                try:
+                    count = int(row[1])
+                    mean = float(row[2])
+                    vmin = float(row[3])
+                    vmax = float(row[4])
+                except ValueError:
+                    continue
+                if (count <= 0 or not (math.isfinite(mean)
+                                       and math.isfinite(vmin)
+                                       and math.isfinite(vmax))):
+                    continue
+                try:
+                    t = dt.datetime.fromisoformat(row[0])
+                except ValueError:
+                    continue
+                hours.append(t)
+                means.append(mean)
+                maxs.append(vmax)
+                mins.append(vmin)
+                secs += count
+    except OSError:
+        return [], [], [], [], 0, 86400
+    miss = max(0, 86400 - secs)
+    return hours, means, maxs, mins, secs, miss
+
+
+def aggregate_daily_from_hours(hours, means, maxs, mins):
+    """把清洗后的序列重新聚合成每日序列(统计口径用)。"""
+    by_day = {}
+    for h, m, x, n in zip(hours, means, maxs, mins):
+        d = h.date().isoformat()
+        by_day.setdefault(d, [[], [], []])
+        by_day[d][0].append(m)
+        by_day[d][1].append(x)
+        by_day[d][2].append(n)
+    day_dates, day_means, day_maxs, day_mins = [], [], [], []
+    day_secs, day_miss = [], []
+    for d in sorted(by_day):
+        ms, xs, ns = by_day[d]
+        day_dates.append(d)
+        day_means.append(float(np.mean(ms)))
+        day_maxs.append(float(np.max(xs)))
+        day_mins.append(float(np.min(ns)))
+        day_secs.append(len(ms) * 3600)
+        day_miss.append(max(0, 86400 - len(ms) * 3600))
+    return (day_dates, day_means, day_maxs, day_mins,
+            day_secs, day_miss)
+
+
+def compute_feature_stats(dates, means, maxs, mins, seconds=None,
+                          missing=None, start=None, end=None,
+                          native_means=None, native_maxs=None,
+                          native_mins=None):
+    """
+    由日期/日均值/日最大/日最小系列计算整体统计值 + 每日统计。
+    native_means/native_maxs/native_mins 提供时（清洗后的原生粒度序列，
+    小时级或秒级，取决于特征），平均值/均方根值用原生均值序列，极值用
+    原生最大/最小序列（与报告表格“日最大值/日最小值”聚合口径一致），
+    避免“日均值抹平”导致极值失真（如振动 ±5 的瞬时极值被日均摊到 -0.0003）。
+    小时最大/最小字段与小时均值一样经过 clean_series_value 清洗
+    （尖峰替代/分布极端剔除/物理范围过滤，参数一致），极值直接取
+    清洗后的原生最大/最小序列，与小时均值时间序列绘图口径一致。
+    seconds/missing 为每日有效/缺失秒数(可选，来自 daily 明细)。
+    返回 (stats_dict, dates, means, maxs, mins)。
+    """
+    if not dates:
+        return None, [], [], [], []
+
+    # 日期过滤
+    kept = [(d, m, x, n, (s if seconds else 0),
+             (k if missing else 0))
+            for d, m, x, n, s, k in zip(
+                dates, means, maxs, mins,
+                seconds or [0] * len(dates), missing or [0] * len(dates))
+            if (not start or d >= start) and (not end or d <= end)]
+    if not kept:
+        return None, [], [], [], []
+    dates, means, maxs, mins, secs, mis = zip(*kept)
+    dates = list(dates)
+    means = list(means)
+    maxs = list(maxs)
+    mins = list(mins)
+    secs = list(secs)
+    mis = list(mis)
+
+    ext_means = native_means if native_means is not None else means
+    ext_maxs = native_maxs if native_maxs is not None else maxs
+    ext_mins = native_mins if native_mins is not None else mins
+    if not ext_maxs:
+        ext_maxs = maxs
+    if not ext_mins:
+        ext_mins = mins
+    arr = np.array(ext_means, dtype=float)
+    daily = []
+    for d, m, x, n in zip(dates, means, maxs, mins):
+        daily.append({
+            "日期": d,
+            "平均值": round(float(m), 6),
+            "最大值": round(float(x), 6),
+            "最小值": round(float(n), 6),
+        })
+
+    stats = {
+        "起始日期": dates[0],
+        "结束日期": dates[-1],
+        "覆盖天数": len(dates),
+        "有效小时数": 0,
+        "缺失小时数": 0,
+        "平均值": round(float(np.mean(arr)), 6),
+        "中位数": round(float(np.median(arr)), 6),
+        "标准差": round(float(np.std(arr)), 6),
+        "最大值": round(float(np.max(ext_maxs)), 6),
+        "最小值": round(float(np.min(ext_mins)), 6),
+        "差值": round(float(np.max(ext_maxs) - np.min(ext_mins)), 6),
+        "绝对最大值": round(
+            max(abs(np.max(ext_maxs)), abs(np.min(ext_mins))), 6),
+        "均方根值": round(float(np.sqrt(np.mean(np.square(arr)))), 6),
+        "每日统计": daily,
+    }
+
+    # 有效/缺失小时数：秒数->小时；无秒数时按天估算(每天 24 小时)
+    if any(secs):
+        total_sec = sum(secs)
+        missing_sec = sum(mis)
+        stats["有效小时数"] = round(total_sec / 3600, 1)
+        stats["缺失小时数"] = round(missing_sec / 3600, 1)
+        stats["有效天数"] = sum(1 for s in secs if s > 0)
+        stats["缺失天数"] = sum(1 for s in secs if s <= 0)
+    else:
+        stats["有效小时数"] = len(dates) * 24
+        stats["缺失小时数"] = 0
+        stats["有效天数"] = len(dates)
+        stats["缺失天数"] = 0
+    # 报告期内“整日无数据”的天数也要计入缺失：缺失小时数/缺失天数目前只
+    # 统计“有数据的天内部”的空洞，完全没数据的天（如传感器停采一个月）不会
+    # 进入 dates，导致“覆盖330天却显示缺失0”与图上缺段对不上。
+    if start and end:
+        try:
+            expected = ((dt.date.fromisoformat(str(end)[:10])
+                         - dt.date.fromisoformat(str(start)[:10])).days + 1)
+        except ValueError:
+            expected = len(dates)
+        absent = max(0, expected - len(dates))
+        if absent:
+            stats["缺失天数"] = float(stats.get("缺失天数") or 0) + absent
+            stats["缺失小时数"] = round(
+                float(stats.get("缺失小时数") or 0) + absent * 24, 1)
+    return stats, dates, means, maxs, mins
+
+
+def _temp_effect_stats(strain_hours, strain_means, strain_maxs, strain_mins,
+                       temp_hours, temp_means):
+    """应变-温度联合统计：按小时对齐做线性回归，
+    计算 剔除温度后的应变最大值/最小值 与 Pearson 相关系数。
+
+    温度必须用清洗后的小时序列（与结构温度曲线图一致），不用原始序列；
+    剔除温度最大值 = max(清洗后 小时最大序列 - (a·T+b))，
+    剔除温度最小值 = min(清洗后 小时最小序列 - (a·T+b))，
+    与其他特征“极值取清洗后最大/最小序列”的口径一致。
+    统计库“相关性系数”存 Pearson 相关系数 r；
+    散点图（相关性_<特征A>-<特征B>.png）单独标注回归斜率 a（με/℃）。
+    返回 dict 或 None(数据不足)。"""
+    if not strain_hours or not temp_hours:
+        return None
+    si = {}
+    for i, h in enumerate(strain_hours):
+        si.setdefault(h, i)
+    xs, ys = [], []
+    for j, h in enumerate(temp_hours):
+        i = si.get(h)
+        if i is not None:
+            xs.append(float(temp_means[j]))
+            ys.append(float(strain_means[i]))
+    if len(xs) < 10:
+        return None
+    xa, ya = np.array(xs, dtype=float), np.array(ys, dtype=float)
+    try:
+        slope, intercept = np.polyfit(xa, ya, 1)
+    except Exception:  # noqa: BLE001
+        return None
+    # 残差(荷载应变) = 应变 - (a·T+b)；极值按 最大/最小 序列分别计算
+    if strain_maxs is not None and strain_mins is not None:
+        resid_max, resid_min = [], []
+        for j, h in enumerate(temp_hours):
+            i = si.get(h)
+            if i is None:
+                continue
+            fitted = slope * float(temp_means[j]) + intercept
+            resid_max.append(float(strain_maxs[i]) - fitted)
+            resid_min.append(float(strain_mins[i]) - fitted)
+        rm_max = max(resid_max) if resid_max else None
+        rm_min = min(resid_min) if resid_min else None
+    else:
+        resid = ya - (slope * xa + intercept)   # 均值残差（兼容无 max/min）
+        rm_max = float(np.max(resid))
+        rm_min = float(np.min(resid))
+    if rm_max is None or rm_min is None:
+        return None
+    if float(np.std(xa)) == 0:
+        corr = 0.0
+    else:
+        corr = float(np.corrcoef(xa, ya)[0, 1])
+    return {
+        "剔除温度最大值": round(float(rm_max), 6),
+        "剔除温度最小值": round(float(rm_min), 6),
+        "相关性系数": round(corr, 6),
+    }
+
+
+def _norm_strain_temp_pos(name):
+    """位置归一化：去掉 上游/下游/左幅/右幅/左侧/右侧 等方位词，
+    用于应变-温度联合统计的跨位置配对（如 顶板左幅 <-> 顶板上游）。
+    保留 顶板/底板/截面/跨/墩 等核心部位，避免把不同截面错配。"""
+    s = str(name or "")
+    for w in ("上游侧", "下游侧", "上游", "下游", "左幅", "右幅",
+              "左侧", "右侧"):
+        s = s.replace(w, "")
+    return re.sub(r"\s+", "", s)
+
+
+# 应变“剔除温度后”荷载应变叠加线的颜色（绿色实线，与主曲线的彩色
+# 实线区分；叠加线自身的尖峰/异常标记统一用黑色，不用红色/品红）
+LOAD_STRAIN_OVERLAY_COLOR = "#00b050"
+LOAD_STRAIN_OVERLAY_MARK_COLOR = "#000000"
+
+
+# 允许“应变-温度跨方位配对”的大桥：编号文件里应变用 左幅/右幅、
+# 结构温度用 上游/下游，两套命名无法精确配对。
+# 对这些桥：同一核心部位(如 炎陵侧中跨1/4截面顶板)的温度序列，
+# 同时配给 左幅/右幅 的应变计算 剔除温度/相关性系数。
+STRAIN_TEMP_CROSS_SIDE_BRIDGES = {"洣水河", "洣水河特大桥", "mishuihe"}
+
+
+def _fmt_cn_dt(s):
+    """2026-03-26 14:00 -> 3月26日14时(图上标注用)。"""
+    try:
+        d, t = s.split(" ")
+        y, m, day = d.split("-")
+        hh = t.split(":")[0]
+        return f"{int(m)}月{int(day)}日{int(hh)}时"
+    except (ValueError, AttributeError):
+        return s
+
+
+def _fmt_dt_short(dt):
+    """紧凑时间标注：1.18 3（月.日 时），分钟非整时补 :MM；
+    同一年份不重复写年份，避免图上标注过长重叠。"""
+    if getattr(dt, "minute", 0) == 0:
+        return f"{dt.month}.{dt.day} {dt.hour}"
+    return f"{dt.month}.{dt.day} {dt.hour}:{dt.minute:02d}"
+
+
+def _series_bucket_seconds(hours) -> int:
+    """由时间序列的相邻最小间隔反推聚合粒度(秒)：小时=3600、10分钟=600、秒级=1。"""
+    if not hours or len(hours) < 2:
+        return 3600
+    # 桶长均匀，只需采样前若干间隔即可确定粒度，避免对秒级全量做 O(n) 循环
+    sample = min(len(hours) - 1, 1000)
+    deltas = [(b - a).total_seconds()
+              for a, b in zip(hours[:sample + 1], hours[1:sample + 2])
+              if b > a]
+    if not deltas:
+        return 3600
+    d = min(deltas)
+    for cand in (86400, 3600, 1800, 600, 300, 60, 30, 10, 5, 1):
+        if abs(d - cand) < cand * 0.02:
+            return cand
+    return int(round(d))
+
+
+def _bucket_label(bucket_seconds: int) -> str:
+    """聚合粒度对应的图例文案：小时=均值、10分钟=10分钟均值、秒级=秒级均值。"""
+    if bucket_seconds == 3600:
+        return "均值"
+    if bucket_seconds == 600:
+        return "10分钟均值"
+    if bucket_seconds == 60:
+        return "1分钟均值"
+    if bucket_seconds == 1:
+        return "秒级均值"
+    return f"{bucket_seconds}秒均值"
+
+
+def _granularity_label(panels) -> str:
+    """由面板序列的实际时间间隔反推图标题粒度文案。
+    风速 daily 是 10 分钟、振动/地震是秒级、普通传感器是小时，
+    不能再写死“小时均值”（否则 10 分钟数据画的图会标成小时均值）。"""
+    hours = next((s["hours"] for _, sub in panels for s in sub
+                  if s.get("hours")), [])
+    b = _series_bucket_seconds(hours) if hours else 3600
+    return {3600: "小时均值", 1800: "半小时均值", 600: "10分钟均值",
+            300: "5分钟均值", 60: "1分钟均值", 1: "秒级均值"}.get(
+        b, f"{b}秒均值")
+
+
+def _unwrap_circular(values, period=360.0, jump=180.0):
+    """把 0~360 的圆形量展开成连续序列（仅用于绘图）。
+    消除 350°->10° 这种 0<->360 的伪跳变（物理上只差 20°）。"""
+    arr = np.asarray(values, dtype=float)
+    out = arr.copy()
+    for i in range(1, len(arr)):
+        d = out[i] - out[i - 1]
+        if d > jump:
+            out[i] -= period
+        elif d < -jump:
+            out[i] += period
+    return out
+
+
+@lru_cache(maxsize=1024)
+def _is_direction_feature(feature: str) -> bool:
+    """风向类特征：水平风向 spfx、竖向风向 szfx（圆形量）。"""
+    return feature_code(feature) in ("spfx", "szfx")
+
+
+def _cap_shifts(shifts, max_n: int = 5):
+    """突变段只保留偏离(段均值-基线)最大的前 max_n 条，避免标注淹没图面。"""
+    if max_n <= 0 or len(shifts) <= max_n:
+        return shifts
+    def key(s):
+        try:
+            return abs(float(s.get("段内平均值", 0)) - float(s.get("基线平均值", 0)))
+        except (TypeError, ValueError):
+            return 0.0
+    return sorted(shifts, key=key, reverse=True)[:max_n]
+
+
+def _cap_annotations(items, max_n=5, key=None):
+    """标注(缺失/突变段)过多时只保留最显著的 max_n 条并返回被截断的条数，
+    避免图上文字重叠；默认按缺失小时数降序。返回 (保留列表, 截断条数)。"""
+    items = list(items or [])
+    if len(items) <= max_n:
+        return items, 0
+    if key is None:
+        key = lambda it: float(it.get("缺失小时数", 0) or 0)
+    ordered = sorted(items, key=key, reverse=True)[:max_n]
+    return ordered, len(items) - max_n
+
+
+def _label_on_bands(ax, fig, items, fontsize=12, max_n=4):
+    """缺失/突变段 ≤ max_n 条时，文字统一放图上方留白区逐行排列：
+    - 按行高向上扩展 y 轴预留空间，文字不会压住数据线段；
+    - 一行一条，行高固定，绝不重叠；
+    - 图上色带保留，文字与色带通过紧凑时间段文字对应。"""
+    if not items:
+        return
+    try:
+        from matplotlib.dates import date2num
+    except Exception:  # noqa: BLE001
+        date2num = None
+    n = len(items)
+    y0, y1 = ax.get_ylim()
+    yspan = (y1 - y0) or 1.0
+    try:
+        ax_pt = (ax.get_window_extent(fig.canvas.get_renderer()).height
+                 * 72.0 / fig.dpi)
+    except Exception:  # noqa: BLE001
+        ax_pt = 250.0
+    row_pt = fontsize + 6.0
+    if ax_pt > n * row_pt:
+        expand = n * row_pt * yspan / (ax_pt - n * row_pt)
+    else:
+        expand = yspan * max(0.3, 0.05 * n)
+    y1_new = y1 + expand
+    ax.set_ylim(y0, y1_new)
+    row_h = expand / n
+    xlim0, xlim1 = ax.get_xlim()
+    x_left = xlim0 + (xlim1 - xlim0) * 0.02
+    for i, (label, color, xv, yv) in enumerate(items):
+        ax.text(x_left, y1_new - row_h * (i + 0.5), label,
+                ha="left", va="center", fontsize=fontsize,
+                fontweight="bold", color=color,
+                bbox=dict(facecolor="white", alpha=0.9, pad=0.9,
+                          edgecolor=color, linewidth=0.8))
+
+
+def _label_in_margin(fig, axes_region, items, fontsize=12):
+    """缺失/突变段 > max_n 条时，文字全部挪到子图右侧留白区逐行排列，
+    图内只保留色带；行高按子图纵向高度均分，不会重叠。"""
+    if not items:
+        return
+    n = len(items)
+    left, bottom, width, height = axes_region.bounds
+    row_h = height / n
+    x = left + width + 0.012
+    for i, (label, color, xv, yv) in enumerate(items):
+        fig.text(x, bottom + height - row_h * (i + 0.5), label,
+                 ha="left", va="center", fontsize=fontsize,
+                 fontweight="bold", color=color,
+                 bbox=dict(facecolor="white", alpha=0.9, pad=0.7,
+                           edgecolor=color, linewidth=0.8))
+
+
+# 0 为正常值的特征：风速(代号 spfs/szfs)、裂缝(前缀 LF，如 LF(Δx))、
+# 挠度(代号 nd / 前缀 ND)。静风、裂缝闭合、挠度空载时长时间为 0 属正常，
+# 不按 24h 标注；只有连续恒 0 超过一周才标“可能故障”。
+# 具体代号/前缀/小时数见 preprocess/清洗限值.json → 恒0正常特征。
+
+
+def zero_min_hours(feature, default=24.0):
+    """恒 0 标注阈值：普通特征 24h；0 为正常值的特征放宽到一周。"""
+    if _is_wind_speed_code(feature):
+        return ZERO_OK_MIN_HOURS   # 静风时风速为 0 属正常
+    code = feature_code(feature)
+    if code in ZERO_OK_CODES:
+        return ZERO_OK_MIN_HOURS
+    prefix = re.match(r"^[A-Za-z0-9]+", str(feature))
+    if prefix and prefix.group(0).upper() in ZERO_OK_PREFIXES:
+        return ZERO_OK_MIN_HOURS
+    return default
+
+
+def detect_zero_runs(hours, means, min_hours=24.0):
+    """检测连续恒 0 超过 min_hours 的段（疑似传感器故障/未接入），
+    返回 [{起始时间, 结束时间, 持续小时数}]。
+
+    用布尔掩码 + 段边界一次算完（C 层），秒级序列(8.6 万点/天)下比
+    逐点 Python 循环快一个量级；取值口径与逐点循环一致。
+    """
+    runs = []
+    if not hours or len(hours) < 2:
+        return runs
+    try:
+        arr = np.asarray(means, dtype=float)
+        is_zero = np.abs(arr) <= 1e-9          # NaN 比较为 False，与逐点一致
+    except (TypeError, ValueError):
+        is_zero = None
+    if is_zero is not None:
+        if not is_zero.any():
+            return runs
+        idx = np.flatnonzero(is_zero)
+        brk = np.flatnonzero(np.diff(idx) > 1)
+        starts = np.concatenate(([idx[0]], idx[brk + 1]))
+        ends = np.concatenate((idx[brk], [idx[-1]]))
+        # 时长只用段首/段尾两个时间戳（避免把整条时间序列转 datetime64）
+        for a, b in zip(starts.tolist(), ends.tolist()):
+            dur = (hours[b] - hours[a]).total_seconds() / 3600.0
+            if dur > min_hours:
+                runs.append({
+                    "起始时间": hours[a].strftime("%Y-%m-%d %H:%M"),
+                    "结束时间": hours[b].strftime("%Y-%m-%d %H:%M"),
+                    "持续小时数": round(dur, 1),
+                })
+        return runs
+    start = None
+    for i, v in enumerate(means):
+        try:
+            is_zero = abs(float(v)) <= 1e-9
+        except (TypeError, ValueError):
+            is_zero = False
+        if is_zero and start is None:
+            start = i
+        elif not is_zero and start is not None:
+            dur = (hours[i - 1] - hours[start]).total_seconds() / 3600.0
+            if dur > min_hours:
+                runs.append({
+                    "起始时间": hours[start].strftime("%Y-%m-%d %H:%M"),
+                    "结束时间": hours[i - 1].strftime("%Y-%m-%d %H:%M"),
+                    "持续小时数": round(dur, 1),
+                })
+            start = None
+    if start is not None:
+        dur = (hours[-1] - hours[start]).total_seconds() / 3600.0
+        if dur > min_hours:
+            runs.append({
+                "起始时间": hours[start].strftime("%Y-%m-%d %H:%M"),
+                "结束时间": hours[-1].strftime("%Y-%m-%d %H:%M"),
+                "持续小时数": round(dur, 1),
+            })
+    return runs
+
+
+def _mask_zero_run_hours(hours, means, maxs, mins, runs):
+    """剔除落在连续恒0时间段内的小时/秒级点，返回 (hours, means, maxs, mins)。"""
+    if not runs:
+        return hours, means, maxs, mins
+    spans = []
+    for z in runs:
+        try:
+            t0 = dt.datetime.strptime(z["起始时间"], "%Y-%m-%d %H:%M")
+            t1 = dt.datetime.strptime(z["结束时间"], "%Y-%m-%d %H:%M")
+        except (ValueError, KeyError):
+            continue
+        spans.append((t0, t1))
+    if not spans:
+        return hours, means, maxs, mins
+    # 二分定位每个故障段的起止下标，一次切片剔除（时间序列按时间升序）
+    try:
+        keep = np.ones(len(hours), dtype=bool)
+        for t0, t1 in spans:
+            keep[bisect.bisect_left(hours, t0):
+                 bisect.bisect_right(hours, t1)] = False
+        return ([h for h, k in zip(hours, keep) if k],
+                [v for v, k in zip(means, keep) if k],
+                [v for v, k in zip(maxs, keep) if k],
+                [v for v, k in zip(mins, keep) if k])
+    except (TypeError, ValueError):
+        pass
+    ho, mo, xo, no = [], [], [], []
+    for i, h in enumerate(hours):
+        if any(t0 <= h <= t1 for t0, t1 in spans):
+            continue
+        ho.append(h)
+        mo.append(means[i])
+        xo.append(maxs[i])
+        no.append(mins[i])
+    return ho, mo, xo, no
+
+
+def _mask_zero_fault_hours(hours, means, maxs, mins, feature):
+    """统计极值用：剔除恒0故障段（含短于 24h 的段）。
+
+    绘图标注只对 >=24h（0为正常值特征 168h）的段标“可能故障”；统计极值
+    若也只剔 24h 段，几小时/十几小时的传感器掉零会把应变“最小值”打成 0。
+    因此这里对“0不是正常值”的特征，额外按 小时最小/最大序列 检测
+    >=6h 的连续恒0段，一并从 均值/最大/最小 序列剔除后再算极值
+    （平均值/中位数同步排除，与极值口径一致）。
+    风速/挠度/裂缝等“0为正常值”的特征保持原 168h 规则，不做短段剔除。
+    返回 (剔除后 hours, means, maxs, mins, 故障段列表)。
+    """
+    code = feature_code(feature)
+    prefix_m = re.match(r"^[A-Za-z0-9]+", str(feature or ""))
+    zero_ok = (code in ZERO_OK_CODES
+               or (prefix_m
+                   and prefix_m.group(0).upper() in ZERO_OK_PREFIXES))
+    runs = detect_zero_runs(hours, means,
+                            min_hours=zero_min_hours(feature))
+    if not zero_ok:
+        # 短时恒0段：按 最小/最大 序列检测（传感器掉零时 min=max=mean=0）
+        runs_min = detect_zero_runs(hours, mins, min_hours=6.0)
+        runs_max = detect_zero_runs(hours, maxs, min_hours=6.0)
+        for r in runs_min + runs_max:
+            if r not in runs:
+                runs.append(r)
+        runs.sort(key=lambda r: str(r.get("起始时间") or ""))
+    if not runs:
+        return hours, means, maxs, mins, []
+    return _mask_zero_run_hours(hours, means, maxs, mins, runs) + (runs,)
+
+
+def plot_time_series(sensor_id, sensor_name, feature, times, means,
+                     out_path, shifts=None, replaced_indices=None,
+                     replaced_range_indices=None, hour_level=True, gaps=None):
+    """
+    时间序列图。
+    hour_level=True 时按小时描点(一天 24 个点)，横轴仍标日期；
+    突变/缺失/恒0段只画色带，不写文字标注（方案第 2 节）。
+    """
+    x = list(range(len(times)))
+    fig, ax = plt.subplots(figsize=(15, 5.5))
+    mean_label = _bucket_label(_series_bucket_seconds(times))
+    plot_means = (_unwrap_circular(means) if _is_direction_feature(feature)
+                  else means)
+    if len(times) == 1:
+        ax.plot(x, plot_means, "o", color="#1f77b4", markersize=8,
+                label=mean_label)
+    else:
+        ax.plot(x, plot_means, "-", color="#1f77b4", linewidth=1.2,
+                label=mean_label)
+
+    # 尖峰替代位置打叉标记(黑=统计尖峰, 红=物理范围外)
+    if replaced_indices:
+        ax.plot([x[i] for i in replaced_indices],
+                [means[i] for i in replaced_indices],
+                "x", color="black", markersize=8, mew=2,
+                label="已替换尖峰点(统计)")
+    if replaced_range_indices:
+        ax.plot([x[i] for i in replaced_range_indices],
+                [means[i] for i in replaced_range_indices],
+                "x", color="#d62728", markersize=9, mew=2,
+                label="已剔除异常值(物理范围外/分布极端)")
+
+    # 横轴: 日期刻度(小时模式下按天定位，避免挤)
+    if hour_level:
+        day_start = {}
+        for i, t in enumerate(times):
+            day_start.setdefault(t.date().isoformat(), i)
+        day_list = sorted(day_start)
+        step = max(1, len(day_list) // 15)
+        tick_days = day_list[::step]
+        ax.set_xticks([day_start[d] for d in tick_days])
+        ax.set_xticklabels([_fmt_cn_date(d) for d in tick_days],
+                           rotation=30, fontsize=9)
+    else:
+        step = max(1, len(times) // 15)
+        ax.set_xticks(x[::step])
+        ax.set_xticklabels([_fmt_cn_date(t) for t in times[::step]],
+                           rotation=30, fontsize=9)
+
+    # 突变区间 + 缺失段标注: 着色段全部画上；≤4 段文字标在带上，
+    # >4 段文字挪到图右侧留白区，图上只留色带
+    label_items = []   # [(label, color, xv, yv)]
+    any_gap = any_zero = False
+    shift_high = shift_low = False
+    for s in shifts or []:
+        try:
+            t0 = dt.datetime.strptime(s["起始时间"], "%Y-%m-%d %H:%M")
+            t1 = dt.datetime.strptime(s["结束时间"], "%Y-%m-%d %H:%M")
+            if hour_level:
+                a = min(range(len(times)),
+                        key=lambda i: abs((times[i] - t0).total_seconds()))
+                b = min(range(len(times)),
+                        key=lambda i: abs((times[i] - t1).total_seconds()))
+            else:
+                a = times.index(s["起始时间"][:10])
+                b = times.index(s["结束时间"][:10])
+        except (ValueError, KeyError):
+            continue
+        color = "#d62728" if s["方向"] == "偏高" else "#2ca02c"
+        ax.axvspan(a - 0.5, b + 0.5, color=color, alpha=_BAND_ALPHA)
+        if s["方向"] == "偏高":
+            shift_high = True
+        else:
+            shift_low = True
+        yv = (plot_means[b] if b < len(plot_means)
+              else plot_means[a] if a < len(plot_means) else 0.0)
+        label_items.append(
+            (f"{_fmt_compact_range(s['起始时间'], s['结束时间'])} "
+             f"{s['方向']}", color, float(x[a]), yv))
+    for g in gaps or []:
+        try:
+            t0 = dt.datetime.strptime(g["起始时间"], "%Y-%m-%d %H:%M")
+            t1 = dt.datetime.strptime(g["结束时间"], "%Y-%m-%d %H:%M")
+            a = min(range(len(times)),
+                    key=lambda i: abs((times[i] - t0).total_seconds()))
+            b = min(range(len(times)),
+                    key=lambda i: abs((times[i] - t1).total_seconds()))
+        except (ValueError, KeyError):
+            continue
+        ax.axvspan(a - 0.5, b + 0.5, color="#ff7f0e", alpha=_BAND_ALPHA)
+        any_gap = True
+        yv = (plot_means[b] if b < len(plot_means)
+              else plot_means[a] if a < len(plot_means) else 0.0)
+        label_items.append(
+            (_fmt_compact_range(g['起始时间'], g['结束时间']), "#d2691e",
+             float(x[a]), yv))
+    # 连续恒 0 超过阈值(普通 24h，0 为正常值的特征一周)：
+    # 紫色色带 + “编号(时间段)可能故障”
+    for z in detect_zero_runs(times, means,
+                              min_hours=zero_min_hours(feature)):
+        try:
+            t0 = dt.datetime.strptime(z["起始时间"], "%Y-%m-%d %H:%M")
+            t1 = dt.datetime.strptime(z["结束时间"], "%Y-%m-%d %H:%M")
+            a = min(range(len(times)),
+                    key=lambda i: abs((times[i] - t0).total_seconds()))
+            b = min(range(len(times)),
+                    key=lambda i: abs((times[i] - t1).total_seconds()))
+        except (ValueError, KeyError):
+            continue
+        ax.axvspan(a - 0.5, b + 0.5, color="#9467bd", alpha=_BAND_ALPHA)
+        any_zero = True
+        yv = (plot_means[b] if b < len(plot_means)
+              else plot_means[a] if a < len(plot_means) else 0.0)
+        label_items.append(
+            (f"{sensor_id}({_fmt_compact_range(z['起始时间'], z['结束时间'])})"
+             f"可能故障", "#9467bd", float(x[a]), yv))
+    # 方案第 2 节：图上不再画文字标注（彩色带保留，时段信息在统计 JSON/结论段）
+
+    ax.set_xlabel("日期")
+    ax.set_ylabel("数值")
+    if sensor_name:
+        title = (f"{sensor_name}（编号{sensor_id}）- "
+                 f"{feature_display(feature)} 时间序列")
+    else:
+        title = f"传感器{sensor_id} - {feature_display(feature)} 时间序列"
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    _converge_ylim(ax, plot_means, feature)
+    _handles, _labels = ax.get_legend_handles_labels()
+    # 尖峰/异常标记在画图时已自带 label，这里只补色带项，避免重复
+    _a_handles, _a_labels = _anno_legend_items(
+        any_gap=any_gap, shift_high=shift_high, shift_low=shift_low,
+        any_zero=any_zero)
+    _handles += _a_handles
+    _labels += _a_labels
+    _labels, _handles = _trim_legend_items(_labels, _handles, 1,
+                                              keep_curve_labels=True)
+    if _handles:
+        fig.legend(_handles, _labels, loc="lower center",
+                   bbox_to_anchor=(0.5, 0.005),
+                   ncol=min(4, len(_labels)), fontsize=9, framealpha=0.9)
+    fig.tight_layout(rect=(0.0, 0.11, 1.0, 1.0))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_histogram(sensor_id, sensor_name, feature, means, out_path):
+    """频率分布直方图：小时均值分布。"""
+    if not means:
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.hist(means, bins=min(40, max(10, len(means) // 5)),
+            density=True, alpha=0.75, color="#4c72b0", edgecolor="black")
+    ax.set_xlabel("数值")
+    ax.set_ylabel("频率")
+    if sensor_name:
+        title = (f"{sensor_name}（编号{sensor_id}）- "
+                 f"{feature_display(feature)} 频率分布")
+    else:
+        title = f"传感器{sensor_id} - {feature_display(feature)} 频率分布"
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def density2d(x, y):
+    """2D 密度估计(参考原脚本的核密度做法)。"""
+    if not HAS_SCIPY or len(x) < 5:
+        return None
+    xi = np.linspace(min(x), max(x), 100)
+    yi = np.linspace(min(y), max(y), 100)
+    xi, yi = np.meshgrid(xi, yi)
+    kernel = scipy_stats.gaussian_kde(np.vstack([x, y]))
+    zi = np.reshape(kernel(np.vstack([xi.ravel(), yi.ravel()])).T, xi.shape)
+    try:
+        from scipy.interpolate import griddata
+        grid_z = griddata((xi.flatten(), yi.flatten()), zi.flatten(),
+                          (np.column_stack((x, y))[:, 0],
+                           np.column_stack((x, y))[:, 1]), method="linear")
+        return grid_z
+    except Exception:
+        return None
+
+
+def plot_correlation(feat_a, feat_b, x, y, sensor_name, sensor_id, out_path):
+    """相关性分析图：密度散点 + 回归直线 + 相关系数。"""
+    if len(set(x)) < 2 or len(set(y)) < 2:
+        return None  # 常数列无法计算相关系数
+    fig, ax = plt.subplots(figsize=(9, 6))
+    density = density2d(x, y)
+    if density is not None:
+        ax.scatter(x, y, c=density, s=8, cmap="GnBu",
+                   label="测点（颜色=密度）")
+    else:
+        ax.scatter(x, y, s=8, alpha=0.6, color="#4c72b0", label="测点")
+    slope, intercept, r = np.polyfit(x, y, 1)[0], 0.0, 0.0
+    if len(x) >= 2:
+        slope, intercept = np.polyfit(x, y, 1)
+        r = np.corrcoef(x, y)[0, 1]
+    xq = np.linspace(min(x), max(x), 100)
+    ax.plot(xq, slope * xq + intercept, "k:", linewidth=1.5, label="回归直线")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.set_title(f"{sensor_name}（编号{sensor_id}）相关性分析")
+    ax.set_xlabel(feature_display(feat_a))
+    ax.set_ylabel(feature_display(feat_b))
+    ax.text(0.03, 0.90, f"y = {slope:.4f}x + {intercept:.4f}\nr = {r:.4f}",
+            transform=ax.transAxes, fontsize=11,
+            bbox=dict(facecolor="white", alpha=0.8))
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return {"相关系数": round(float(r), 6),
+            "斜率": round(float(slope), 6),
+            "截距": round(float(intercept), 6)}
+
+
+def plot_daily_time_series(sensor_id, sensor_name, feature, day_date, times,
+                           means, out_path, replaced_indices=None,
+                           replaced_range_indices=None, shifts=None,
+                           gaps=None, dpi=200):
+    """振动按天时间序列图：横轴 0~24 小时(秒级点按小时定位)，
+    标题含具体年月日；图上标注尖峰/异常/突变段/缺失。"""
+    t0 = times[0].replace(hour=0, minute=0, second=0, microsecond=0)
+    xs = [(t - t0).total_seconds() / 3600.0 for t in times]
+    fig, ax = plt.subplots(figsize=(15, 5.5))
+    ax.plot(xs, means, "-", color="#1f77b4", linewidth=0.9,
+            label="秒级均值")
+    if replaced_indices:
+        ax.plot([xs[i] for i in replaced_indices],
+                [means[i] for i in replaced_indices],
+                "x", color="black", markersize=8, mew=2,
+                label="已替换尖峰点(统计)")
+    if replaced_range_indices:
+        ax.plot([xs[i] for i in replaced_range_indices],
+                [means[i] for i in replaced_range_indices],
+                "x", color="#d62728", markersize=9, mew=2,
+                label="已剔除异常值(物理范围外/分布极端)")
+    ax.set_xticks(range(0, 25, 6))
+    ax.set_xticklabels([f"{h}时" for h in range(0, 25, 6)], fontsize=12)
+    ax.set_xlim(0, 24)
+    ax.set_xlabel("时刻（小时）", fontsize=13)
+    ax.set_ylabel(feature_display(feature), fontsize=13)
+    ax.tick_params(axis="y", labelsize=12)
+    ax.grid(True, alpha=0.3)
+    ax.set_title(
+        f"{sensor_id} {sensor_name}｜{feature_display(feature)}｜"
+        f"{_fmt_cn_date(day_date)}", fontsize=14)
+
+    # 突变区间 + 缺失段标注: 着色段全部画上；≤4 段文字标在带上，
+    # >4 段文字挪到图右侧留白区，图上只留色带
+    label_items = []   # [(label, color, xv, yv)]
+    any_gap = False
+    shift_high = shift_low = False
+    for s in shifts or []:
+        try:
+            st = dt.datetime.strptime(s["起始时间"], "%Y-%m-%d %H:%M")
+            et = dt.datetime.strptime(s["结束时间"], "%Y-%m-%d %H:%M")
+            a = min(range(len(times)),
+                    key=lambda i: abs((times[i] - st).total_seconds()))
+            b = min(range(len(times)),
+                    key=lambda i: abs((times[i] - et).total_seconds()))
+        except (ValueError, KeyError):
+            continue
+        color = "#d62728" if s["方向"] == "偏高" else "#2ca02c"
+        ax.axvspan(xs[a] - 0.01, xs[b] + 0.01, color=color, alpha=_BAND_ALPHA)
+        if s["方向"] == "偏高":
+            shift_high = True
+        else:
+            shift_low = True
+        yv = (means[b] if b < len(means)
+              else means[a] if a < len(means) else 0.0)
+        label_items.append(
+            (f"{_fmt_compact_range(s['起始时间'], s['结束时间'])} "
+             f"{s['方向']}", color, float(xs[a]), yv))
+    for g in gaps or []:
+        try:
+            st = dt.datetime.strptime(g["起始时间"], "%Y-%m-%d %H:%M")
+            et = dt.datetime.strptime(g["结束时间"], "%Y-%m-%d %H:%M")
+            a = min(range(len(times)),
+                    key=lambda i: abs((times[i] - st).total_seconds()))
+            b = min(range(len(times)),
+                    key=lambda i: abs((times[i] - et).total_seconds()))
+        except (ValueError, KeyError):
+            continue
+        ax.axvspan(xs[a] - 0.01, xs[b] + 0.01, color="#ff7f0e", alpha=_BAND_ALPHA)
+        any_gap = True
+        yv = (means[b] if b < len(means)
+              else means[a] if a < len(means) else 0.0)
+        label_items.append(
+            (_fmt_compact_range(g['起始时间'], g['结束时间']), "#d2691e",
+             float(xs[a]), yv))
+    # 方案第 2 节：图上不再画文字标注（彩色带保留）
+    _converge_ylim(ax, means, feature)
+    _handles, _labels = ax.get_legend_handles_labels()
+    _a_handles, _a_labels = _anno_legend_items(any_gap=any_gap,
+                                               shift_high=shift_high,
+                                               shift_low=shift_low)
+    _handles += _a_handles
+    _labels += _a_labels
+    _labels, _handles = _trim_legend_items(_labels, _handles, 1,
+                                              keep_curve_labels=True)
+    if _handles:
+        fig.legend(_handles, _labels, loc="lower center",
+                   bbox_to_anchor=(0.5, 0.005),
+                   ncol=min(4, len(_labels)), fontsize=9, framealpha=0.9)
+    fig.tight_layout(rect=(0.0, 0.11, 1.0, 1.0))
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def plot_histogram_from_counts(sensor_id, sensor_name, feature, bin_edges,
+                               counts, out_path):
+    """由累积直方图计数画频率分布图(振动按天处理时季度汇总用)。"""
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    widths = np.diff(bin_edges)
+    total = float(counts.sum()) or 1.0
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(centers, counts / (total * widths), width=widths,
+           color="#1f77b4", alpha=0.75, edgecolor="black", linewidth=0.4)
+    ax.set_title(
+        f"{sensor_id} {sensor_name}｜{feature_display(feature)} 频率分布",
+        fontsize=14)
+    ax.set_xlabel("数值", fontsize=13)
+    ax.set_ylabel("频率密度", fontsize=13)
+    ax.tick_params(labelsize=12)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+# ==================== 交通荷载跨车道图（不生成车道子文件夹） ====================
+
+def _traffic_date_axis(ax, hours, x):
+    """交通图横轴：按小时描点，刻度标日期。"""
+    step = max(1, len(x) // 12)
+    ticks = list(range(0, len(x), step))
+    if ticks[-1] != len(x) - 1:
+        ticks.append(len(x) - 1)
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([hours[i].strftime("%m-%d") for i in ticks],
+                       rotation=30, fontsize=8)
+    ax.grid(alpha=0.3)
+
+
+def plot_traffic_charts(series, total_series, out_dir, dpi=200):
+    """交通荷载跨车道合并图（各车道车辆累计通过数量图 / 各车道通过数量
+    比例图 / 各车道频率分布图），直接放在 交通荷载/ 下，不分子车道文件夹。
+
+    series: [(车道名, hours, means), ...]（清洗后小时计数，各车道时间对齐）
+    total_series: (hours, means) 或 None（比例分母，缺省按各车道求和）
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    n = len(series)
+    x = list(range(len(series[0][2])))
+
+    # 1) 各车道车辆累计通过数量图（多元时间序列折线）
+    fig, ax = plt.subplots(figsize=(15, 6), dpi=dpi)
+    for i, (lane, hours, means) in enumerate(series):
+        ax.plot(x, np.cumsum(means), "-",
+                color=colors[i % len(colors)], linewidth=1.3, label=lane)
+    _traffic_date_axis(ax, series[0][1], x)
+    ax.set_ylabel("累计通过数量（辆）")
+    ax.set_title("各车道车辆累计通过数量图", fontsize=14)
+    ax.legend(loc="upper left", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "各车道车辆累计通过数量图.png"),
+                dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    # 2) 各车道通过数量比例图（小时级数据，子图）：每个车道一张子图，
+    #    绘制在同一张画布上，避免四条折线叠在一起看不清。
+    total_arr = None
+    if total_series and total_series[1]:
+        total_arr = np.array(total_series[1], dtype=float)
+    nrows = 2 if n > 2 else 1
+    ncols = 2 if n > 1 else 1
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(15, 2.8 * nrows), dpi=dpi,
+                             squeeze=False)
+    for i, (lane, hours, means) in enumerate(series):
+        ax = axes.flat[i]
+        m = np.array(means, dtype=float)
+        if total_arr is not None and len(total_arr) == len(m):
+            denom = total_arr
+        else:
+            denom = np.zeros(len(m))
+            for _l, _h, _mm in series:
+                denom += np.array(_mm, dtype=float)
+        pct = np.where(denom > 0, m / np.maximum(denom, 1e-9) * 100, np.nan)
+        xi = list(range(len(m)))
+        ax.plot(xi, pct, "-", color=colors[i % len(colors)], linewidth=0.8)
+        _traffic_date_axis(ax, hours, xi)
+        ax.set_ylim(0, 100)
+        ax.set_ylabel("比例（%）", fontsize=9)
+        valid = pct[np.isfinite(pct)]
+        avg = float(np.mean(valid)) if valid.size else 0.0
+        ax.set_title(f"{lane}（平均 {avg:.1f}%）", fontsize=11)
+    for j in range(n, nrows * ncols):
+        axes.flat[j].axis("off")
+    fig.suptitle("各车道通过数量比例图（小时级）", fontsize=14)
+    _finalize_layout(fig, rows=nrows)
+    fig.savefig(os.path.join(out_dir, "各车道通过数量比例图.png"),
+                dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    # 3) 各车道频率分布图（2x2 子图，每车道一张直方图）
+    nrows = 2 if n > 2 else 1
+    ncols = 2 if n > 1 else 1
+    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 8), dpi=dpi,
+                             squeeze=False)
+    for i, (lane, hours, means) in enumerate(series):
+        ax = axes.flat[i]
+        ax.hist(means, bins=40, color=colors[i % len(colors)], alpha=0.75)
+        ax.set_title(lane, fontsize=12)
+        ax.set_xlabel("小时通过数量（辆）", fontsize=10)
+        ax.set_ylabel("小时数", fontsize=10)
+        ax.grid(alpha=0.3)
+    for j in range(n, nrows * ncols):
+        axes.flat[j].axis("off")
+    fig.suptitle("各车道频率分布图", fontsize=14)
+    _finalize_layout(fig, rows=nrows)
+    fig.savefig(os.path.join(out_dir, "各车道频率分布图.png"),
+                dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def _build_traffic_charts(args, sensor_feats, chart_dir, issues):
+    """读取交通荷载各车道小时序列（清洗口径与统计库一致），生成跨车道合并图。"""
+    feats = sensor_feats.get(TRAFFIC_SENSOR, []) or []
+    lanes = sorted([f for f in feats if re.match(r"^车道\d+$", f)],
+                   key=lambda x: int(re.search(r"\d+", x).group()))
+    if args.features:
+        lanes = [f for f in lanes
+                 if _traffic_selected(args.features)
+                 or _feature_selected(f, args.features)]
+    if not lanes:
+        return
+
+    def _clean_lane(lane):
+        hours, means, _, _, _, _, _, _, _, _ = read_hourly_series(
+            resolve_feature_dirs(args.daily_root, TRAFFIC_SENSOR, lane))
+        if not hours:
+            return None, None
+        keep = [i for i, h in enumerate(hours)
+                if (not args.start or h.date().isoformat() >= args.start)
+                and (not args.end or h.date().isoformat() <= args.end)]
+        hours = [hours[i] for i in keep]
+        means = [means[i] for i in keep]
+        if not hours:
+            return None, None
+        means, _recs, _ix, _rx = clean_series_value(
+            hours, means, f"{TRAFFIC_SENSOR}-{lane}", args.spike_threshold,
+            hour_level=True, vrange=feature_range(lane),
+            max_spikes=args.max_spikes, dist_k=args.dist_k,
+            max_dist_outliers=args.max_dist_outliers,
+            max_total_removals=args.max_removals)
+        return (hours if means else None), means
+
+    series = []
+    for lane in lanes:
+        hours, means = _clean_lane(lane)
+        if hours:
+            series.append((lane, hours, means))
+    if not series:
+        issues.append(f"无数据: {TRAFFIC_SENSOR}/交通荷载图")
+        return
+
+    total_series = None
+    if TRAFFIC_TOTAL_FEATURE in feats:
+        thours, tmeans = _clean_lane(TRAFFIC_TOTAL_FEATURE)
+        if thours:
+            total_series = (thours, tmeans)
+    plot_traffic_charts(series, total_series,
+                        os.path.join(chart_dir, TRAFFIC_SENSOR),
+                        dpi=args.dpi)
+
+
+# ==================== 合并绘图（按监测部位分组，一张图多测点/多特征） ====================
+
+AXIS_INNER = {"Δx", "Δy", "Δz", "x", "y", "z"}
+
+
+def _is_axis_triple(pairs):
+    """判断 (sensor, feature) 列表是否为“同一传感器 X/Y/Z 三向分量”
+    （如 GNSS(Δx/Δy/Δz)、SZJSD(xJsd/yJsd/zJsd)、EZJD(xJd/yJd)），
+    用于时间序列图/直方图按三行一列竖排。"""
+    if len(pairs) != 3:
+        return False
+    sensors = {str(s) for s, _ in pairs}
+    if len(sensors) != 1:
+        return False
+    feats = [f for _, f in pairs]
+    if len(set(feats)) != 3:
+        return False
+    inners = []
+    for f in feats:
+        m = re.search(r"\(([^)]+)\)$", str(f))
+        if not m:
+            return False
+        inners.append(m.group(1))
+    canon = [_axis_canon(i) for i in inners]
+    if (all(a in ("x", "y", "z") for a in canon)
+            and len(set(canon)) == 3):
+        return True
+    return all(i.lower().endswith(("jd", "jsd")) for i in inners)
+
+
+def feature_group(feature: str) -> str:
+    """把特征编码归组：
+      - GNSS(Δx/Δy/Δz)、EZJD(xJd/yJd)、DZJSD(xJsd) 等轴/方向分量 -> 同一组(prefix)
+      - WSD(rh)/WSD(temp)、WD(temp)、YB(rsg) 等不同测量 -> 各自成组
+      - FSFX2(spfs/szfs) 风速、FSFX2(spfx/szfx) 风向 -> 按类成组
+    """
+    m = re.search(r"^([A-Za-z0-9]+)\(([^)]+)\)$", feature)
+    if not m:
+        return feature
+    prefix, inner = m.group(1), m.group(2)
+    if _axis_canon(inner):
+        return prefix
+    if inner.lower().endswith(("jd", "jsd")):
+        return prefix
+    if len(inner) >= 2 and inner[-1].lower() in ("s", "x"):
+        return f"{prefix}({inner[-1].lower()})"
+    return feature
+
+
+def load_position_map(name_dict_path: str = "", sensor_map_path: str = "") -> dict:
+    """返回 {位置名: [(传感器编号, 特征编码), ...]}。
+    优先用 传感器名称对照/<桥>.json 的 传感器名称；否则回退 传感器编号名称.json。"""
+    pos_map = defaultdict(list)
+    if name_dict_path and os.path.isfile(name_dict_path):
+        try:
+            with open(name_dict_path, encoding="utf-8") as f:
+                data = json.load(f)
+            for name, entries in (data.get("传感器名称") or {}).items():
+                for e in entries or []:
+                    feats = e.get("特征编码") or ([e["特征"]] if e.get("特征") else [])
+                    for feat in feats:
+                        pos_map[name].append((str(e["编号"]), feat))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[警告] 读取名称对照失败: {exc}")
+    if not pos_map and sensor_map_path and os.path.isfile(sensor_map_path):
+        try:
+            with open(sensor_map_path, encoding="utf-8") as f:
+                data = json.load(f)
+            for sid, info in (data.get("传感器") or {}).items():
+                name = info.get("监测部位") or info.get("名称") or ""
+                if name:
+                    pos_map[name].append((str(sid), info.get("类别", "")))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[警告] 读取传感器对照失败: {exc}")
+    return {k: sorted(set(v)) for k, v in pos_map.items()}
+
+
+def _safe_dirname(s: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]', "_", str(s)).strip()
+
+
+def _bridge_variants(name):
+    """桥名的常见写法变体(湘江特 <-> 湘江特大桥)，用于兼容预处理与
+    建图库传不同桥名时目录对不上(如预处理 --bridge 湘江特、建图库
+    --bridge 湘江特大桥)。"""
+    name = (name or "").strip()
+    if not name:
+        return []
+    variants = [name]
+    for suffix in ("特大桥", "大桥"):
+        if name.endswith(suffix):
+            variants.append(name[:-len(suffix)])
+        else:
+            variants.append(name + suffix)
+    seen = set()
+    out = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _feature_selected(feature: str, feature_arg: str) -> bool:
+    """--features 过滤：留空=全部；否则特征名包含任一给定词即选中
+    （如传 DZJSD 会匹配 DZJSD(xJsd)）。"""
+    if not feature_arg:
+        return True
+    fn = str(feature).lower()
+    return any(t.strip() and t.strip().lower() in fn
+               for t in feature_arg.split(","))
+
+
+def _traffic_selected(feature_arg: str) -> bool:
+    """--features 里是否选了“交通荷载”（匹配 daily 下的 车道N/总共 特征）。"""
+    return any(t.strip() == TRAFFIC_SENSOR
+               for t in (feature_arg or "").split(","))
+
+
+def resolve_feature_dir(daily_root, sensor, feature):
+    """定位 daily 下某特征的目录。模块前缀不一致时(如对照表 DZJSD(xJsd)
+    但实际数据 SZJSD(xJsd))，按括号内编码(xJsd/yJsd/zJsd)匹配实际存在的目录。
+    返回 (目录路径, 实际特征名)。"""
+    dirs = resolve_feature_dirs(daily_root, sensor, feature)
+    if dirs:
+        return dirs[0], os.path.basename(dirs[0])
+    root = daily_root if isinstance(daily_root, str) else daily_root[0]
+    return os.path.join(root, str(sensor), feature), feature
+
+
+def resolve_feature_dirs(daily_root, sensor, feature):
+    """定位 daily 下某特征的全部目录（年度多季度时返回多个）。
+    模块前缀不一致时按括号内编码匹配实际存在的目录。"""
+    roots = daily_root if isinstance(daily_root, (list, tuple)) \
+        else [daily_root]
+    out = []
+    target = feature_code(feature)
+    for root in roots:
+        d = os.path.join(root, str(sensor), feature)
+        if os.path.isdir(d):
+            out.append(d)
+            continue
+        sroot = os.path.join(root, str(sensor))
+        if os.path.isdir(sroot):
+            for fn in sorted(os.listdir(sroot)):
+                if os.path.isdir(os.path.join(sroot, fn)) \
+                        and feature_code(fn) == target:
+                    out.append(os.path.join(sroot, fn))
+                    break
+    return out
+
+
+def read_clean_hourly_means(daily_root, sensor, feature, start="", end="",
+                            spike_k=5.0, max_spikes=3, gap_fill_hours=24.0,
+                            shift_min_days=7, shift_k=2.5, dist_k=20.0,
+                            max_dist_outliers=5, max_shifts=5,
+                            max_total_removals=5):
+    """读取某 (传感器,特征) 的均值序列，返回:
+    (plot_hours, plot_means, spike_pts, range_pts, gaps, records, shifts)
+      - 已做日期过滤 + 物理范围过滤 + 尖峰清洗（与 per_sensor 同一套逻辑）
+      - 绘图路径不启用统计值特有的判定窗口与候选式剔除 = 图上只有原来的
+        尖峰标记与物理范围/季节合理性异常标记
+      - plot_* 已按 gap_fill_hours 线性填充缺失段（仅用于绘图）
+      - spike_pts/range_pts: 被替换尖峰/被剔除异常值的坐标 (时间, 清洗后值)
+      - gaps: 缺失段记录 [{起始时间, 结束时间, 缺失小时数}]
+      - records: 清洗记录明细（尖峰替代 / 范围外剔除）
+      - shifts: 突变段记录（持续高于/低于基线，精确到数据粒度）
+    """
+    feat_dirs = resolve_feature_dirs(daily_root, sensor, feature)
+    if not feat_dirs:
+        return [], [], [], [], [], [], []
+    hours, means, _, _ = read_hourly_series(feat_dirs)[:4]
+    if not hours:
+        return [], [], [], [], [], [], []
+    keep = [i for i, h in enumerate(hours)
+            if (not start or h.date().isoformat() >= start)
+            and (not end or h.date().isoformat() <= end)]
+    hours = [hours[i] for i in keep]
+    means = [means[i] for i in keep]
+
+    records, spike_idx, range_idx = [], [], []
+    if hours:
+        vrange = feature_range(feature)
+        means, records, spike_idx, range_idx = clean_series_value(
+            hours, means, f"{sensor}-{feature}", spike_k,
+            hour_level=True, vrange=vrange, max_spikes=max_spikes,
+            dist_k=dist_k, max_dist_outliers=max_dist_outliers,
+            max_total_removals=max_total_removals, feature=feature)
+    spike_pts = [(hours[i], means[i]) for i in spike_idx]
+    range_pts = [(hours[i], means[i]) for i in range_idx]
+
+    shifts = []
+    # 风向(spfx/szfx)是圆形量，没有“偏高/偏低”概念，不做突变段检测
+    if (shift_k > 0 and len(hours) >= 24 * (shift_min_days + 2)
+            and not _is_direction_feature(feature)):
+        shifts = _cap_shifts(
+            detect_level_shifts(hours, means, shift_min_days, shift_k),
+            max_shifts)
+    # 连续异常段(> max_run 点)：不剔除，只在图上标注(精确到数据粒度)
+    if hours and not _is_direction_feature(feature):
+        block_k = dist_k if dist_k > 0 else DEFAULT_DIST_K
+        blocks = detect_deviation_blocks(hours, means, k=block_k)
+        if blocks:
+            shifts = _cap_shifts(shifts + blocks, max_shifts)
+
+    plot_hours, plot_means = hours, means
+    gaps = []
+    if gap_fill_hours > 0 and plot_hours:
+        (plot_hours, plot_means, _, _), gaps = fill_long_gaps(
+            hours, means, means, means, gap_fill_hours)
+    return plot_hours, plot_means, spike_pts, range_pts, gaps, records, shifts
+
+
+def _copy_per_sensor_charts(charts_dir, sensor, feature, out_dir, sub_dir="",
+                            fallback_charts_dir=""):
+    """把 per_sensor 图(图库/<编号>/<特征>/时间序列图.png 等)复制到合并目录。
+    sub_dir 非空时复制到 out_dir/<sub_dir>/（单传感器多特征场景）。
+    返回复制成功的文件数。"""
+    src_dir = os.path.join(charts_dir, str(sensor), feature)
+    if not os.path.isdir(src_dir) and fallback_charts_dir:
+        # 新图库目录没有 per_sensor 图时，从旧图库回退复制
+        src_dir = os.path.join(fallback_charts_dir, str(sensor), feature)
+    if not os.path.isdir(src_dir):
+        return 0
+    dest = os.path.join(out_dir, sub_dir) if sub_dir else out_dir
+    os.makedirs(dest, exist_ok=True)
+    copied = 0
+    for fname in ("时间序列图.png", "频率分布图.png"):
+        src = os.path.join(src_dir, fname)
+        if os.path.isfile(src):
+            try:
+                shutil.copy2(src, os.path.join(dest, fname))
+                copied += 1
+            except OSError as exc:
+                print(f"[警告] 复制 per_sensor 图失败 {src}: {exc}", flush=True)
+    return copied
+
+
+def _build_merged_series(daily_root, gf_pairs, start, end, spike_threshold,
+                         max_spikes, gap_fill_hours, shift_min_days,
+                         shift_threshold, dist_k=20.0,
+                         max_dist_outliers=5, max_shifts=5,
+                         max_total_removals=5):
+    """读取组内各 (传感器,特征) 的清洗后小时序列（含缺失/突变/替换标记）。"""
+    series = []
+    uniq_sensors = {s for s, _ in gf_pairs}
+    uniq_feats = {f for _, f in gf_pairs}
+    for sensor, feat in gf_pairs:
+        spike_k = (0 if _is_direction_feature(feat)
+                   else spike_threshold)
+        (hours, means, spike_pts, range_pts, gaps, records, shifts) = \
+            read_clean_hourly_means(
+                daily_root, sensor, feat, start, end, spike_k, max_spikes,
+                gap_fill_hours, shift_min_days, shift_threshold, dist_k,
+                max_dist_outliers, max_shifts, max_total_removals)
+        if not hours:
+            continue
+        if len(uniq_sensors) == 1:
+            label = feat if len(uniq_feats) > 1 else sensor
+        elif len(uniq_feats) == 1:
+            label = sensor
+        else:
+            label = f"{sensor}-{feat}"
+        series.append({
+            "label": label, "feature": feat, "sensor": sensor,
+            "hours": hours, "means": means,
+            "spike_pts": spike_pts, "range_pts": range_pts,
+            "gaps": gaps, "records": records, "shifts": shifts,
+        })
+    return series
+
+
+def _build_merged_daily_charts(args, pos, g, gf_pairs, out_dir, issues):
+    """振动(秒级)合并图：按天生成 时间序列图_日期.png(横轴 0~24 小时，
+    标题含年月日)；频率分布图按季度逐日累积；每天只加载当天数据。"""
+    # 秒级按天图只选“单日有效数据足够多”的天（至少 1 小时），避免传感器
+    # 几乎没数据时选到只有几行样本的天，画出几乎为空/凌晨就断的图
+    day_chart_min_seconds = 3600
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        day_set = set()
+        for sensor, feat in gf_pairs:
+            for feat_dir in resolve_feature_dirs(
+                    args.daily_root, sensor, feat):
+                if not os.path.isdir(feat_dir):
+                    continue
+                for fn in os.listdir(feat_dir):
+                    if not fn.lower().endswith(".csv"):
+                        continue
+                    d = fn[:-4]
+                    if ((not args.start or d >= args.start)
+                            and (not args.end or d <= args.end)):
+                        day_set.add(d)
+        days = sorted(day_set)
+        if not days:
+            issues.append(f"无数据: {pos}/{g}")
+            return
+        uniq_sensors = {s for s, _ in gf_pairs}
+        uniq_feats = {f for _, f in gf_pairs}
+        hist_bins = np.linspace(-1000.0, 1000.0, 101)
+        hist_acc = {}
+        all_records = []
+        chart_series = None
+        chart_day = ""
+        best_total_secs = -1
+        for day in days:
+            series = []
+            day_total_secs = 0
+            for sensor, feat in gf_pairs:
+                path = ""
+                for feat_dir in resolve_feature_dirs(
+                        args.daily_root, sensor, feat):
+                    cand = os.path.join(feat_dir, day + ".csv")
+                    if os.path.isfile(cand):
+                        path = cand
+                        break
+                if not path:
+                    continue
+                hours_d, means_d, maxs_d, mins_d, secs, miss = \
+                    read_daily_file(path)
+                if not hours_d:
+                    continue
+                vrange = feature_range(feat)
+                spike_k = (0 if _is_direction_feature(feat)
+                           else args.spike_threshold)
+                means_d, recs, ix, rx = clean_series_value(
+                    hours_d, means_d, f"{sensor}-{feat}", spike_k,
+                    hour_level=True, vrange=vrange,
+                    max_spikes=args.max_spikes, dist_k=args.dist_k,
+                    max_dist_outliers=args.max_dist_outliers,
+                    max_total_removals=args.max_removals)
+                shifts_d = []
+                if not _is_direction_feature(feat):
+                    block_k = (args.dist_k if args.dist_k > 0
+                               else DEFAULT_DIST_K)
+                    blocks = detect_deviation_blocks(
+                        hours_d, means_d, k=block_k, min_points=60)
+                    if blocks:
+                        shifts_d = _cap_shifts(blocks, args.max_shifts)
+                gaps_d = []
+                if len(hours_d) > 1:
+                    # 秒级数据：相邻两个有效点间隔超过 30 秒即视为缺口
+                    # （1s 粒度下 5 分钟阈值太粗，分钟级掉数也要标注）
+                    gap_thr = 30.0 / 3600.0
+                    for a in range(len(hours_d) - 1):
+                        gaph = (hours_d[a + 1] - hours_d[a]
+                                ).total_seconds() / 3600.0
+                        if gaph > gap_thr:
+                            gaps_d.append({
+                                "起始时间": hours_d[a].strftime(
+                                    "%Y-%m-%d %H:%M"),
+                                "结束时间": hours_d[a + 1].strftime(
+                                    "%Y-%m-%d %H:%M"),
+                                "缺失小时数": round(gaph, 3),
+                            })
+                if len(uniq_sensors) == 1:
+                    label = feat if len(uniq_feats) > 1 else sensor
+                elif len(uniq_feats) == 1:
+                    label = sensor
+                else:
+                    label = f"{sensor}-{feat}"
+                series.append({
+                    "label": label, "feature": feat, "sensor": sensor,
+                    "hours": hours_d, "means": means_d,
+                    "spike_pts": [(hours_d[i], means_d[i]) for i in ix],
+                    "range_pts": [(hours_d[i], means_d[i]) for i in rx],
+                    "gaps": gaps_d, "records": recs, "shifts": shifts_d,
+                })
+                day_total_secs += secs
+                cnts, _ = np.histogram(means_d, bins=hist_bins)
+                key = (sensor, feat)
+                hist_acc[key] = hist_acc.get(key, 0) + cnts
+                all_records.append({
+                    "日期": day, "传感器": sensor, "特征": feat,
+                    "清洗记录": recs, "数据缺失时段": gaps_d,
+                    "突变区间": shifts_d,
+                })
+            # 选定出图日：--vibration-date 优先；否则只在单日有效秒数达到
+            # 下限的天里取最多的一天（避免选到只有几行样本的天）
+            if series:
+                if args.vibration_date and args.vibration_date == day:
+                    best_total_secs = day_total_secs
+                    chart_series = series
+                    chart_day = day
+                elif (not args.vibration_date
+                        and day_total_secs >= day_chart_min_seconds
+                        and day_total_secs > best_total_secs):
+                    best_total_secs = day_total_secs
+                    chart_series = series
+                    chart_day = day
+        if days and not chart_series:
+            issues.append(
+                f"{pos}/{g}: 各日有效数据过少（单日均 <"
+                f"{day_chart_min_seconds} 秒），未生成按天时间序列图")
+        if chart_series:
+            plot_group_time_series(
+                pos, g, chart_series,
+                os.path.join(out_dir, "时间序列图.png"),
+                dpi=args.dpi, day_mode=True)
+        if hist_acc:
+            plot_group_histogram_from_counts(
+                pos, g, hist_acc, hist_bins,
+                os.path.join(out_dir, "频率分布图.png"), dpi=args.dpi)
+        with open(os.path.join(out_dir, "预处理记录.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({
+                "位置": pos,
+                "特征组": g,
+                "生成时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "出图日期": chart_day,
+                "记录": all_records,
+            }, f, ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        issues.append(f"合并图错误: {pos}/{g}: {exc}")
+        print(f"[警告] 合并图失败 {pos}/{g}: {exc}", flush=True)
+
+
+def plot_group_time_series(position, group, series, out_path, dpi=200,
+                           day_mode=False):
+    """同位置同特征组的时间序列图。面板数 ≤6 时一张图；超过 6 个拆成
+    多张图(时间序列图.png / _2.png / _3.png ...)，每张 ≤6 个子图，
+    避免子图过小、标注看不清，便于插入报告。"""
+    n = len(series)
+    if n == 0:
+        return
+    feats = []
+    for s in series:
+        if s["feature"] not in feats:
+            feats.append(s["feature"])
+    single_feat = len(feats) == 1
+    if single_feat:
+        panels = [(s.get("sensor") or s["label"], [s]) for s in series]
+    else:
+        panels = [(f, [s for s in series if s["feature"] == f])
+                  for f in feats]
+    max_panels = 6
+    chunks = [panels[i:i + max_panels]
+              for i in range(0, len(panels), max_panels)]
+    for ci, chunk in enumerate(chunks):
+        if ci == 0:
+            out = out_path
+        else:
+            base, ext = os.path.splitext(out_path)
+            out = f"{base}_{ci + 1}{ext}"
+        _plot_group_time_series_one(position, group, chunk, out, dpi, day_mode,
+                                    ci + 1, len(chunks))
+
+
+def _est_legend_ncol(labels, fontsize, avail_px):
+    """估算底部图例的最大可用列数（列主序填充，每行宽度不超过 avail_px）。
+
+    按 CJK≈1em、ASCII≈0.55em 粗估文字宽度，加上图例句柄与列间距；
+    最终以绘制后的实测宽度为准（见 _make_legend_fit）。
+    """
+    def _w(t):
+        return sum((1.0 if ord(c) > 0x2E80 else 0.55) for c in t) * fontsize
+    handle = 2.0 * fontsize + 0.8 * fontsize   # handlelength + handletextpad
+    spacing = 2.0 * fontsize                    # columnspacing
+    border = 0.8 * fontsize                     # 左右 borderpad
+    widths = [_w(lb) + handle for lb in labels]
+    ncol = min(len(labels), 8)
+    while ncol > 1:
+        nrows = (len(labels) + ncol - 1) // ncol
+        max_row = 0
+        for r in range(nrows):
+            row = widths[r * ncol:(r + 1) * ncol]
+            rw = sum(row) + spacing * (len(row) - 1)
+            if rw > max_row:
+                max_row = rw
+        if border + max_row <= avail_px:
+            return ncol
+        ncol -= 1
+    return 1
+
+
+def _make_legend_fit(fig, handles, labels, fontsize=12):
+    """底部全局图例：自动收缩列数/字号，确保图例完整落在画布内。
+
+    图例超出画布时，bbox_inches='tight' 会把画布放大（服务器 matplotlib
+    3.11 上表现为图例贴边/文字被截），因此先按实测宽度把图例收进画布。
+    返回 (legend, window_extent)。
+    """
+    avail = fig.get_size_inches()[0] * fig.dpi * 0.96
+    ncol = _est_legend_ncol(labels, fontsize, avail)
+    leg = None
+    while True:
+        if leg is not None:
+            leg.remove()
+        leg = fig.legend(handles, labels, loc="lower center",
+                         ncol=ncol, fontsize=fontsize, frameon=True,
+                         borderaxespad=0.3)
+        fig.canvas.draw()
+        ext = leg.get_window_extent()
+        if ext.width <= avail:
+            return leg, ext
+        if ncol > 1:
+            ncol -= 1
+            continue
+        if fontsize > 9:
+            fontsize -= 1
+            ncol = _est_legend_ncol(labels, fontsize, avail)
+            continue
+        return leg, ext
+
+
+# 色带/图例色块统一透明度：太低（0.12~0.18）在白底上淡成灰白看不出
+# 颜色（红/绿/紫都像灰带），太高会盖住曲线。图上色带与图例色块必须同值，
+# 保证“图上所见 = 图例所示”。取值见 preprocess/清洗限值.json → 绘图阈值。
+
+
+# 图例标注项的实用性排序（数值越小越优先保留）
+_LEGEND_ANNO_PRIORITY = {
+    "长时间偏高": 0,
+    "长时间偏低": 0,
+    "已替换尖峰(统计)": 1,
+    "已剔除异常值(范围外)": 1,
+    "已替换尖峰点(统计)": 1,
+    "已剔除异常值(物理范围外/分布极端)": 1,
+    "剔除温度后-已替换尖峰(统计)": 1,
+    "剔除温度后-已剔除异常值(范围外)": 1,
+    "数据缺失(已插值填充)": 2,
+    "可能故障(恒0超过24h)": 3,
+}
+
+
+def _anno_legend_items(any_spike: bool = False, any_range: bool = False,
+                       any_gap: bool = False, shift_high: bool = False,
+                       shift_low: bool = False,
+                       any_zero: bool = False,
+                       overlay_spike: bool = False,
+                       overlay_range: bool = False):
+    """按“图上实际画了什么”生成图例项（彩带/标记与图例必须一一对应）。
+
+    历史上这里是“把所有可能的项都塞进图例再裁到 4 条”，于是图上画着
+    缺失橙带/恒0紫带、图例里却没有对应条目——用户看到的就是“有彩带没图例”。
+    """
+    handles, labels = [], []
+    if any_spike:
+        handles.append(plt.Line2D([], [], marker="x", color="black",
+                                  linestyle="None", markersize=7, mew=1.8))
+        labels.append("已替换尖峰(统计)")
+    if any_range:
+        handles.append(plt.Line2D([], [], marker="x", color="#d62728",
+                                  linestyle="None", markersize=8, mew=1.8))
+        labels.append("已剔除异常值(范围外)")
+    if overlay_spike or overlay_range:
+        handles.append(plt.Line2D([], [], marker="x",
+                                  color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                  linestyle="None", markersize=7, mew=1.8))
+        labels.append("剔除温度后-已替换尖峰(统计)")
+        if overlay_range:
+            handles.append(plt.Line2D([], [], marker="D",
+                                      color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                      linestyle="None", markersize=6, mew=1.6))
+            labels.append("剔除温度后-已剔除异常值(范围外)")
+    if any_gap:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#ff7f0e",
+                                     alpha=_BAND_ALPHA))
+        labels.append("数据缺失(已插值填充)")
+    if shift_high:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#d62728",
+                                     alpha=_BAND_ALPHA))
+        labels.append("长时间偏高")
+    if shift_low:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#2ca02c",
+                                     alpha=_BAND_ALPHA))
+        labels.append("长时间偏低")
+    if any_zero:
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor="#9467bd",
+                                     alpha=_BAND_ALPHA))
+        labels.append("可能故障(恒0超过24h)")
+    return handles, labels
+
+
+def _trim_legend_items(labels, handles, uniq_sensor_count,
+                       multi_curve: bool = False,
+                       keep_curve_labels: bool = False):
+    """图例项限量，避免底部图例行数过多把子图挤扁。
+
+    单传感器组（如 3#柱墩墩底左幅 SZJSD 的 X/Y/Z 三面板）：传感器编号
+    冗余（面板标题已标明轴向），直接去掉，只保留最有用的标注（长时间
+    偏高/偏低、尖峰、异常等，最多 4 条）；
+    多传感器组：传感器编号优先保留（区分线型），标注按实用性排序，
+    总量最多 8 条。
+    """
+    if not labels:
+        return labels, handles
+    items = list(zip(labels, handles))
+    # 标注项（色带/×标记）永远保留：图上画了就必须有图例
+    annos = [(lb, h) for lb, h in items if lb in _LEGEND_ANNO_PRIORITY]
+    others = [(lb, h) for lb, h in items if lb not in _LEGEND_ANNO_PRIORITY]
+    if keep_curve_labels and others:
+        # 单曲线图（逐传感器/按天振动）：曲线本身也是“图上画的东西”，
+        # 标签说明聚合粒度（小时均值/10分钟均值…），一并保留
+        kept = others[:1] + annos
+        return [lb for lb, _ in kept], [h for _, h in kept]
+    if multi_curve:
+        # 多曲线子图（应变原始+剔除温度叠加/同面板多测点）：保留编号区分线型
+        # 编号优先保留，剩余容量给标注项（标注项已保证全部保留）
+        room = max(0, 10 - len(annos))
+        kept = others[:room] + annos
+    else:
+        # 单曲线（温度/湿度/挠度等，即使多面板）：编号已在子图标题里，
+        # 图例只留状态项；状态项本身就代表“图上画了东西”，全部保留
+        # （最多 5~7 种），避免出现“有彩带没图例”
+        kept = list(annos)
+        kept.sort(key=lambda x: _LEGEND_ANNO_PRIORITY[x[0]])
+    return [lb for lb, _ in kept], [h for _, h in kept]
+
+
+# 面板间最小垂直间隙、单图缺失段标注上限：见 preprocess/清洗限值.json → 绘图阈值
+
+
+def _apply_group_layout(fig, bottom, top=0.95):
+    """多子图合并图布局：tight_layout 优先；失败时回退固定边距+hspace。
+
+    day_mode(秒级振动/地震按天出图)时，部分 matplotlib 版本会因装饰物
+    (子图标题/刻度标签/图例)挤压 rect 触发 "Tight layout not applied"
+    警告，axes 保持默认 subplotpars——默认 hspace=0.2 在 3 面板时面板间
+    只剩 ~0.045 图高，刻度标签与下一面板标题几乎贴在一起。
+    这里在 tight_layout 后检查实际面板间隙，过小(或未应用)就改用显式
+    边距+hspace=0.32 重新排布，保证上下不挤。
+    """
+    import warnings as _w
+    with _w.catch_warnings(record=True) as wl:
+        _w.simplefilter("always")
+        try:
+            fig.tight_layout(rect=(0, bottom, 1, top))
+        except Exception:
+            pass
+        tight_failed = any(
+            "Tight layout not applied" in str(w.message) for w in wl)
+    min_gap = None
+    try:
+        # 只比较同一列上下相邻面板的间隙；2 列网格中左右相邻面板 y 相同，
+        # 若混在一起会把横向邻居误判为“间隙 0”。
+        col_items = {}
+        for ax in fig.axes:
+            if not ax.lines:
+                continue
+            x0, y0, _, h = ax.get_position().bounds
+            col_items.setdefault(round(x0, 2), []).append((y0, h))
+        gaps = []
+        for items in col_items.values():
+            items.sort()
+            for i in range(len(items) - 1):
+                gaps.append(items[i + 1][0] - (items[i][0] + items[i][1]))
+        min_gap = min(gaps) if gaps else None
+    except Exception:
+        pass
+    if tight_failed or (min_gap is not None
+                        and min_gap < _GROUP_MIN_PANEL_GAP):
+        fig.subplots_adjust(left=0.10, right=0.96,
+                            top=top - 0.005, bottom=bottom + 0.005,
+                            hspace=0.32, wspace=0.20)
+
+
+def _suptitle_top(fig, gap_lines: float = 0.5, min_top: float = 0.80,
+                  max_top: float = 0.99) -> float:
+    """按总标题的实际行高给出 axes 区域上边界。
+
+    总标题与第一行子图标题之间只留约 gap_lines 倍行高（0.5 行 ≈ 1.5 倍
+    行距的观感）。原实现按"图高的固定比例"留白（0.92/0.84…），子图一多、
+    画布一高，物理间距就被放大成好几厘米的空白带。
+    """
+    h_in = float(fig.get_size_inches()[1]) or 1.0
+    st = getattr(fig, "_suptitle", None)
+    try:
+        fs = float(st.get_fontsize()) if st is not None else 14.0
+    except (TypeError, ValueError):
+        fs = 14.0
+    if not (fs > 0):
+        fs = 14.0
+    line = fs * 1.2 / 72.0 / h_in            # 一行文字高度（figure 比例）
+    top = 1.0 - line - gap_lines * line - 0.004
+    return max(min_top, min(max_top, top))
+
+
+def _finalize_layout(fig, rows: int = 1, bottom: float = 0.0) -> None:
+    """统一的标题/图例安全区：
+    - 顶部为 fig.suptitle 预留空间，避免总标题与第一行子图标题重合；
+    - 底部按调用方给的图例高度 bottom 预留，避免图例压住坐标轴/刻度。
+    tight_layout 不会自动为 suptitle 留白，这里显式收紧 rect 并把 suptitle
+    顶到画布上沿（bbox_inches='tight' 保存时不会裁掉）。
+    """
+    bottom = min(0.45, max(0.0, bottom))
+    st = getattr(fig, "_suptitle", None)
+    if st is not None:
+        try:
+            st.set_y(1.0)
+            st.set_va("top")
+        except Exception:  # noqa: BLE001
+            pass
+    _fit_suptitle_gap(fig, bottom, _suptitle_top(fig))
+
+
+def _fit_suptitle_gap(fig, bottom, top, gap_lines: float = 0.5,
+                      ) -> float:
+    """布好局后实测“总标题底 ↔ 第一行子图标题顶”的空白，必要时收紧一次
+    rect 上边界，让两行标题呈约 1.5 倍行距（gap_lines=0.5 行）。
+
+    matplotlib 的 tight_layout 会在 rect 内额外留出 pad 与子图标题高度，
+    实测比按公式推算更可靠。修正用一次 subplots_adjust 完成（不再跑第二遍
+    tight_layout——它会重新测量全部文字，代价远高于本修正）；渲染器取文字
+    包围盒不需要整图 draw，开销很小。
+    返回最终使用的 rect 上边界。
+    """
+    _apply_group_layout(fig, bottom, top=top)
+    st = getattr(fig, "_suptitle", None)
+    if st is None:
+        return top
+    try:
+        renderer = fig.canvas.get_renderer()
+        h_px = float(fig.get_size_inches()[1]) * fig.dpi
+    except Exception:  # noqa: BLE001
+        return top
+    try:
+        su = st.get_window_extent(renderer)
+        axes = [a for a in fig.axes if a.get_visible() and a.lines] or \
+            [a for a in fig.axes if a.get_visible()]
+        if not axes:
+            return top
+        title_top = max(a.title.get_window_extent(renderer).y1
+                        for a in axes)
+    except Exception:  # noqa: BLE001
+        return top
+    want = gap_lines * su.height
+    gap = su.y0 - title_top              # 正数=两行标题之间的空白
+    if abs(gap - want) <= 0.15 * su.height:
+        return top
+    try:
+        new_top = min(0.995, max(0.5,
+                                 fig.subplotpars.top + (gap - want) / h_px))
+        fig.subplots_adjust(top=new_top)
+        return new_top
+    except Exception:  # noqa: BLE001
+        return top
+
+
+def _converge_ylim(ax, values, feature: str = "",
+                   multi_curve: bool = False) -> None:
+    """按数据 2.5%~97.5% 分位数收一收 y 轴，减少大段空白；
+    长尾特征（风速/风向 10min）不收敛，避免裁掉真实大风事件。
+    multi_curve（同子图多条曲线，如应变原始+剔除温度叠加线）用全量
+    最值+5% 余量，避免把其中一条线裁掉。"""
+    vals = [float(v) for v in (values or [])
+            if v is not None and np.isfinite(v)]
+    if len(vals) < 10:
+        return
+    if feature_granularity(feature) == "10min" or _is_direction_feature(feature):
+        return
+    if multi_curve:
+        lo, hi = min(vals), max(vals)
+    else:
+        lo, hi = np.percentile(vals, [2.5, 97.5])
+    span = float(hi - lo)
+    if span <= 0:
+        return
+    pad = 0.05 if multi_curve else 0.10
+    ax.set_ylim(float(lo) - pad * span, float(hi) + pad * span)
+
+
+def _plot_group_time_series_one(position, group, panels, out_path, dpi=200,
+                                day_mode=False, chunk_idx=1, chunk_total=1):
+    """同位置同特征组的时间序列图（子图布局，保证清晰度）：
+      - 单特征多测点：每个传感器一个子图，标题带传感器编号；
+      - 多特征：每个特征一个子图，子图内叠加各测点；
+      - 缺失时段橙色色带、长时间突变段红/绿色带、恒0故障紫色带；
+      - 图上不写文字标注（时段清单在统计 JSON 与报告结论段）。
+     day_mode=True 时横轴改为 0~24 小时(秒级振动按天出图)，标题含日期。"""
+    n = len(panels)
+    single_feat = len({sub[0]["feature"] for _, sub in panels}) == 1
+    # 单传感器 X/Y/Z 等轴/方向分量(如 GNSS Δx/Δy/Δz)：三行一列竖排，
+    # 每个子图占满整幅宽度(约 9.5 英寸/行)，上下留白最小化
+    row3 = _is_axis_triple(
+        [(sub[0].get("sensor"), sub[0]["feature"]) for _, sub in panels])
+    if row3:
+        ncols = 1
+        panel_h = 4.2
+        panel_w = 9.5
+    elif n <= 3:
+        ncols = 1
+        panel_w = 9.5
+        # 2/3 个子图两/三行一列竖排，行高给足避免被裁成横版
+        panel_h = 4.2
+    else:
+        ncols = 2
+        panel_w = 9.5
+        panel_h = 4.2
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(panel_w * ncols, panel_h * nrows + 1.5),
+                             squeeze=False)
+    axes = axes.reshape(-1)
+    colors = plt.cm.tab10.colors + plt.cm.Set2.colors
+    global_handles = []
+    global_labels = []
+    margin_labels = []    # [(ax_index, label, color, xv, yv)] 多段时画到右侧留白
+
+    for pi, (ptitle, sub) in enumerate(panels):
+        ax = axes[pi]
+        # 缺失/突变段全部着色并收集文字(带对应色带位置)
+        any_gap = False
+        _shifts = [sh for s in sub for sh in (s.get("shifts") or [])]
+        shift_high = any(str(sh.get("方向")) == "偏高" for sh in _shifts)
+        shift_low = any(str(sh.get("方向")) == "偏低" for sh in _shifts)
+        any_zero = False
+        panel_labels = []   # [(label, color)]
+        panel_pos = []      # [(label, color, xv, yv)] 与 panel_labels 同步
+        for i, s in enumerate(sub):
+            plot_label = s["label"]
+            bucket = _series_bucket_seconds(s["hours"])
+            if bucket != 3600:
+                plot_label = f"{plot_label}（{_bucket_label(bucket)}）"
+            plot_means = (_unwrap_circular(s["means"])
+                          if _is_direction_feature(s["feature"])
+                          else s["means"])
+            if day_mode:
+                t0 = s["hours"][0].replace(hour=0, minute=0, second=0,
+                                           microsecond=0)
+                xs = [(t - t0).total_seconds() / 3600.0 for t in s["hours"]]
+                day_date = t0.date().isoformat()
+            else:
+                xs = s["hours"]
+                day_date = ""
+            ax.plot(xs, plot_means, "-", linewidth=1.3,
+                    color=colors[i % len(colors)], label=plot_label)
+            # 应变组：同一子图上叠加“剔除温度后”荷载应变折线
+            # （不新增子图，共用坐标轴；与统计库 _temp_effect_stats 同口径）
+            for _ov in (s.get("load_overlays") or []):
+                _ov_hours, _ov_means, _ov_label = _ov[:3]
+                if day_mode:
+                    _ov_xs = [
+                        (_t - t0).total_seconds() / 3600.0
+                        for _t in _ov_hours]
+                else:
+                    _ov_xs = _ov_hours
+                ax.plot(_ov_xs, _ov_means, "-", linewidth=1.4,
+                        color=LOAD_STRAIN_OVERLAY_COLOR, label=_ov_label)
+                # 叠加线自身的尖峰/异常：单独标记（主线的缺失/故障/突变段
+                # 不重复，因为叠加线由原应变计算而来）
+                if len(_ov) >= 5:
+                    _ov_xmap = dict(zip(_ov_hours, _ov_xs))
+                    _ov_spike, _ov_range = _ov[3], _ov[4]
+                    if _ov_spike:
+                        ax.plot([_ov_xmap[p[0]] for p in _ov_spike],
+                                [p[1] for p in _ov_spike],
+                                "x", color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                markersize=9, mew=2.2, zorder=6)
+                    if _ov_range:
+                        ax.plot([_ov_xmap[p[0]] for p in _ov_range],
+                                [p[1] for p in _ov_range],
+                                "D", color=LOAD_STRAIN_OVERLAY_MARK_COLOR,
+                                markersize=6, mew=1.6, zorder=6)
+            _gaps = s.get("gaps") or []
+            if len(_gaps) > _MAX_GAP_ANNOTS:
+                # 缺失段过多（秒级数据常每隔几分钟掉线）：不逐段画色带，
+                # 避免整幅图被橙色带铺满；完整时段清单在 预处理记录.json。
+                try:
+                    _gt0 = dt.datetime.strptime(
+                        _gaps[0]["起始时间"], "%Y-%m-%d %H:%M")
+                    _ga = min(range(len(s["hours"])),
+                              key=lambda k: abs(
+                                  (s["hours"][k] - _gt0).total_seconds()))
+                    _glabel = f"缺失时段过多（{len(_gaps)}段）"
+                    panel_labels.append((_glabel, "#d2691e"))
+                    _yv = (plot_means[_ga] if _ga < len(plot_means)
+                           else 0.0)
+                    panel_pos.append(
+                        (_glabel, "#d2691e", xs[_ga], _yv))
+                    s["_gap_overflow"] = len(_gaps)
+                except (ValueError, KeyError):
+                    pass
+            else:
+                for g in _gaps:
+                    try:
+                        t0 = dt.datetime.strptime(
+                            g["起始时间"], "%Y-%m-%d %H:%M")
+                        t1 = dt.datetime.strptime(
+                            g["结束时间"], "%Y-%m-%d %H:%M")
+                    except (ValueError, KeyError):
+                        continue
+                    a = min(range(len(s["hours"])),
+                            key=lambda k: abs(
+                                (s["hours"][k] - t0).total_seconds()))
+                    b = min(range(len(s["hours"])),
+                            key=lambda k: abs(
+                                (s["hours"][k] - t1).total_seconds()))
+                    ax.axvspan(xs[a], xs[b],
+                               color="#ff7f0e", alpha=_BAND_ALPHA)
+                    panel_labels.append(
+                        (_fmt_compact_range(g['起始时间'], g['结束时间']),
+                         "#d2691e"))
+                    yv = (plot_means[b] if b < len(plot_means)
+                          else plot_means[a] if a < len(plot_means) else 0.0)
+                    panel_pos.append(
+                        (_fmt_compact_range(g['起始时间'], g['结束时间']),
+                         "#d2691e", xs[a], yv))
+                    any_gap = True
+            for sh in s.get("shifts") or []:
+                try:
+                    t0 = dt.datetime.strptime(sh["起始时间"], "%Y-%m-%d %H:%M")
+                    t1 = dt.datetime.strptime(sh["结束时间"], "%Y-%m-%d %H:%M")
+                except (ValueError, KeyError):
+                    continue
+                a = min(range(len(s["hours"])),
+                        key=lambda k: abs((s["hours"][k] - t0).total_seconds()))
+                b = min(range(len(s["hours"])),
+                        key=lambda k: abs((s["hours"][k] - t1).total_seconds()))
+                color = "#d62728" if sh["方向"] == "偏高" else "#2ca02c"
+                ax.axvspan(xs[a], xs[b],
+                           color=color, alpha=_BAND_ALPHA)
+                panel_labels.append(
+                    (f"{_fmt_compact_range(sh['起始时间'], sh['结束时间'])} "
+                     f"{sh['方向']}", color))
+                yv = (plot_means[b] if b < len(plot_means)
+                      else plot_means[a] if a < len(plot_means) else 0.0)
+                panel_pos.append(
+                    (f"{_fmt_compact_range(sh['起始时间'], sh['结束时间'])} "
+                     f"{sh['方向']}", color, xs[a], yv))
+            # 连续恒 0 超过阈值(普通 24h，0 为正常值的特征一周)：
+            # 紫色色带 + “编号(时间段)可能故障”
+            if not day_mode:
+                for z in detect_zero_runs(
+                        s["hours"], s["means"],
+                        min_hours=zero_min_hours(s["feature"])):
+                    try:
+                        t0 = dt.datetime.strptime(
+                            z["起始时间"], "%Y-%m-%d %H:%M")
+                        t1 = dt.datetime.strptime(
+                            z["结束时间"], "%Y-%m-%d %H:%M")
+                        a = min(range(len(s["hours"])),
+                                key=lambda k: abs(
+                                    (s["hours"][k] - t0).total_seconds()))
+                        b = min(range(len(s["hours"])),
+                                key=lambda k: abs(
+                                    (s["hours"][k] - t1).total_seconds()))
+                    except (ValueError, KeyError):
+                        continue
+                    ax.axvspan(xs[a], xs[b], color="#9467bd", alpha=_BAND_ALPHA)
+                    zrange = _fmt_compact_range(z['起始时间'], z['结束时间'])
+                    zlabel = f"{plot_label}({zrange})可能故障"
+                    panel_labels.append((zlabel, "#9467bd"))
+                    yv = (plot_means[b] if b < len(plot_means)
+                          else plot_means[a] if a < len(plot_means) else 0.0)
+                    panel_pos.append((zlabel, "#9467bd", xs[a], yv))
+                    any_zero = True
+            if s["spike_pts"]:
+                ax.plot([p[0] for p in s["spike_pts"]],
+                        [p[1] for p in s["spike_pts"]],
+                        "x", color="black", markersize=9, mew=2.2, zorder=5)
+            if s["range_pts"]:
+                ax.plot([p[0] for p in s["range_pts"]],
+                        [p[1] for p in s["range_pts"]],
+                        "x", color="#d62728", markersize=10, mew=2.2, zorder=5)
+
+        # 图上不再画“时间段/偏高偏低/可能故障”文字（方案第 2 节）：
+        # 这些结论信息在统计 JSON 与报告结论段已有；图只保留彩色带+曲线，
+        # 避免文字挤压绘图区、造成子图不等宽。
+        _ = (panel_labels, panel_pos, margin_labels)   # 保留变量供调试
+
+        if day_mode:
+            ax.set_xticks(range(0, 25, 6))
+            ax.set_xticklabels([f"{h}时" for h in range(0, 25, 6)],
+                               fontsize=13)
+            ax.set_xlim(0, 24)
+            ax.set_xlabel("时刻（小时）", fontsize=14)
+        all_hours = sorted({h for s in sub for h in s["hours"]})
+        if all_hours and not day_mode:
+            day_starts = {}
+            for h in all_hours:
+                day_starts.setdefault(h.date().isoformat(), h)
+            days = sorted(day_starts)
+            step = max(1, len(days) // 12)
+            ticks = [day_starts[d] for d in days[::step]]
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([_fmt_cn_date(d) for d in days[::step]],
+                               rotation=30, fontsize=13)
+        if day_mode:
+            ax.set_title(
+                f"{ptitle}｜{feature_display(sub[0]['feature'])}｜"
+                f"{_fmt_cn_date(day_date)}", fontsize=15)
+        elif row3:
+            # 一行三列时子图标题直接用分量名(如 GNSS(Δx))，整图标题带位置
+            ax.set_title(feature_display(sub[0]["feature"]), fontsize=15)
+        elif single_feat:
+            ax.set_title(f"{ptitle}｜{feature_display(sub[0]['feature'])}",
+                         fontsize=15)
+        else:
+            ax.set_title(feature_display(ptitle), fontsize=15)
+        ax.set_ylabel(feature_display(sub[0]["feature"]) if single_feat
+                      else feature_display(ptitle), fontsize=14)
+        ax.tick_params(axis="y", labelsize=12)
+        ax.grid(True, alpha=0.3)
+        # 收敛 y 轴时把“剔除温度后”叠加线也算进去，避免叠加线被裁掉
+        _ylim_vals = [v for s in sub for v in s.get("means", [])]
+        for _s in sub:
+            for _ov in (_s.get("load_overlays") or []):
+                _ylim_vals.extend(_ov[1] or [])
+        _converge_ylim(ax, _ylim_vals, sub[0].get("feature", ""),
+                       multi_curve=(len(sub) >= 2
+                                    or any(s.get("load_overlays")
+                                           for s in sub)))
+
+        handles, labels = ax.get_legend_handles_labels()
+        # 图例项按“本面板实际画了什么”生成：没画的不要凭空出现，
+        # 画了的（缺失橙带/恒0紫带/尖峰×/异常×）必须有对应图例
+        _any_spike = any(s.get("spike_pts") for s in sub)
+        _any_range = any(s.get("range_pts") for s in sub)
+        _ov_spike = any(ov[3] for ss in sub
+                        for ov in (ss.get("load_overlays") or [])
+                        if len(ov) >= 5)
+        _ov_range = any(ov[4] for ss in sub
+                        for ov in (ss.get("load_overlays") or [])
+                        if len(ov) >= 5)
+        _a_handles, _a_labels = _anno_legend_items(
+            any_spike=_any_spike, any_range=_any_range, any_gap=any_gap,
+            shift_high=shift_high, shift_low=shift_low, any_zero=any_zero,
+            overlay_spike=_ov_spike, overlay_range=_ov_range)
+        handles += _a_handles
+        labels += _a_labels
+        # 子图不画图例(避免遮挡数据)；统一收集到整图底部一个全局图例
+        for h, lb in zip(handles, labels):
+            if lb not in global_labels:
+                global_labels.append(lb)
+                global_handles.append(h)
+
+    for j in range(len(panels), len(axes)):
+        axes[j].axis("off")
+
+    _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
+    _gran = _granularity_label(panels)
+    _rows = (n + ncols - 1) // ncols if ncols else 1
+    if day_mode:
+        fig.suptitle(
+            f"{position}｜{group} {_gran}时间序列（{n} 个测点）｜"
+            f"{_fmt_cn_date(day_date)}{_chunk_txt}", fontsize=18)
+    else:
+        fig.suptitle(
+            f"{position}｜{group} {_gran}时间序列（{n} 个测点）{_chunk_txt}",
+            fontsize=18)
+    try:
+        fig._suptitle.set_y(1.0)
+        fig._suptitle.set_va("top")
+    except Exception:  # noqa: BLE001
+        pass
+    # 顶部留白只按总标题行高给（约 1.5 倍行距），再按实测间距微调
+    _top = _suptitle_top(fig)
+    if global_handles:
+        uniq_sensor_count = len({s["sensor"] for _, sub in panels
+                                 for s in sub})
+        # 多曲线判定：同面板多条曲线（应变原始+剔除温度叠加），
+        # 或同一子图内叠加多个测点 → 图例需保留编号区分线型
+        _multi_curve = any(
+            len(ss) >= 2 or any(s.get("load_overlays") for s in ss)
+            for _, ss in panels)
+        global_labels, global_handles = _trim_legend_items(
+            global_labels, global_handles, uniq_sensor_count, _multi_curve)
+        # 自检：图上画出来的色带/标记必须都在图例里，缺了就告警
+        _drawn_kinds = []
+        if any_gap:
+            _drawn_kinds.append("数据缺失(已插值填充)")
+        if shift_high:
+            _drawn_kinds.append("长时间偏高")
+        if shift_low:
+            _drawn_kinds.append("长时间偏低")
+        if any_zero:
+            _drawn_kinds.append("可能故障(恒0超过24h)")
+        _missing_legend = [k for k in _drawn_kinds
+                           if k not in global_labels]
+        if _missing_legend:
+            print(f"[警告] 图例缺少已绘制的色带说明 {_missing_legend}: "
+                  f"{out_path}", flush=True)
+        leg, leg_ext = _make_legend_fit(fig, global_handles, global_labels)
+        fig_h_px = fig.get_size_inches()[1] * fig.dpi
+        # 图例完整位于画布内，axes 下边界让出图例高度 + 间距
+        bottom = min(0.35, max(0.08, leg_ext.y1 / fig_h_px + 0.03))
+        _fit_suptitle_gap(fig, bottom, _top)
+    else:
+        _fit_suptitle_gap(fig, 0.0, _top)
+    # 不再有右侧文字标注：子图占满画布宽度（等宽等高），统一 tight 保存
+    _save_group_fig(fig, out_path, dpi, tight=True)
+    plt.close(fig)
+
+
+def _save_group_fig(fig, out_path: str, dpi: int = 200,
+                    tight: bool = True) -> None:
+    """保存合并图并做宽高比体检。
+
+    个别 matplotlib 版本（如服务器 conda 环境的 3.11.x）对
+    bbox_inches='tight' 中位于画布外/边缘的标注元素处理异常，会把画布
+    放大成 16:1 的废图，或把底部图例撑到贴边/截断。检测到异常宽高比，
+    或 tight 保存后画布明显大于原画布（说明有画布外元素被 bbox 包进来）
+    时，改用不带 tight 的画布重存一版，并打印警告便于日志定位。
+    """
+    fig.savefig(out_path, dpi=dpi,
+                bbox_inches=("tight" if tight else None),
+                facecolor="white")
+    try:
+        from PIL import Image
+        im = Image.open(out_path)
+        w, h = im.size
+        cw = int(round(fig.get_size_inches()[0] * dpi))
+        ch = int(round(fig.get_size_inches()[1] * dpi))
+        bad_ratio = w and h and (w / h > 6.0 or h / w > 6.0)
+        # tight 正常情况下只会裁剪留白、不会比原画布更宽；明显更宽说明
+        # 有画布外元素（如溢出图例）被 bbox 包了进来
+        overflow = bool(tight and (w > cw * 1.06 or h > ch * 1.06))
+        if bad_ratio or overflow:
+            print(
+                f"[警告] 合并图尺寸异常 {w}x{h}（画布 {cw}x{ch}），"
+                f"改用非 tight 画布重存: {out_path}",
+                flush=True)
+            fig.savefig(out_path, dpi=dpi, bbox_inches=None,
+                        facecolor="white")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[警告] 合并图尺寸体检失败 {out_path}: {exc}", flush=True)
+
+
+def plot_group_histogram(position, group, series, out_path, dpi=200):
+    """频率分布图：每个测点(传感器-特征)一个子图，不再叠加。
+    超过 6 个测点时拆成多张图(频率分布图.png / _2.png / ...)。"""
+    n = len(series)
+    if n == 0:
+        return
+    max_panels = 6
+    chunks = [series[i:i + max_panels]
+              for i in range(0, n, max_panels)]
+    for ci, chunk in enumerate(chunks):
+        if ci == 0:
+            out = out_path
+        else:
+            base, ext = os.path.splitext(out_path)
+            out = f"{base}_{ci + 1}{ext}"
+        _plot_group_histogram_chunk(position, group, chunk, out, dpi,
+                                    ci + 1, len(chunks))
+
+
+def _plot_group_histogram_chunk(position, group, series, out_path, dpi=200,
+                                chunk_idx=1, chunk_total=1):
+    """频率分布图单个图块：每个测点(传感器-特征)一个子图。"""
+    n = len(series)
+    if n == 0:
+        return
+    # 子图缩小并横向排列：每行最多 3 个（≤3 个测点单行横排），
+    # 面板约 5.0×3.2，整体更紧凑，便于报告排版
+    cols = min(n, 3)
+    rows = (n + cols - 1) // cols
+    panel_w, panel_h = 5.0, 3.2
+    fig, axes = plt.subplots(
+        rows, cols,
+        figsize=(panel_w * cols, panel_h * rows + 1.0))
+    axes = np.array(axes).reshape(-1)
+    colors = plt.cm.tab10.colors + plt.cm.Set2.colors
+    for i, s in enumerate(series):
+        ax = axes[i]
+        ax.hist(s["means"], bins=min(40, max(10, len(s["means"]) // 5)),
+                density=True, alpha=0.7, color=colors[i % len(colors)],
+                edgecolor="black")
+        ax.set_title(f"{s['label']}｜{feature_display(s['feature'])}",
+                     fontsize=12, pad=8)
+        ax.set_xlabel("数值", fontsize=11)
+        ax.set_ylabel("频率", fontsize=11)
+        ax.grid(True, alpha=0.3)
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+    _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
+    fig.suptitle(
+        f"{position}｜{group} 频率分布直方图（{n} 个测点）{_chunk_txt}",
+        fontsize=16)
+    _finalize_layout(fig, rows=rows)
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def plot_group_histogram_from_counts(position, group, hist_acc, bin_edges,
+                                     out_path, dpi=200):
+    """振动(秒级)合并频率分布图：每个 (传感器,特征) 一个子图，计数按季度逐日累积。
+    超过 6 个测点时拆成多张图。"""
+    keys = sorted(hist_acc)
+    if not keys:
+        return
+    max_panels = 6
+    chunks = [keys[i:i + max_panels]
+              for i in range(0, len(keys), max_panels)]
+    for ci, chunk in enumerate(chunks):
+        if ci == 0:
+            out = out_path
+        else:
+            base, ext = os.path.splitext(out_path)
+            out = f"{base}_{ci + 1}{ext}"
+        sub_acc = {k: hist_acc[k] for k in chunk}
+        _plot_group_histogram_from_counts_chunk(
+            position, group, sub_acc, bin_edges, out, dpi, ci + 1, len(chunks))
+
+
+def _plot_group_histogram_from_counts_chunk(position, group, hist_acc,
+                                            bin_edges, out_path, dpi=200,
+                                            chunk_idx=1, chunk_total=1):
+    """振动(秒级)合并频率分布图单个图块。"""
+    keys = sorted(hist_acc)
+    if not keys:
+        return
+    n = len(keys)
+    # 子图缩小并横向排列：每行最多 3 个（≤3 个测点单行横排），
+    # 面板约 5.0×3.2，整体更紧凑，便于报告排版
+    cols = min(n, 3)
+    rows = (n + cols - 1) // cols
+    panel_w, panel_h = 5.0, 3.2
+    fig, axes = plt.subplots(
+        rows, cols,
+        figsize=(panel_w * cols, panel_h * rows + 1.0),
+        squeeze=False)
+    axes = np.array(axes).reshape(-1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+    widths = np.diff(bin_edges)
+    colors = plt.cm.tab10.colors
+    for i, (sensor, feat) in enumerate(keys):
+        ax = axes[i]
+        counts = hist_acc[(sensor, feat)]
+        total = float(counts.sum()) or 1.0
+        ax.bar(centers, counts / (total * widths), width=widths,
+               color=colors[i % len(colors)], alpha=0.75,
+               edgecolor="black", linewidth=0.4)
+        ax.set_title(f"{sensor}｜{feature_display(feat)}",
+                     fontsize=12, pad=8)
+        ax.set_xlabel("数值", fontsize=11)
+        ax.set_ylabel("频率密度", fontsize=11)
+        ax.grid(True, alpha=0.3)
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+    _chunk_txt = f"（第 {chunk_idx}/{chunk_total} 张）" if chunk_total > 1 else ""
+    fig.suptitle(
+        f"{position}｜{group} 频率分布直方图（{n} 个测点，按日累积）{_chunk_txt}",
+        fontsize=16)
+    _finalize_layout(fig, rows=rows)
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def plot_group_correlation(position, group, series, out_path, dpi=200):
+    """组内特征两两相关：只有一对时独立成一张图，多对时用子图网格。"""
+    feat_series = defaultdict(list)
+    for s in series:
+        feat_series[s["feature"]].extend(zip(s["hours"], s["means"]))
+    feats = sorted(feat_series)
+    pairs = [(a, b) for i, a in enumerate(feats) for b in feats[i + 1:]]
+    if not pairs:
+        return
+    single = len(pairs) == 1
+    if single:
+        fig, ax0 = plt.subplots(1, 1, figsize=(9, 6.5))
+        axes = np.array([ax0])
+    else:
+        cols = 2
+        rows = (len(pairs) + cols - 1) // cols
+        fig, axes = plt.subplots(rows, cols, figsize=(14, 5.6 * rows))
+        axes = np.array(axes).reshape(-1)
+    for k, (a, b) in enumerate(pairs):
+        ax = axes[k]
+        da = dict(feat_series[a])
+        db = dict(feat_series[b])
+        xs = [da[t] for t in da if t in db]
+        ys = [db[t] for t in da if t in db]
+        if len(xs) < 3 or len(set(xs)) < 2 or len(set(ys)) < 2:
+            ax.axis("off")
+            continue
+        slope, intercept = np.polyfit(xs, ys, 1)
+        r = np.corrcoef(xs, ys)[0, 1]
+        ax.scatter(xs, ys, s=7, alpha=0.5, color="#4c72b0", label="测点")
+        xq = np.linspace(min(xs), max(xs), 100)
+        ax.plot(xq, slope * xq + intercept, "k:", linewidth=1.3,
+                label="回归直线")
+        ax.set_title(f"{a} vs {b}　r = {r:.4f}", fontsize=13)
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+    if not single:
+        for j in range(len(pairs), len(axes)):
+            axes[j].axis("off")
+    fig.suptitle(f"{position}｜{group} 特征相关性分析", fontsize=16)
+    _finalize_layout(fig, rows=rows)
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def plot_position_correlation(position, series, pos_dir, dpi=200):
+    """位置内跨特征相关性散点图（如 结构应变-温度）。
+
+    同一测点(传感器)同时有两种特征时按传感器编号配对；
+    不同传感器承载不同特征时按测点顺序配对（测点1 温度 ↔ 测点1 应变）。
+    每个特征对一张图，图内每个测点一个子图，保存为
+    图库/<位置>/相关性_<特征A>-<特征B>.png。
+    """
+    feat_sensors = defaultdict(list)  # feature -> [(sensor, hours, means)]
+    for s in series:
+        feat_sensors[s["feature"]].append(
+            (s["sensor"], s["hours"], s["means"]))
+    feats = sorted(feat_sensors)
+    pairs = [(a, b) for i, a in enumerate(feats) for b in feats[i + 1:]]
+    if not pairs:
+        return
+    os.makedirs(pos_dir, exist_ok=True)
+
+    for a, b in pairs:
+        da_by_sid = {sid: dict(zip(hs, ms))
+                     for sid, hs, ms in feat_sensors[a]}
+        db_by_sid = {sid: dict(zip(hs, ms))
+                     for sid, hs, ms in feat_sensors[b]}
+        # 1) 优先：同一传感器同时有两种特征 -> 按传感器配对
+        panels = []
+        for sid in da_by_sid:
+            if sid in db_by_sid:
+                panels.append((sid, da_by_sid[sid], db_by_sid[sid]))
+        # 2) 否则：不同传感器 -> 按测点顺序配对
+        if not panels:
+            def _key(x):
+                return (int(x) if x.isdigit() else x)
+            sa = sorted(feat_sensors[a], key=lambda t: _key(t[0]))
+            sb = sorted(feat_sensors[b], key=lambda t: _key(t[0]))
+            for k, (t1, t2) in enumerate(zip(sa, sb), 1):
+                panels.append((f"测点{k}",
+                               dict(zip(t1[1], t1[2])),
+                               dict(zip(t2[1], t2[2]))))
+        valid = []
+        for label, da, db in panels:
+            xs = [da[t] for t in da if t in db]
+            ys = [db[t] for t in da if t in db]
+            if len(xs) >= 3 and len(set(xs)) >= 2 and len(set(ys)) >= 2:
+                valid.append((label, xs, ys))
+        if not valid:
+            continue
+
+        single = len(valid) == 1
+        if single:
+            fig, ax0 = plt.subplots(1, 1, figsize=(9, 6.5))
+            axes = np.array([ax0])
+        else:
+            cols = 2
+            rows = (len(valid) + cols - 1) // cols
+            fig, axes = plt.subplots(rows, cols, figsize=(14, 4.5 * rows))
+            axes = np.array(axes).reshape(-1)
+        for k, (label, xs, ys) in enumerate(valid):
+            ax = axes[k]
+            slope, intercept = np.polyfit(xs, ys, 1)
+            ax.scatter(xs, ys, s=7, alpha=0.5, color="#4c72b0",
+                       label="测点")
+            xq = np.linspace(min(xs), max(xs), 100)
+            ax.plot(xq, slope * xq + intercept, "k:", linewidth=1.3,
+                    label="回归直线")
+            ax.legend(loc="upper right", fontsize=8)
+            # 相关性系数 = 回归斜率 a（ε_temp = a·T + b），与统计表一致
+            ax.set_title(f"{label}　a = {slope:.4f}", fontsize=13)
+            ax.set_xlabel(feature_display(a), fontsize=11)
+            ax.set_ylabel(feature_display(b), fontsize=11)
+            ax.grid(True, alpha=0.3)
+        if not single:
+            for j in range(len(valid), len(axes)):
+                axes[j].axis("off")
+        fig.suptitle(
+            f"{position}｜{feature_display(a)}-{feature_display(b)} "
+            f"相关性散点图", fontsize=16)
+        _finalize_layout(fig, rows=1)
+        out = os.path.join(pos_dir, f"相关性_{a}-{b}.png")
+        fig.savefig(out, dpi=dpi, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+
+
+def _derive_period_tag(start="", end="", daily_root=""):
+    """推导“年份.月份范围”标签，如 2026.1~3、2025.12~2026.3。
+
+    优先级：--start/--end > daily 目录文件名。
+    无法推导时返回空字符串（目录名回退为不带日期的“图库/统计值”）。
+    """
+    def _parse(s):
+        try:
+            return dt.datetime.strptime(str(s).strip(), "%Y-%m-%d").date()
+        except (ValueError, AttributeError):
+            return None
+
+    d0 = d1 = None
+    if start and end:
+        d0, d1 = _parse(start), _parse(end)
+    if not d0 or not d1:
+        dates = []
+        if daily_root and os.path.isdir(daily_root):
+            try:
+                for sensor_dir in os.listdir(daily_root):
+                    sd = os.path.join(daily_root, sensor_dir)
+                    if not os.path.isdir(sd):
+                        continue
+                    for feat_dir in os.listdir(sd):
+                        fd = os.path.join(sd, feat_dir)
+                        if not os.path.isdir(fd):
+                            continue
+                        for fn in os.listdir(fd):
+                            if fn.endswith(".csv"):
+                                p = _parse(fn[:-4])
+                                if p:
+                                    dates.append(p)
+                    if len(dates) > 50000:
+                        break
+            except Exception:
+                pass
+        if dates:
+            d0, d1 = min(dates), max(dates)
+    if not d0 or not d1:
+        return ""
+    if d0.year == d1.year:
+        return f"{d0.year}.{d0.month}~{d1.month}"
+    return f"{d0.year}.{d0.month}~{d1.year}.{d1.month}"
+
+
+def _copy_per_sensor_dirs(lib_root, chart_dir, bridge=""):
+    """把旧图库的 per_sensor 数字文件夹(如 184/DZJSD(xJsd))复制到新图库目录(缺则补)。
+
+    振动/应变等章节按显式传感器编号出图，需要 per_sensor 图；新目录合并图之外
+    补一份，保证带年月目录自包含、报告全量命中。
+    """
+    old_charts = os.path.join(lib_root, "图库", bridge) if bridge \
+        else os.path.join(lib_root, "图库")
+    if not os.path.isdir(old_charts):
+        return 0
+    copied = 0
+    for name in os.listdir(old_charts):
+        if not name.isdigit():
+            continue
+        s = os.path.join(old_charts, name)
+        d = os.path.join(chart_dir, name)
+        if os.path.isdir(s) and not os.path.isdir(d):
+            try:
+                shutil.copytree(s, d)
+                copied += 1
+            except OSError as exc:
+                print(f"[警告] 复制 per_sensor 目录失败 {s}: {exc}", flush=True)
+    return copied
+
+
+def _write_status_dirs(lib_root, chart_dir, stats_dir, update_charts=True):
+    """把本期实际目录写入 <lib_root>/status.json 的 dirs（保留其它字段）。"""
+    status_path = os.path.join(lib_root, "status.json")
+    try:
+        status = {}
+        if os.path.isfile(status_path):
+            with open(status_path, "r", encoding="utf-8") as f:
+                status = json.load(f)
+        status.setdefault("dirs", {})
+        if update_charts:
+            status["dirs"]["charts"] = os.path.abspath(chart_dir)
+        status["dirs"]["stats"] = os.path.abspath(stats_dir)
+        status["updated_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(status_path, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[警告] 写 status.json 失败: {exc}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="图库 + 统计值生成(集成版)")
+    ap.add_argument("--mode", choices=["merged", "per_sensor"], default="merged",
+                    help="merged=按监测部位合并出图(多传感器/多特征一张图，默认)；"
+                         "per_sensor=旧的按传感器出图")
+    ap.add_argument("--position-map", default="",
+                    help="传感器名称对照 json 路径(默认扫描 "
+                         "传感器对照/传感器名称对照/*.json)")
+    ap.add_argument("--dpi", type=int, default=200,
+                    help="图片分辨率(默认 200，保证插入 Word 清晰)")
+    ap.add_argument("--daily-root", default=None,
+                    help="预处理输出的 daily 目录(默认由 --year/--quarter 或 "
+                         "DEFAULT_DAILY_ROOT 推导)")
+    ap.add_argument("--year", type=int, default=0,
+                    help="年份(如 2026)，与 --quarter 一起自动推导 daily 目录/期号/日期范围")
+    ap.add_argument("--quarter", type=int, default=0, choices=[1, 2, 3, 4],
+                    help="季度(1~4)，与 --year 一起使用")
+    ap.add_argument("--lib-root", default=DEFAULT_LIB_ROOT,
+                    help="图库/统计值 的上级目录")
+    ap.add_argument("--charts-dir", default="",
+                    help="图库输出目录(默认 <lib-root>/图库)")
+    ap.add_argument("--stats-dir", default="",
+                    help="统计值输出目录(默认 <lib-root>/统计值)")
+    ap.add_argument("--sensor-map", default="",
+                    help="传感器编号名称.json 路径(默认 "
+                         "传感器对照/传感器编号名称.json)")
+    ap.add_argument("--period-tag", default="",
+                    help="目录名里的年月标签(如 2026.1~3)；默认自动从数据范围推导")
+    ap.add_argument("--bridge", default="",
+                    help="大桥名称(如 赤石)；图库/统计值挂到 图库_<期>/<桥名>、"
+                         "统计值_<期>/<桥名> 下，daily 根目录取 "
+                         "<daily根>/<桥名>/daily_<期>。不填时按传感器对照表自动推导")
+    ap.add_argument("--features", default="",
+                    help="只生成指定特征(逗号分隔，如 DZJSD(xJsd),YB(rsg))；"
+                         "留空=全部。用于对不满意的特征选择性重新生成")
+    ap.add_argument("--limits", default="",
+                    help="清洗限值 JSON 路径(默认 preprocess/清洗限值.json："
+                         "物理量程、温度季节上下限、恒0判定、统计窗口、"
+                         "剔除预算、绘图阈值)")
+    ap.add_argument("--traffic-only", action="store_true",
+                    help="只处理交通荷载(车道统计)：检查 inputs 原始数据、"
+                         "必要时先转日级，再生成 交通荷载 图库/统计值；"
+                         "不写 总览.json/公共缺失时间段.json，避免覆盖"
+                         "该期其它传感器的统计产物")
+    ap.add_argument("--vibration-date", default="",
+                    help="振动(秒级)出图日期 YYYY-MM-DD；不指定时自动取"
+                         "数据最完整/最新的一天(只出一张时间序列图)")
+    ap.add_argument("--correlation", action="store_true",
+                    help="同时生成同传感器不同特征间的相关性分析图")
+    ap.add_argument("--limit-sensors", type=int, default=0,
+                    help="只处理前 N 个传感器(试跑用)")
+    ap.add_argument("--spike-threshold", type=float, default=5.0,
+                    help="尖峰检测阈值(偏离稳健基线多少个MAD，0=关闭尖峰清洗)")
+    ap.add_argument("--max-spikes", type=int, default=3,
+                    help="每个序列最多替代几个尖峰(只保留最极端的，默认3)")
+    ap.add_argument("--dist-k", type=float, default=20.0,
+                    help="分布极端值过滤宽带(稳健尺度倍数，默认20；"
+                         "0=关闭，只保留物理范围过滤)")
+    ap.add_argument("--max-dist-outliers", type=int, default=5,
+                    help="保留参数(兼容旧命令)；现按连续异常段整段剔除，"
+                         "一段占 --max-removals 1 个名额，不再按点数限制)")
+    ap.add_argument("--max-removals", type=int, default=5,
+                    help="分布极端点+零散尖峰合计最多剔除几个(按偏离程度排名，"
+                         "默认5；物理范围外/非有限值不计入)")
+    ap.add_argument("--max-shifts", type=int, default=5,
+                    help="突变区间最多标注几条(按偏离程度排名，默认5)")
+    ap.add_argument("--stat-window", type=int, default=0,
+                    help="统计值清洗的判定窗口(小时)：0=按特征粒度自动"
+                         "(风速24h、加速度1h即原逻辑、其余全局)，"
+                         ">0 显式指定，负数=强制全局。只影响统计值，"
+                         "绘图始终用原有的稳健基线+尖峰逻辑")
+    ap.add_argument("--skip-per-sensor", action="store_true",
+                    help="跳过逐传感器(per_sensor)出图，直接生成 merged 图"
+                         "(单传感器单特征组也会由 merged 路径直接出图)")
+    ap.add_argument("--skip-charts", action="store_true",
+                    help="跳过图库生成(per_sensor 与 merged 图都不生成)，"
+                         "只计算并写出统计库(位置统计/)，用于只刷新统计值")
+    ap.add_argument("--skip-stats", action="store_true",
+                    help="跳过统计值计算与写出(per_sensor 只出图、不重算统计；"
+                         "与 --skip-per-sensor 一起用时逐传感器整体跳过，"
+                         "只生成合并图；统计值保留上次结果)")
+    ap.add_argument("--gap-fill-hours", type=float, default=24,
+                    help="连续缺失达到该小时数时，图上标注并用线性插值"
+                         "填充绘图(默认24小时，0=关闭)")
+    ap.add_argument("--shift-threshold", type=float, default=2.5,
+                    help="突变段检测阈值(偏离基线多少个尺度，0=关闭突变标注)")
+    ap.add_argument("--shift-min-days", type=int, default=7,
+                    help="突变段最短持续天数")
+    ap.add_argument("--start", default="", help="起始日期 YYYY-MM-DD(可选)")
+    ap.add_argument("--end", default="", help="结束日期 YYYY-MM-DD(可选)")
+    args = ap.parse_args()
+    if args.limits:
+        apply_cleaning_limits(args.limits)
+
+    # --year/--quarter 自动推导：起止日期、期号(daily 根目录在桥名推导后统一拼接)
+    if args.year and args.quarter:
+        qs = (args.quarter - 1) * 3 + 1
+        qe = args.quarter * 3
+        start_d = dt.date(args.year, qs, 1)
+        end_d = dt.date(args.year, qe, calendar.monthrange(args.year, qe)[1])
+        args.start = args.start or start_d.isoformat()
+        args.end = args.end or end_d.isoformat()
+    tag = args.period_tag or _derive_period_tag(
+        args.start, args.end, args.daily_root or DEFAULT_DAILY_ROOT)
+    chart_dir = args.charts_dir or (
+        os.path.join(args.lib_root, f"图库_{tag}") if tag
+        else os.path.join(args.lib_root, "图库"))
+    stats_dir = args.stats_dir or (
+        os.path.join(args.lib_root, f"统计值_{tag}") if tag
+        else os.path.join(args.lib_root, "统计值"))
+
+    map_path = (args.sensor_map
+                or os.path.join(DEFAULT_SENSOR_MAP_DIR, "传感器编号名称.json"))
+    if not os.path.isfile(map_path):
+        # 兼容旧布局：统计值目录里还有旧对照表时回退
+        old_map = os.path.join(stats_dir, "传感器编号名称.json")
+        if os.path.isfile(old_map):
+            map_path = old_map
+    sensor_map = load_sensor_map(map_path)
+    print(f"传感器名称对照: {'已加载(' + str(len(sensor_map)) + '个)' if sensor_map else '未找到'}")
+
+    # 大桥名称：--bridge 优先，否则按对照表里最常见的桥名自动推导
+    bridge = args.bridge or ""
+    if not bridge:
+        names = [info.get("桥名", "") for info in sensor_map.values()]
+        names = [n for n in names if n]
+        if names:
+            bridge = max(set(names), key=names.count)
+    # daily 根目录(绝对路径)；显式 --daily-root 优先
+    if not args.daily_root:
+        base = os.path.dirname(DEFAULT_DAILY_ROOT.rstrip("/\\"))
+        daily_name = os.path.basename(DEFAULT_DAILY_ROOT.rstrip("/\\"))
+        yearly = bool(args.year and not args.quarter)
+        if args.year and args.quarter:
+            daily_name = f"daily_{args.year}.{qs}~{qe}"
+        if bridge:
+            # 兼容桥名写法差异(湘江特 vs 湘江特大桥)：按目录存在性匹配，
+            # 避免预处理用 --bridge 湘江特、建图库用 --bridge 湘江特大桥 时
+            # daily 目录对不上
+            resolved = False
+            for v in _bridge_variants(bridge):
+                if yearly:
+                    # 年度：daily 根为桥根目录，下面挂各季度 daily_* 子目录
+                    cand = os.path.join(base, v)
+                    if os.path.isdir(cand) and any(
+                            os.path.isdir(os.path.join(cand, d))
+                            for d in os.listdir(cand)
+                            if d == "daily" or d.startswith("daily_")):
+                        bridge = v
+                        args.daily_root = cand
+                        resolved = True
+                        break
+                else:
+                    cand = os.path.join(base, v, daily_name)
+                    if os.path.isdir(cand):
+                        bridge = v
+                        args.daily_root = cand
+                        resolved = True
+                        break
+            if not resolved:
+                args.daily_root = (
+                    os.path.join(base, bridge) if yearly
+                    else os.path.join(base, bridge, daily_name))
+        else:
+            args.daily_root = os.path.join(
+                base, "" if yearly else daily_name)
+    # 年度模式：加载该年全部季度 daily 子目录(daily_2026.1~3 / 4~6 / ...)
+    if args.year and not args.quarter:
+        root = args.daily_root if isinstance(args.daily_root, str) \
+            else args.daily_root[0]
+        subdirs = sorted(
+            os.path.join(root, d) for d in os.listdir(root)
+            if os.path.isdir(os.path.join(root, d))
+            and (d == "daily" or d.startswith("daily_")))
+        if subdirs:
+            args.daily_root = subdirs
+        else:
+            args.daily_root = [root]
+        tag = f"{args.year}.1~12"
+        chart_dir = args.charts_dir or (
+            os.path.join(args.lib_root, f"图库_{tag}") if tag
+            else os.path.join(args.lib_root, "图库"))
+        stats_dir = args.stats_dir or (
+            os.path.join(args.lib_root, f"统计值_{tag}") if tag
+            else os.path.join(args.lib_root, "统计值"))
+    if bridge:
+        # 图库/统计值：图库_<期>/<桥名>、统计值_<期>/<桥名>。
+        # 显式 --charts-dir/--stats-dir 可能已带桥名（web 传的是
+        # 图库_<期>/<桥名> 这种），已带时不再重复拼，避免出现
+        # 统计值_2026.4~6/洣水河特大桥/洣水河特大桥/位置统计
+        def _leaf_has_bridge(path):
+            leaf = os.path.basename(os.path.normpath(str(path or "")))
+            return bool(leaf) and leaf in _bridge_variants(bridge)
+        if not _leaf_has_bridge(chart_dir):
+            chart_dir = os.path.join(chart_dir, bridge)
+        if not _leaf_has_bridge(stats_dir):
+            stats_dir = os.path.join(stats_dir, bridge)
+        print(f"大桥名称: {bridge}")
+        print(f"daily 数据源: {args.daily_root}")
+    if isinstance(args.daily_root, list) and len(args.daily_root) > 1:
+        print(f"年度模式: 加载 {len(args.daily_root)} 个季度 daily 目录")
+    if not args.skip_charts:
+        os.makedirs(chart_dir, exist_ok=True)
+    os.makedirs(stats_dir, exist_ok=True)
+    if tag:
+        print(f"本期年月范围: {tag}")
+
+    # ---------- 交通荷载：跳过已存在 / 原始数据检查 / 日级兜底 ----------
+    # 普通全量跑：图库/统计值已有交通荷载产物时跳过，避免每次重复处理；
+    # --traffic-only（web“交通荷载预处理”）强制重建。
+    skip_traffic = (not args.traffic_only
+                    and _traffic_outputs_exist(chart_dir, stats_dir))
+    if not skip_traffic:
+        _ensure_traffic_daily(args, bridge, tag)
+    else:
+        print("[提示] 图库/统计值已包含交通荷载数据，跳过交通荷载处理"
+              "（如需强制重建请加 --traffic-only）", flush=True)
+
+    # ---------- 选择数据源 ----------
+    sensor_feats = discover_sensor_features(args.daily_root)
+    if not sensor_feats:
+        print(f"[错误] daily 目录为空，无法生成图库（已取消 summary.csv 日级回退）: "
+              f"{args.daily_root}")
+        sys.exit(1)
+    print(f"数据源: daily 目录(小时级明细) {args.daily_root}")
+    # 新符号提醒：实际数据里出现但没配置物理范围的特征，只用自适应
+    # 尖峰/分布清洗（不做物理硬过滤），提醒人工看过数据后补范围
+    _unranged = sorted({
+        f for _s, feats in sensor_feats.items() for f in feats
+        if feature_range(f) is None})
+    if _unranged:
+        print("[提示] 以下特征未配置物理范围，仅用自适应尖峰/分布清洗"
+              "（看过一两个季度数据后可补范围）："
+              + "、".join(_unranged), flush=True)
+
+    # 收集 (传感器, 特征) 列表
+    pairs = [(s, f) for s, feats in sorted(sensor_feats.items())
+             for f in feats]
+    if args.traffic_only:
+        # 只处理交通荷载（车道N/总共）
+        pairs = [(s, f) for s, f in pairs if s == TRAFFIC_SENSOR]
+    elif args.features:
+        want_traffic = _traffic_selected(args.features)
+        pairs = [(s, f) for s, f in pairs
+                 if _feature_selected(f, args.features)
+                 or (want_traffic and s == TRAFFIC_SENSOR)]
+    sensors = sorted({p[0] for p in pairs})
+    if args.traffic_only and TRAFFIC_SENSOR not in sensors:
+        print("[提醒] 未找到交通荷载日级数据（inputs 无原始数据或尚未预处理），"
+              "请先下载/预处理交通荷载数据", flush=True)
+        return
+    if args.limit_sensors:
+        sensors = sensors[:args.limit_sensors]
+        pairs = [p for p in pairs if p[0] in set(sensors)]
+    print(f"共发现 {len(sensors)} 个传感器，开始生成图库...")
+
+    t0 = time.time()
+    issues = []   # 失败/数据不足记录
+    overview = []
+    pos_stats = {}   # 位置 -> 传感器编号 -> 特征 -> {统计, 每日统计}
+    pos_sensor_order = {}   # 位置 -> 传感器编号列表(按首次出现顺序)
+    pos_daily = {}   # 位置 -> 传感器编号 -> 特征 -> (dates, means) 用于应变-温度联合统计
+    _corr_hourly = {}   # (传感器, 特征) -> (hours, 清洗后means/maxs/mins)
+    _feature_hour_cov = {}   # 特征 -> {sensors:set, covered:{小时:覆盖传感器数}}
+                             # 用于“多数传感器公共缺失时间段”统计
+    # 只出合并图(--skip-per-sensor --skip-stats)时，逐传感器统计计算与出图
+    # 整体跳过，直接进入合并图库阶段，节省大量读取/统计时间
+    _sensor_iter = sensors
+    if args.skip_per_sensor and args.skip_stats:
+        print("--skip-per-sensor --skip-stats: 跳过逐传感器统计计算与出图，"
+              "直接生成合并图")
+        _sensor_iter = []
+    for idx, sensor in enumerate(_sensor_iter, 1):
+        if sensor == TRAFFIC_SENSOR and skip_traffic:
+            print(f"[跳过] 交通荷载统计已存在，跳过 {sensor}"
+                  "（--traffic-only 可强制重建）", flush=True)
+            continue
+        info = sensor_map.get(sensor, {})
+        sensor_name = info.get("名称", "") or sensor
+        bridge = info.get("桥名", "")
+        sensor_stats = {
+            "编号": sensor,
+            "名称": sensor_name,
+            "桥名": bridge,
+            "生成时间": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "特征统计": {},
+        }
+        # 传感器所在位置(与图库 merge 位置目录一致)；找不到回退到传感器编号
+        pos_name = (info.get("监测部位") or info.get("名称") or "").strip() or sensor
+        corr_results = {}
+        daily_by_feat = {}
+
+        for feature in [f for (s, f) in pairs if s == sensor]:
+            # 实际特征名 = daily 下该传感器真实的特征目录名（同族回退时可能
+            # 与名称对照/配置特征不一致，如对照表 DZJSD(xJsd)、实际数据是
+            # SZJSD(xJsd/yJsd/zJsd)）。统计键/特征字段必须用实际特征，否则
+            # 统计库与图库(按实际特征命名)对不上，报告会把 304 的 SZJSD
+            # 数据当成 DZJSD，索引到同位置的振动图。
+            _fd = resolve_feature_dirs(args.daily_root, sensor, feature)
+            actual_feature = os.path.basename(_fd[0]) if _fd else feature
+            try:
+                # ---------- 振动(秒级)按天出图：每天只加载当天数据 ----------
+                if _is_second_level_feature(feature):
+                    day_files = sorted({
+                        fn for feat_dir in resolve_feature_dirs(
+                            args.daily_root, sensor, feature)
+                        for fn in os.listdir(feat_dir)
+                        if fn.lower().endswith(".csv")})
+                    day_files = [fn for fn in day_files
+                                 if (not args.start or fn[:-4] >= args.start)
+                                 and (not args.end or fn[:-4] <= args.end)]
+                    if not day_files:
+                        issues.append(f"无数据: {sensor}/{feature}")
+                        continue
+                    vrange = feature_range(feature)
+                    spike_k = (0 if _is_direction_feature(feature)
+                               else args.spike_threshold)
+                    spike_rec = []
+                    shifts_all = []
+                    gaps_all = []
+                    day_dates, day_means, day_maxs = [], [], []
+                    day_mins, day_secs, day_miss = [], [], []
+                    native_hours = []
+                    native_means, native_maxs, native_mins = [], [], []
+                    _spk_b, _dist_b, _rm_b = granularity_cleaning_budget(
+                        actual_feature, args.max_spikes,
+                        args.max_dist_outliers, args.max_removals)
+                    hist_bins = np.linspace(-1000.0, 1000.0, 101)
+                    hist_counts = None
+                    chart_day = None          # (日期, hours, means, ix, rx, shifts, gaps)
+                    best_secs = -1
+                    for fn in day_files:
+                        date_str = fn[:-4]
+                        path = ""
+                        for feat_dir in resolve_feature_dirs(
+                                args.daily_root, sensor, feature):
+                            cand = os.path.join(feat_dir, fn)
+                            if os.path.isfile(cand):
+                                path = cand
+                                break
+                        if not path:
+                            continue
+                        hours_d, means_d, maxs_d, mins_d, secs, miss = \
+                            read_daily_file(path)
+                        if not hours_d:
+                            continue
+                        means_d, r1, ix1, rx1 = clean_series_value(
+                            hours_d, means_d, f"{date_str}均值", spike_k,
+                            hour_level=True, vrange=vrange,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b,
+                            feature=feature)
+                        maxs_d, r2, ix2, rx2 = clean_series_value(
+                            hours_d, maxs_d, f"{date_str}最大值", spike_k,
+                            hour_level=True, vrange=vrange,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b,
+                            feature=feature)
+                        mins_d, r3, ix3, rx3 = clean_series_value(
+                            hours_d, mins_d, f"{date_str}最小值", spike_k,
+                            hour_level=True, vrange=vrange,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b,
+                            feature=feature)
+                        spike_rec += r1 + r2 + r3
+                        # 累积清洗后的原生粒度序列（小时级/秒级），
+                        # 供全期极值按特征颗粒度计算
+                        native_hours += list(hours_d)
+                        native_means += list(means_d)
+                        native_maxs += list(maxs_d)
+                        native_mins += list(mins_d)
+                        # 突变段(按天, 秒级至少 1 分钟)
+                        shifts_d = []
+                        if not _is_direction_feature(feature):
+                            block_k = (args.dist_k if args.dist_k > 0
+                                       else DEFAULT_DIST_K)
+                            blocks = detect_deviation_blocks(
+                                hours_d, means_d, k=block_k, min_points=60)
+                            if blocks:
+                                shifts_d = _cap_shifts(blocks,
+                                                       args.max_shifts)
+                        shifts_all += shifts_d
+                        # 缺失(>5 分钟)标注
+                        gaps_d = []
+                        if len(hours_d) > 1:
+                            for a in range(len(hours_d) - 1):
+                                gaph = (hours_d[a + 1] - hours_d[a]
+                                        ).total_seconds() / 3600.0
+                                if gaph > 5.0 / 60.0:
+                                    gaps_d.append({
+                                        "起始时间": hours_d[a].strftime(
+                                            "%Y-%m-%d %H:%M"),
+                                        "结束时间": hours_d[a + 1].strftime(
+                                            "%Y-%m-%d %H:%M"),
+                                        "缺失小时数": round(gaph, 3),
+                                    })
+                        gaps_all += gaps_d
+                        # 日聚合(清洗后)
+                        day_dates.append(date_str)
+                        day_means.append(float(np.mean(means_d)))
+                        day_maxs.append(float(np.max(maxs_d)))
+                        day_mins.append(float(np.min(mins_d)))
+                        day_secs.append(secs)
+                        day_miss.append(miss)
+                        # 直方图累积(季度汇总)
+                        cnts, _ = np.histogram(means_d, bins=hist_bins)
+                        hist_counts = (cnts if hist_counts is None
+                                       else hist_counts + cnts)
+                        # 选定出图日：--vibration-date 优先，否则取有效秒数最多的一天
+                        if args.vibration_date and date_str == args.vibration_date:
+                            chart_day = (date_str, hours_d, means_d,
+                                         sorted(ix1), sorted(rx1),
+                                         shifts_d, gaps_d)
+                        elif not args.vibration_date and secs > best_secs:
+                            best_secs = secs
+                            chart_day = (date_str, hours_d, means_d,
+                                         sorted(ix1), sorted(rx1),
+                                         shifts_d, gaps_d)
+                    if not day_dates:
+                        issues.append(f"无数据: {sensor}/{feature}")
+                        continue
+                    # 振动只出一张时间序列图(选定一天，横轴 0~24 小时，标题含日期)
+                    if chart_day and not args.skip_per_sensor \
+                            and not args.skip_charts:
+                        fout = os.path.join(chart_dir, sensor, feature)
+                        os.makedirs(fout, exist_ok=True)
+                        cdate, ch, cm, cix, crx, csh, cgp = chart_day
+                        plot_daily_time_series(
+                            sensor, sensor_name, feature, cdate, ch, cm,
+                            os.path.join(fout, "时间序列图.png"),
+                            replaced_indices=cix,
+                            replaced_range_indices=crx,
+                            shifts=csh, gaps=cgp, dpi=args.dpi)
+                    # 季度频率分布图(按天累积)
+                    if hist_counts is not None and not args.skip_per_sensor \
+                            and not args.skip_charts:
+                        fout = os.path.join(chart_dir, sensor, feature)
+                        os.makedirs(fout, exist_ok=True)
+                        plot_histogram_from_counts(
+                            sensor, sensor_name, feature, hist_bins,
+                            hist_counts, os.path.join(fout, "频率分布图.png"))
+                    if not args.skip_stats:
+                        # 恒0故障段（含 <24h 短段）：剔除后算极值，并记录
+                        # 疑似故障时间段 供季度统计/总结引用
+                        if native_hours:
+                            (_n_hours, _n_means, _n_maxs, _n_mins,
+                             zero_runs) = _mask_zero_fault_hours(
+                                native_hours, native_means,
+                                native_maxs, native_mins, feature)
+                        else:
+                            _n_hours, _n_means, _n_maxs, _n_mins = \
+                                native_hours, native_means, \
+                                native_maxs, native_mins
+                            zero_runs = []
+                        stats, day_dates, day_means, day_maxs, day_mins = \
+                            compute_feature_stats(
+                                day_dates, day_means, day_maxs, day_mins,
+                                day_secs, day_miss, args.start, args.end,
+                                _n_means, _n_maxs, _n_mins)
+                        if stats is None:
+                            issues.append(f"无数据: {sensor}/{feature}")
+                            continue
+                        if zero_runs:
+                            stats["疑似故障时间段"] = zero_runs
+                        stats["特征"] = actual_feature
+                        stats["特征中文名"] = feature_display(actual_feature)
+                        stats["预处理"] = {
+                            "尖峰替代": spike_rec,
+                            "突变区间": shifts_all,
+                            "数据缺失填充": gaps_all,
+                        }
+                        sensor_stats["特征统计"][actual_feature] = stats
+                        # 统计库: 位置 -> 测点 -> 特征(只存整体统计，不存每日统计)
+                        pos_stats.setdefault(pos_name, {}).setdefault(
+                            str(sensor), {})[actual_feature] = {
+                            "统计": {k: v for k, v in stats.items()
+                                     if k not in ("每日统计", "特征",
+                                                  "特征中文名", "预处理")},
+                        }
+                        _order = pos_sensor_order.setdefault(pos_name, [])
+                        if str(sensor) not in _order:
+                            _order.append(str(sensor))
+                    daily_by_feat[feature] = (day_dates, day_means)
+                    pos_daily.setdefault(pos_name, {}).setdefault(
+                        str(sensor), {})[feature] = (list(day_dates),
+                                                     list(day_means))
+                    continue
+                # ---------- 小时级数据(一天 24 个点) ----------
+                (hours, hmeans, hmaxs, hmins,
+                 day_dates, day_means, day_maxs, day_mins,
+                 day_secs, day_miss) = read_hourly_series(
+                     resolve_feature_dirs(
+                         args.daily_root, sensor, feature))
+                if not hours:
+                    issues.append(f"无数据: {sensor}/{feature}")
+                    continue
+                keep = [i for i, h in enumerate(hours)
+                        if (not args.start
+                            or h.date().isoformat() >= args.start)
+                        and (not args.end
+                             or h.date().isoformat() <= args.end)]
+                if not keep:
+                    issues.append(f"无数据: {sensor}/{feature}")
+                    continue
+                hours = [hours[i] for i in keep]
+                hmeans = [hmeans[i] for i in keep]
+                hmaxs = [hmaxs[i] for i in keep]
+                hmins = [hmins[i] for i in keep]
+                # 累计小时覆盖，供“多数传感器公共缺失时间段”统计
+                if hours:
+                    _fc = _feature_hour_cov.setdefault(
+                        actual_feature, {"sensors": set(), "covered": {}})
+                    _fc["sensors"].add(str(sensor))
+                    for _h in hours:
+                        _fc["covered"][_h] = _fc["covered"].get(_h, 0) + 1
+
+                # 尖峰清洗: 均值/最大/最小 三个序列各自检测替代
+                spike_rec = []
+                spike_idx = []
+                vrange = feature_range(feature)
+                _spk_b, _dist_b, _rm_b = granularity_cleaning_budget(
+                    actual_feature, args.max_spikes,
+                    args.max_dist_outliers, args.max_removals)
+                spike_k = (0 if _is_direction_feature(feature)
+                           else args.spike_threshold)
+                hmeans, r1, ix1, rx1 = clean_series_value(
+                    hours, hmeans, "小时均值", spike_k,
+                    hour_level=True, vrange=vrange,
+                    max_spikes=_spk_b, dist_k=args.dist_k,
+                    max_dist_outliers=_dist_b,
+                    max_total_removals=_rm_b,
+                    feature=feature)
+                hmaxs, r2, ix2, rx2 = clean_series_value(
+                    hours, hmaxs, "小时最大值", spike_k,
+                    hour_level=True, vrange=vrange,
+                    max_spikes=_spk_b, dist_k=args.dist_k,
+                    max_dist_outliers=_dist_b,
+                    max_total_removals=_rm_b,
+                    feature=feature)
+                hmins, r3, ix3, rx3 = clean_series_value(
+                    hours, hmins, "小时最小值", spike_k,
+                    hour_level=True, vrange=vrange,
+                    max_spikes=_spk_b, dist_k=args.dist_k,
+                    max_dist_outliers=_dist_b,
+                    max_total_removals=_rm_b,
+                    feature=feature)
+                spike_rec = r1 + r2 + r3
+                # 图上只标均值序列的剔除点；最大/最小序列的清洗记录仍写入 JSON
+                spike_idx = sorted(ix1)
+                range_idx = sorted(rx1)
+
+                # 突变段检测(小时级，按"当天多数小时偏离"判定；风向除外)
+                shifts = []
+                if (args.shift_threshold > 0
+                        and not _is_direction_feature(feature)):
+                    shifts = _cap_shifts(
+                        detect_level_shifts(
+                            hours, hmeans, args.shift_min_days,
+                            args.shift_threshold),
+                        args.max_shifts)
+                # 连续异常段(> max_run 点)：不剔除，只在图上标注
+                if not _is_direction_feature(feature):
+                    block_k = (args.dist_k if args.dist_k > 0
+                               else DEFAULT_DIST_K)
+                    blocks = detect_deviation_blocks(
+                        hours, hmeans, k=block_k)
+                    if blocks:
+                        shifts = _cap_shifts(shifts + blocks,
+                                             args.max_shifts)
+
+                # 数据缺失(>=24h)检测: 图上标注，并用线性插值填充绘图序列
+                gaps = []
+                plot_hours, plot_means = hours, hmeans
+                plot_maxs, plot_mins = hmaxs, hmins
+                if args.gap_fill_hours > 0:
+                    (plot_hours, plot_means, plot_maxs, plot_mins), gaps = \
+                        fill_long_gaps(hours, hmeans, hmaxs, hmins,
+                                       args.gap_fill_hours)
+                # 原序列下标 -> 填充后下标(尖峰标记位置对齐)；
+                # 用字典查询避免“hours 未严格递增时 fi 越界”
+                plot_idx = {h2: i for i, h2 in enumerate(plot_hours)}
+                filled_map = {
+                    oi: plot_idx.get(h, oi) for oi, h in enumerate(hours)}
+                spike_idx_plot = [filled_map[i] for i in spike_idx]
+                range_idx_plot = [filled_map[i] for i in range_idx]
+
+                # 统计值用"真实数据(已去尖峰, 不含填充值)"
+                # 有效/缺失秒数沿用 read_hourly_series 的逐日统计
+                # (风速 10min / 振动秒级等非小时粒度下也正确)
+                _raw_secs = dict(zip(day_dates, day_secs))
+                _raw_miss = dict(zip(day_dates, day_miss))
+                day_dates, day_means, day_maxs, day_mins = \
+                    aggregate_daily_from_hours(hours, hmeans, hmaxs, hmins)[:4]
+                day_secs = [_raw_secs.get(d, 0) for d in day_dates]
+                day_miss = [_raw_miss.get(d, 0) for d in day_dates]
+                stats = None
+                if not args.skip_stats:
+                    # 统计值清洗：与绘图共用上面那套“物理范围+尖峰”逻辑，
+                    # 但按特征粒度再判一次局部异常（风速 24h 窗口：阵风/大风
+                    # 是常态，只有相对当日上下文明显异常才剔除）；
+                    # 加速度/振动等窗口=0，与上面的清洗结果一致。
+                    # 只影响统计口径，绘图序列仍是原来的清洗结果。
+                    s_means, s_maxs, s_mins = hmeans, hmaxs, hmins
+                    _stat_win = _stat_window_for(feature, args.stat_window)
+                    if _stat_win:
+                        _skw = dict(hour_level=True, vrange=vrange,
+                                    feature=feature,
+                                    stat_window=_stat_win)
+                        s_means, _sr1, _si1, _sx1 = clean_series_value(
+                            hours, hmeans, "小时均值(统计)", spike_k,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b, **_skw)
+                        s_maxs, _sr2, _si2, _sx2 = clean_series_value(
+                            hours, hmaxs, "小时最大值(统计)", spike_k,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b, **_skw)
+                        s_mins, _sr3, _si3, _sx3 = clean_series_value(
+                            hours, hmins, "小时最小值(统计)", spike_k,
+                            max_spikes=_spk_b, dist_k=args.dist_k,
+                            max_dist_outliers=_dist_b,
+                            max_total_removals=_rm_b, **_skw)
+                        spike_rec = spike_rec + _sr1 + _sr2 + _sr3
+                    # 恒0故障段（含 <24h 短段）剔除后算极值
+                    if hours:
+                        (_n_hours, _n_means, _n_maxs, _n_mins,
+                         zero_runs) = _mask_zero_fault_hours(
+                            hours, s_means, s_maxs, s_mins, feature)
+                    else:
+                        _n_hours, _n_means, _n_maxs, _n_mins = \
+                            hours, s_means, s_maxs, s_mins
+                        zero_runs = []
+                    # 缓存“恒0故障段剔除后”的清洗小时序列（均值/最大/最小）
+                    # 供 应变-温度回归/剔除温度极值 使用（与统计口径一致，
+                    # 短时掉零段不会把 剔除温度最小 打成 0）
+                    if actual_feature in ("YB(rsg)", "WD(temp)", "WSD(temp)"):
+                        _corr_hourly[(str(sensor), actual_feature)] = (
+                            list(_n_hours), list(_n_means),
+                            list(_n_maxs), list(_n_mins))
+                    stats, day_dates, day_means, day_maxs, day_mins = \
+                        compute_feature_stats(
+                            day_dates, day_means, day_maxs, day_mins,
+                            day_secs, day_miss, args.start, args.end,
+                            _n_means, _n_maxs, _n_mins)
+                    if stats is None:
+                        issues.append(f"无数据: {sensor}/{feature}")
+                        continue
+                    if zero_runs:
+                        stats["疑似故障时间段"] = zero_runs
+                        stats["特征"] = actual_feature
+                        stats["特征中文名"] = feature_display(actual_feature)
+                    stats["预处理"] = {
+                        "尖峰替代": spike_rec,
+                        "突变区间": shifts,
+                        "数据缺失填充": gaps,
+                    }
+                    if sensor == TRAFFIC_SENSOR:
+                        # 交通荷载: 数值 = 期内累计通过车辆数(小时计数求和)
+                        stats["数值"] = round(float(sum(hmeans)), 1)
+                    sensor_stats["特征统计"][actual_feature] = stats
+                    # 统计库: 位置 -> 测点 -> 特征(只存整体统计，不存每日统计)
+                    pos_stats.setdefault(pos_name, {}).setdefault(
+                        str(sensor), {})[actual_feature] = {
+                        "统计": {k: v for k, v in stats.items()
+                                 if k not in ("每日统计", "特征",
+                                              "特征中文名", "预处理")},
+                    }
+                    _order = pos_sensor_order.setdefault(pos_name, [])
+                    if str(sensor) not in _order:
+                        _order.append(str(sensor))
+                daily_by_feat[feature] = (day_dates, day_means)
+                pos_daily.setdefault(pos_name, {}).setdefault(
+                    str(sensor), {})[feature] = (list(day_dates),
+                                                 list(day_means))
+
+                # 逐传感器图（--skip-per-sensor 时跳过，merged 模式直接出图）
+                if (not args.skip_per_sensor and not args.skip_charts
+                        and sensor != TRAFFIC_SENSOR):
+                    fout = os.path.join(chart_dir, sensor, feature)
+                    os.makedirs(fout, exist_ok=True)
+                    plot_time_series(sensor, sensor_name, feature, plot_hours,
+                                     plot_means,
+                                     os.path.join(fout, "时间序列图.png"),
+                                     shifts=shifts,
+                                     replaced_indices=spike_idx_plot,
+                                     replaced_range_indices=range_idx_plot,
+                                     gaps=gaps,
+                                     hour_level=True)
+                    plot_histogram(sensor, sensor_name, feature, hmeans,
+                                   os.path.join(fout, "频率分布图.png"))
+                if not args.skip_stats and stats and len(day_dates) < 2:
+                    stats["提示"] = "数据不足，仅 1 天"
+                    issues.append(f"数据不足: {sensor}/{feature} 仅 1 天")
+            except Exception as exc:
+                issues.append(f"错误: {sensor}/{feature}: {exc}")
+                print(f"[警告] {sensor}/{feature} 处理失败: {exc}", flush=True)
+
+        # 交通荷载: 车道比例 = 车道数值 / 总共数值 * 100
+        if sensor == TRAFFIC_SENSOR and not args.skip_stats:
+            total_val = (sensor_stats["特征统计"].get(
+                TRAFFIC_TOTAL_FEATURE) or {}).get("数值")
+            if total_val:
+                for feat, st in sensor_stats["特征统计"].items():
+                    if feat == TRAFFIC_TOTAL_FEATURE or not st.get("数值"):
+                        continue
+                    st["比例"] = round(float(st["数值"]) / float(total_val) * 100, 2)
+                    rec = pos_stats.get(pos_name, {}).get(
+                        str(sensor), {}).get(feat)
+                    if rec:
+                        rec["统计"]["比例"] = st["比例"]
+
+        # 相关性分析：同一传感器内两两特征，按日期对齐（仅 per_sensor 模式）
+        if args.mode == "per_sensor" and args.correlation and len(daily_by_feat) >= 2:
+            feats_list = list(daily_by_feat)
+            for i in range(len(feats_list)):
+                for j in range(i + 1, len(feats_list)):
+                    fa, fb = feats_list[i], feats_list[j]
+                    da, ma = daily_by_feat[fa]
+                    db, mb = daily_by_feat[fb]
+                    common = sorted(set(da) & set(db))
+                    if len(common) < 10:
+                        continue
+                    ia = {d: i for i, d in enumerate(da)}
+                    ib = {d: i for i, d in enumerate(db)}
+                    x = [ma[ia[d]] for d in common]
+                    y = [mb[ib[d]] for d in common]
+                    out = os.path.join(chart_dir, sensor,
+                                       f"相关性_{fa}_{fb}.png")
+                    r = plot_correlation(fa, fb, x, y, sensor_name, sensor,
+                                         out)
+                    if r is not None:
+                        corr_results[f"{fa} ~ {fb}"] = r
+        sensor_stats["相关性"] = corr_results
+
+        # 选择性重新生成(--features)时，保留该传感器其他特征的旧统计值
+        if args.features:
+            old_path = os.path.join(stats_dir, f"{sensor}.json")
+            if os.path.isfile(old_path):
+                try:
+                    with open(old_path, "r", encoding="utf-8") as f:
+                        old = json.load(f)
+                    for k, v in (old.get("特征统计") or {}).items():
+                        sensor_stats["特征统计"].setdefault(k, v)
+                    if "相关性" in old and not sensor_stats["相关性"]:
+                        sensor_stats["相关性"] = old["相关性"]
+                except Exception:  # noqa: BLE001
+                    pass
+
+        if not args.skip_stats and args.mode != "merged":
+            # 统计值 JSON 只写整体统计字段(不写“每日统计”/“有效天数”/
+            # “缺失天数”等明细)；计算过程仍保留，报告运行时按整体统计取值
+            for _fstats in (sensor_stats.get("特征统计") or {}).values():
+                if isinstance(_fstats, dict):
+                    _fstats.pop("每日统计", None)
+                    _fstats.pop("有效天数", None)
+                    _fstats.pop("缺失天数", None)
+            with open(os.path.join(stats_dir, f"{sensor}.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(sensor_stats, f, ensure_ascii=False, indent=2)
+
+        overview.append({
+            "编号": sensor, "名称": sensor_name, "桥名": bridge,
+            "特征": list(sensor_stats["特征统计"]),
+        })
+        if idx % 20 == 0 or idx == len(sensors):
+            el = time.time() - t0
+            print(f"  进度 {idx}/{len(sensors)}  已用 {el:.0f}s", flush=True)
+
+    if not args.skip_stats:
+        # 应变-温度联合统计：同一位置（可能不同传感器）的应变与温度
+        # 按日对齐回归，剔除温度效应后写入应变特征(YB(rsg))的统计，
+        # 供报告应变表 “剔除温度最大值/剔除温度最小值/相关性系数” 列使用。
+        # 位置名可能因“左幅/右幅”与“上游/下游”写法不一致而对不上，
+        # 先精确配对，失败时按“核心部位归一化”跨位置配对。
+        pos_feats_all = {}
+        for pos_name in pos_daily:
+            pf = {}
+            for sid, feats in pos_daily[pos_name].items():
+                for feat, (dd, mm) in feats.items():
+                    pf.setdefault(feat, []).append((sid, dd, mm))
+            pos_feats_all[pos_name] = pf
+
+        def _pair_temp(pos_name, pf):
+            """用清洗后温度小时序列给 YB(rsg) 各测点算剔除温度统计。"""
+            if "YB(rsg)" not in pf:
+                return
+            temp_keys = [f for f in pf
+                         if f in ("WD(temp)", "WSD(temp)")]
+            if not temp_keys:
+                return
+            temp_entries = pf[temp_keys[0]]   # [(sid, dates, means)]
+
+            def _series(sid, feat):
+                return _corr_hourly.get(
+                    (str(sid), feat), ([], [], [], []))
+
+            def _is_flat(means):
+                return (not means) or (max(means) - min(means)) <= 1e-9
+
+            def _first_good_temp(entries):
+                # 优先选非恒值(有正常波动)的温度传感器，避免取到
+                # “整季恒0”的故障传感器导致相关系数失真
+                for _tsid, _tdd, _tmm in entries:
+                    if not _is_flat(_series(_tsid, temp_keys[0])[1]):
+                        return str(_tsid)
+                return (str(entries[0][0]) if entries else None)
+
+            strain_entries = pf["YB(rsg)"]
+            for i, (s_sid, _s_dates, _s_means) in enumerate(strain_entries):
+                # 同一位置多个温度/应变测点时按测点一一配对
+                # （测点1↔测点1、测点2↔测点2），避免所有应变测点都
+                # 配到第一个温度测点上；温度不足或该测点温度恒值时，
+                # 回退到该位置第一个正常温度序列。
+                if i < len(temp_entries):
+                    _t_sid = str(temp_entries[i][0])
+                    if _is_flat(_series(_t_sid, temp_keys[0])[1]):
+                        _t_sid = _first_good_temp(temp_entries)
+                else:
+                    _t_sid = _first_good_temp(temp_entries)
+                if not _t_sid:
+                    continue
+                s_hours, s_means, s_maxs, s_mins = _series(
+                    s_sid, "YB(rsg)")
+                t_hours, t_means, _t_maxs, _t_mins = _series(
+                    _t_sid, temp_keys[0])
+                te = _temp_effect_stats(
+                    s_hours, s_means, s_maxs, s_mins,
+                    t_hours, t_means)
+                if not te:
+                    continue
+                rec = pos_stats.get(pos_name, {}).get(str(s_sid), {}).get(
+                    "YB(rsg)")
+                if rec:
+                    rec["统计"].update(te)
+                    # 记录配对来源，便于核对“哪个应变传感器 用 哪个温度传感器算”
+                    rec["统计"]["温度配对传感器编号"] = str(_t_sid)
+                    rec["统计"]["相关性计算传感器对"] = (
+                        f"{s_sid}(YB(rsg))-{_t_sid}({temp_keys[0]})")
+
+        # 第一遍：精确位置配对
+        for pos_name, pf in pos_feats_all.items():
+            _pair_temp(pos_name, pf)
+        # 第二遍：核心部位归一化配对（顶板左幅 <-> 顶板上游 等）。
+        # 仅对配置名单内的大桥生效（洣水河编号文件应变/温度方位命名不一致），
+        # 其他桥仍只做精确配对，避免不同方位传感器被错误跨配。
+        cross_side = any(v in STRAIN_TEMP_CROSS_SIDE_BRIDGES
+                         for v in _bridge_variants(bridge))
+        if cross_side:
+            norm_index = {}
+            for pos_name, pf in pos_feats_all.items():
+                if any(f in ("WD(temp)", "WSD(temp)") for f in pf):
+                    norm_index.setdefault(
+                        _norm_strain_temp_pos(pos_name), []).append(pos_name)
+            for pos_name, pf in pos_feats_all.items():
+                if "YB(rsg)" not in pf:
+                    continue
+                if any(f in ("WD(temp)", "WSD(temp)") for f in pf):
+                    continue   # 已精确配对
+                core = _norm_strain_temp_pos(pos_name)
+                # 洣水河编号方式：应变 左幅/右幅、温度 上游/下游。
+                # 必须按方位对应（左幅↔上游、右幅↔下游），不能都取
+                # 同核心的第一个温度位置，否则 右幅 会错误地配到 上游。
+                want = ""
+                if "右幅" in pos_name or "右侧" in pos_name:
+                    want = "下游"
+                elif "左幅" in pos_name or "左侧" in pos_name:
+                    want = "上游"
+                elif "上游" in pos_name:
+                    want = "上游"
+                elif "下游" in pos_name:
+                    want = "下游"
+                for t_pos in norm_index.get(core, []):
+                    if t_pos == pos_name:
+                        continue
+                    if want and want not in t_pos:
+                        continue
+                    merged = dict(pf)
+                    merged.update(pos_feats_all[t_pos])
+                    _pair_temp(pos_name, merged)
+                    break
+        # 多数传感器公共缺失时间段：某特征下，>50% 有数据的传感器在同一
+        # 小时缺失，把连续小时合并为时间段（小时级精度），写入
+        # 统计值_<期>/<桥名>/公共缺失时间段.json，供季度/年度统计和
+        # 总结段落引用（如“环境湿度基本上都是在 1.18 10~1.19 14 … 缺失”）。
+        if _feature_hour_cov and not args.traffic_only:
+            _common_missing = {}
+            try:
+                _d0 = (dt.date.fromisoformat(str(args.start)[:10])
+                       if args.start else None)
+                _d1 = (dt.date.fromisoformat(str(args.end)[:10])
+                       if args.end else None)
+            except ValueError:
+                _d0 = _d1 = None
+            for _feat, _fc in _feature_hour_cov.items():
+                _total = len(_fc["sensors"])
+                if _total < 2:
+                    continue
+                _covered = _fc["covered"]
+                if _d0 is None or _d1 is None:
+                    if not _covered:
+                        continue
+                    _d0 = min(k.date() for k in _covered)
+                    _d1 = max(k.date() for k in _covered)
+                _bad = []
+                _h = dt.datetime.combine(_d0, dt.time.min)
+                _end = dt.datetime.combine(_d1, dt.time.min) \
+                    + dt.timedelta(days=1)
+                while _h < _end:
+                    if (_total - _covered.get(_h, 0)) / _total >= 0.5:
+                        _bad.append(_h)
+                    _h += dt.timedelta(hours=1)
+                intervals = []
+                for _h in _bad:
+                    if intervals and (_h - intervals[-1][1]).total_seconds() \
+                            / 3600 <= 2:
+                        intervals[-1][1] = _h
+                    else:
+                        intervals.append([_h, _h])
+                spans = [
+                    _fmt_compact_range(a.strftime("%Y-%m-%d %H:%M"),
+                                       b.strftime("%Y-%m-%d %H:%M"))
+                    for a, b in intervals
+                    if (b - a).total_seconds() / 3600 >= 6]
+                if spans:
+                    _common_missing[_feat] = spans
+            if _common_missing:
+                os.makedirs(stats_dir, exist_ok=True)
+                with open(os.path.join(stats_dir, "公共缺失时间段.json"),
+                          "w", encoding="utf-8") as f:
+                    json.dump({
+                        "说明": "多数传感器(>50%有数据)在同一小时缺失的时间段，"
+                                "连续小时合并，仅保留>=6小时区间",
+                        "特征": _common_missing,
+                    }, f, ensure_ascii=False, indent=2)
+        # 位置统计库(与图库目录结构对齐):
+        #   统计值_<期>/<桥名>/位置统计/<位置>/<特征>.json
+        #   内容: {位置: {测点X: {统计, 传感器编号}}}（只存整体统计）
+        #   相关性: 位置统计/<位置>/相关性_<特征A>-<特征B>.json
+        pos_stats_dir = os.path.join(stats_dir, "位置统计")
+        os.makedirs(pos_stats_dir, exist_ok=True)
+        for pos_name in sorted(pos_stats):
+            pos_safe = _safe_dirname(pos_name)
+            pos_dir = os.path.join(pos_stats_dir, pos_safe)
+            os.makedirs(pos_dir, exist_ok=True)
+            if pos_name == TRAFFIC_SENSOR:
+                # 交通荷载：单特征文件 {交通荷载: {车道X: {统计, 传感器编号, 特征}}}，
+                # 车道X 即“测点”键，供报告 cell.vehicle_count.车道X.* 索引
+                payload = {pos_name: {}}
+                for sid in pos_sensor_order.get(pos_name, []):
+                    for feat, v in pos_stats[pos_name].get(sid, {}).items():
+                        if feat == TRAFFIC_TOTAL_FEATURE:
+                            continue
+                        payload[pos_name][feat] = dict(
+                            v, 传感器编号=sid, 特征=TRAFFIC_STAT_FEATURE)
+                with open(os.path.join(pos_dir, "交通荷载.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+                continue
+            # 按特征聚合: 特征 -> 测点X -> {统计, 传感器编号}
+            feat_points = {}
+            for sid in pos_sensor_order.get(pos_name, []):
+                feats = pos_stats[pos_name].get(sid, {})
+                if not feats:
+                    continue
+                for feat, v in feats.items():
+                    feat_points.setdefault(feat, {})
+                    pt_key = f"测点{len(feat_points[feat]) + 1}"
+                    feat_points[feat][pt_key] = dict(v, 传感器编号=sid)
+            for feat, points in feat_points.items():
+                # 单特征 JSON: {位置: {测点X: {统计, 传感器编号, 特征}}}
+                payload = {pos_name: {
+                    pt: dict(v, 特征=feat) for pt, v in points.items()
+                }}
+                with open(os.path.join(
+                        pos_dir, _safe_dirname(feat) + ".json"),
+                        "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+        # 把 剔除温度/相关性系数 写回逐传感器统计 JSON
+        # （报告运行时按 统计值_<期>/<桥名>/<编号>.json 取值；
+        #   相关性键按测点号区分，如 相关性_WD(temp)-YB(rsg)测点1）
+        for pos_name, pts in pos_stats.items():
+            order = [str(x) for x in pos_sensor_order.get(pos_name, [])]
+            for sid, feats in pts.items():
+                yb = feats.get("YB(rsg)") or {}
+                te = yb.get("统计") or {}
+                if "剔除温度最大值" not in te:
+                    continue
+                sensor_path = os.path.join(stats_dir, f"{sid}.json")
+                if not os.path.isfile(sensor_path):
+                    continue
+                try:
+                    with open(sensor_path, "r", encoding="utf-8") as f:
+                        sd = json.load(f)
+                    fs = sd.setdefault("特征统计", {}).setdefault("YB(rsg)", {})
+                    for k in ("剔除温度最大值", "剔除温度最小值", "相关性系数"):
+                        if k in te:
+                            fs[k] = te[k]
+                    if str(sid) in order:
+                        pt_no = order.index(str(sid)) + 1
+                        fs[f"相关性_WD(temp)-YB(rsg)测点{pt_no}"] = te.get("相关性系数")
+                    with open(sensor_path, "w", encoding="utf-8") as f:
+                        json.dump(sd, f, ensure_ascii=False, indent=2)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[警告] 写回应变-温度统计失败 {sid}: {exc}")
+        print(f"  位置统计库已写出: {pos_stats_dir} "
+              f"({len(pos_stats)} 个位置)")
+        if not args.traffic_only:
+            with open(os.path.join(stats_dir, "总览.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({
+                    "说明": "全部传感器-特征图库总览",
+                    "生成时间": dt.datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"),
+                    "传感器数量": len(overview),
+                    "传感器": overview,
+                }, f, ensure_ascii=False, indent=2)
+
+    # ---------- 交通荷载：跨车道合并图（累计数量/比例/频率分布） ----------
+    # 与普通特征不同：不生成 车道N 子文件夹，直接在 交通荷载/ 下出三张图；
+    # --features 交通荷载 时只出该桥交通荷载相关目录
+    if not args.skip_charts and not skip_traffic \
+            and TRAFFIC_SENSOR in sensor_feats:
+        if (not args.features or _traffic_selected(args.features)
+                or any(f.strip().startswith("车道")
+                       for f in str(args.features or "").split(","))):
+            try:
+                _build_traffic_charts(args, sensor_feats, chart_dir, issues)
+            except Exception as exc:  # noqa: BLE001
+                issues.append(f"交通荷载图错误: {exc}")
+                print(f"[警告] 交通荷载图失败: {exc}", flush=True)
+
+    # ---------- 合并图库（按监测部位分组，一张图多测点/多特征） ----------
+    if args.mode == "merged" and not args.skip_charts:
+        print("开始生成合并图库（按监测部位分组）...")
+        pos_map = {}
+        if args.position_map and os.path.isfile(args.position_map):
+            pos_map = load_position_map(args.position_map)
+        else:
+            nd_dir = os.path.join(DEFAULT_SENSOR_MAP_DIR, "传感器名称对照")
+            if not os.path.isdir(nd_dir):
+                old_nd = os.path.join(stats_dir, "传感器名称对照")
+                if os.path.isdir(old_nd):
+                    nd_dir = old_nd
+            if os.path.isdir(nd_dir):
+                files = [f for f in sorted(os.listdir(nd_dir))
+                         if f.endswith(".json")]
+                # 只加载当前桥的对照文件(文件名以桥名开头)，避免把
+                # 其它桥的位置也拉进来(如湘江特跑出洞庭湖/矮寨的位置)
+                if bridge:
+                    picks = [f for f in files if f[:-5].startswith(bridge)]
+                    if picks:
+                        files = picks
+                for f in files:
+                    pm = load_position_map(os.path.join(nd_dir, f))
+                    for k, v in pm.items():
+                        pos_map.setdefault(k, []).extend(v)
+                pos_map = {k: sorted(set(v)) for k, v in pos_map.items()}
+                # 安全网：按对照表里的桥名再过滤一遍
+                if bridge:
+                    def _same_bridge(info_bridge):
+                        return (bridge in (info_bridge or "")
+                                or (info_bridge or "") in bridge)
+                    pos_map = {
+                        k: [p for p in v
+                            if _same_bridge(sensor_map.get(p[0], {}).get("桥名", ""))]
+                        for k, v in pos_map.items()
+                    }
+                    pos_map = {k: v for k, v in pos_map.items() if v}
+        if not pos_map:
+            pos_map = load_position_map("", map_path)
+        if not pos_map:
+            print("[警告] 未找到位置-传感器映射，合并图库跳过")
+        else:
+            allowed = set(sensors) if args.limit_sensors else None
+            merged_ok = 0
+            merged_fail = 0
+
+            def _append_load_strain(series, pos):
+                """给应变组时间序列图叠加“剔除温度后的荷载应变”折线。
+
+                对每个应变测点：用配对的温度传感器（同位置测点N↔测点N，
+                洣水河等跨方位 左幅↔上游/右幅↔下游）做线性回归
+                ε=a·T+b，荷载应变 ε_load = ε − (a·T+b)，与应变序列画在
+                同一子图、同一坐标轴上（不新增子图），颜色明显区分。
+                回归用的温度/应变都是清洗后小时序列（与统计库
+                _temp_effect_stats 同口径）。
+                """
+                if "YB(rsg)" not in {s.get("feature") for s in series}:
+                    return
+
+                def _temp_series(_sid, _feat):
+                    """取清洗后温度小时序列 (hours, means)：优先用统计循环
+                    缓存(未插值)，否则直接从 daily 读取(与图库同一套清洗)。
+                    """
+                    _c = _corr_hourly.get((str(_sid), _feat))
+                    if _c:
+                        return _c[0], _c[1]
+                    _th, _tm, _sp, _rg, _gp, _rc, _sh = \
+                        read_clean_hourly_means(
+                            args.daily_root, str(_sid), _feat,
+                            args.start, args.end,
+                            args.spike_threshold, args.max_spikes,
+                            args.gap_fill_hours, args.shift_min_days,
+                            args.shift_threshold, args.dist_k,
+                            args.max_dist_outliers, args.max_shifts,
+                            args.max_removals)
+                    return _th, _tm
+
+                def _temp_at_pos(_p):
+                    """返回 _p 位置可用的温度序列 [(sid, feat, hours, means)]。
+                    只出图模式(--skip-stats)时 pos_daily/_corr_hourly 为空，
+                    改按 位置-传感器映射(pos_map) + daily 直接读取。
+                    """
+                    out = []
+                    seen = set()
+                    for _sid, _feats in (pos_daily.get(_p) or {}).items():
+                        for _f in ("WD(temp)", "WSD(temp)"):
+                            if _f in _feats:
+                                _th, _tm = _temp_series(_sid, _f)
+                                if _th and (str(_sid), _f) not in seen:
+                                    out.append(
+                                        (str(_sid), _f, _th, _tm))
+                                    seen.add((str(_sid), _f))
+                                break
+                    if out:
+                        return out
+                    for _sid, _f in (pos_map.get(_p) or []):
+                        if _f not in ("WD(temp)", "WSD(temp)"):
+                            continue
+                        _af = sensor_feats.get(str(_sid)) or []
+                        _actual = next(
+                            (x for x in _af
+                             if x in ("WD(temp)", "WSD(temp)")), _f)
+                        _th, _tm = _temp_series(_sid, _actual)
+                        if _th and (str(_sid), _actual) not in seen:
+                            out.append((str(_sid), _actual, _th, _tm))
+                            seen.add((str(_sid), _actual))
+                    return out
+
+                temp_list = _temp_at_pos(pos)
+                if not temp_list:
+                    # 洣水河跨方位：应变 左幅/右幅 ↔ 温度 上游/下游
+                    _want = ("下游" if ("右幅" in pos or "右侧" in pos)
+                             else "上游")
+                    _core = _norm_strain_temp_pos(pos)
+                    for _p in sorted(set(pos_daily) | set(pos_map)):
+                        if _p == pos or _norm_strain_temp_pos(_p) != _core:
+                            continue
+                        if _want and _want not in _p:
+                            continue
+                        temp_list = _temp_at_pos(_p)
+                        if temp_list:
+                            break
+                if not temp_list:
+                    return
+                for i, s in enumerate(series):
+                    if s.get("feature") != "YB(rsg)":
+                        continue
+                    _t = temp_list[i] if i < len(temp_list) else temp_list[0]
+                    _tsid, _tfeat, _th, _tm = _t
+                    _s_c = _corr_hourly.get(
+                        (str(s.get("sensor")), "YB(rsg)"))
+                    if _s_c:
+                        _s_h, _s_m = _s_c[0], _s_c[1]
+                    else:
+                        # 只出图模式：用合并序列(已清洗)做回归
+                        _s_h = s.get("hours", [])
+                        _s_m = s.get("means", [])
+                    if not _s_h or not _th:
+                        continue
+                    _si = {}
+                    for _k, _hh in enumerate(_s_h):
+                        _si.setdefault(_hh, _k)
+                    _xs, _ys = [], []
+                    for _j, _hh in enumerate(_th):
+                        _k = _si.get(_hh)
+                        if _k is not None:
+                            _xs.append(float(_tm[_j]))
+                            _ys.append(float(_s_m[_k]))
+                    if len(_xs) < 10:
+                        continue
+                    try:
+                        _a, _b = np.polyfit(
+                            np.array(_xs, dtype=float),
+                            np.array(_ys, dtype=float), 1)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    _thd = dict(zip(_th, _tm))
+                    _rh, _rm = [], []
+                    for _hh, _mm in zip(s.get("hours", []), s.get("means", [])):
+                        _tv = _thd.get(_hh)
+                        if _tv is not None:
+                            _rm.append(_mm - (_a * _tv + _b))
+                            _rh.append(_hh)
+                    if not _rh:
+                        continue
+                    # 叠加线自身的尖峰/异常：对“剔除温度后”荷载应变均值序列
+                    # 用与主序列相同的参数再做一遍清洗（仅用于图上显示与
+                    # 标记；统计口径仍是 原始 max/min/mean 清洗后 序列，
+                    # 见 _temp_effect_stats）。缺失/故障/突变段不重复标注，
+                    # 因为叠加线由原应变计算而来，主线的标注已覆盖。
+                    _ov_k = (0 if _is_direction_feature("YB(rsg)")
+                             else args.spike_threshold)
+                    _rm_clean, _recs2, _ix2, _rx2 = clean_series_value(
+                        _rh, _rm, f"剔除温度后-{s.get('sensor')}",
+                        _ov_k, hour_level=True,
+                        vrange=feature_range("YB(rsg)"),
+                        max_spikes=args.max_spikes, dist_k=args.dist_k,
+                        max_dist_outliers=args.max_dist_outliers,
+                        max_total_removals=args.max_removals)
+                    s["load_overlays"] = [(
+                        _rh, _rm_clean,
+                        f"剔除温度后-{s.get('sensor')}",
+                        [(_rh[i], _rm_clean[i]) for i in _ix2],
+                        [(_rh[i], _rm_clean[i]) for i in _rx2],
+                    )]
+
+            for pos, pairs in sorted(pos_map.items()):
+                if args.traffic_only:
+                    # 交通荷载传感器不在对照表/pos_map 里：合并图循环只应
+                    # 处理交通传感器，其它位置(如 EZJSD 振动/应变)一律跳过，
+                    # 避免“处理交通荷载”却把整桥的合并图也生成出来(功能杂糅)
+                    pairs = [(s, f) for s, f in pairs
+                             if s == TRAFFIC_SENSOR]
+                    if not pairs:
+                        continue
+                if allowed is not None:
+                    pairs = [(s, f) for s, f in pairs if s in allowed]
+                if args.features:
+                    pairs = [(s, f) for s, f in pairs
+                             if _feature_selected(f, args.features)]
+                if not pairs:
+                    continue
+                groups = defaultdict(list)
+                for sensor, feat in pairs:
+                    # 特征以 daily 下该传感器实际目录为准(如对照表写
+                    # DZJSD(xJsd)，但实际数据是 EZJSD(xJsd)/EZJSD(yJsd))，
+                    # 避免合并图文件夹/标签与 per_sensor 图、统计库对不上；
+                    # daily 无该传感器数据时回退用对照表特征(便于报“无数据”)
+                    actual_feats = sensor_feats.get(str(sensor))
+                    if actual_feats:
+                        for af in actual_feats:
+                            pair = (sensor, af)
+                            gk = feature_group(af)
+                            if pair not in groups[gk]:
+                                # 同一传感器多特征时会重复进入本循环，去重，
+                                # 避免合并图出现两个相同测点(如 431 出现两次)
+                                groups[gk].append(pair)
+                    else:
+                        pair = (sensor, feat)
+                        gk = feature_group(feat)
+                        if pair not in groups[gk]:
+                            groups[gk].append(pair)
+                pos_series = []   # 位置内全部特征序列（用于跨特征相关性散点图）
+                for g, gf_pairs in sorted(groups.items()):
+                    uniq_sensors = {s for s, _ in gf_pairs}
+                    uniq_feats = {f for _, f in gf_pairs}
+                    out_dir = os.path.join(chart_dir, _safe_dirname(pos),
+                                           _safe_dirname(g))
+                    try:
+                        # 振动(秒级)合并图：按天出图(横轴小时、标题含日期)，
+                        # 每天只加载当天数据，避免整季秒级数据过大无法出图
+                        if all(_is_second_level_feature(f)
+                               for _, f in gf_pairs):
+                            _build_merged_daily_charts(
+                                args, pos, g, gf_pairs, out_dir, issues)
+                            merged_ok += 1
+                            continue
+                        # 单传感器单特征：默认复制 per_sensor 图；
+                        # --skip-per-sensor 时由 merged 路径直接出图
+                        if (len(uniq_sensors) == 1 and len(uniq_feats) == 1
+                                and not args.skip_per_sensor):
+                            copied = _copy_per_sensor_charts(
+                                chart_dir, next(iter(uniq_sensors)),
+                                next(iter(uniq_feats)), out_dir,
+                                fallback_charts_dir=os.path.join(
+                                    args.lib_root, "图库", bridge))
+                            if not copied:
+                                merged_fail += 1
+                                continue
+                            gs = _build_merged_series(
+                                args.daily_root, gf_pairs, args.start, args.end,
+                                args.spike_threshold, args.max_spikes,
+                                args.gap_fill_hours, args.shift_min_days,
+                                args.shift_threshold, args.dist_k,
+                                args.max_dist_outliers, args.max_shifts,
+                                args.max_removals)
+                            pos_series.extend(gs)
+                            merged_ok += 1
+                            continue
+                        # 其余情况（单传感器多特征 / 多传感器）：
+                        # 读取数据 -> 生成一张含多个子图的合并图（不再分子特征文件夹）
+                        series = _build_merged_series(
+                            args.daily_root, gf_pairs, args.start, args.end,
+                            args.spike_threshold, args.max_spikes,
+                            args.gap_fill_hours, args.shift_min_days,
+                            args.shift_threshold, args.dist_k,
+                            args.max_dist_outliers, args.max_shifts,
+                            args.max_removals)
+                        if not series:
+                            merged_fail += 1
+                            continue
+                        pos_series.extend(series)
+                        os.makedirs(out_dir, exist_ok=True)
+                        # 应变组：在时间序列图上叠加“剔除温度后的荷载应变”
+                        # 折线（同一子图、同一坐标轴，不新增子图）
+                        series_ts = list(series)
+                        if g == "YB(rsg)":
+                            _append_load_strain(series_ts, pos)
+                        plot_group_time_series(
+                            pos, g, series_ts,
+                            os.path.join(out_dir, "时间序列图.png"),
+                            dpi=args.dpi)
+                        plot_group_histogram(
+                            pos, g, series,
+                            os.path.join(out_dir, "频率分布图.png"),
+                            dpi=args.dpi)
+                        if len(uniq_feats) >= 2:
+                            plot_group_correlation(
+                                pos, g, series,
+                                os.path.join(out_dir, "相关性图.png"),
+                                dpi=args.dpi)
+                        with open(os.path.join(out_dir, "预处理记录.json"),
+                                  "w", encoding="utf-8") as f:
+                            json.dump({
+                                "位置": pos,
+                                "特征组": g,
+                                "生成时间": dt.datetime.now().strftime(
+                                    "%Y-%m-%d %H:%M:%S"),
+                                "测点": [{
+                                    "标签": s["label"],
+                                    "传感器": s["sensor"],
+                                    "特征": s["feature"],
+                                    "清洗记录": s["records"],
+                                    "数据缺失时段": s["gaps"],
+                                    "突变区间": s.get("shifts", []),
+                                } for s in series],
+                            }, f, ensure_ascii=False, indent=2)
+                        merged_ok += 1
+                    except Exception as exc:  # noqa: BLE001
+                        merged_fail += 1
+                        issues.append(f"合并图错误: {pos}/{g}: {exc}")
+                        print(f"[警告] 合并图失败 {pos}/{g}: {exc}", flush=True)
+                # 位置级跨特征相关性散点图（如 结构应变-温度）
+                if len({s["feature"] for s in pos_series}) >= 2:
+                    try:
+                        plot_position_correlation(
+                            pos, pos_series,
+                            os.path.join(chart_dir, _safe_dirname(pos)),
+                            dpi=args.dpi)
+                    except Exception as exc:  # noqa: BLE001
+                        issues.append(f"相关性图错误: {pos}: {exc}")
+                        print(f"[警告] 相关性图失败 {pos}: {exc}", flush=True)
+                elif any(s["feature"] == "YB(rsg)" for s in pos_series):
+                    # 洣水河等跨方位：应变 左幅/右幅 ↔ 温度 上游/下游。
+                    # 该位置只有应变时，找配对温度位置（去方位核心一致 +
+                    # 方位对应）的温度序列并入，生成相关性散点图，放在
+                    # 应变方位文件夹下（图库/<应变位置>/相关性_<A>-<B>.png）。
+                    _want = ""
+                    if "右幅" in pos or "右侧" in pos:
+                        _want = "下游"
+                    elif "左幅" in pos or "左侧" in pos:
+                        _want = "上游"
+                    _core = _norm_strain_temp_pos(pos)
+                    for _p in sorted(pos_map):
+                        if _p == pos or _norm_strain_temp_pos(_p) != _core:
+                            continue
+                        if _want and _want not in _p:
+                            continue
+                        _t_pairs = [(s, f) for s, f in pos_map[_p]
+                                    if f in ("WD(temp)", "WSD(temp)")]
+                        if not _t_pairs:
+                            continue
+                        _ts = _build_merged_series(
+                            args.daily_root, _t_pairs, args.start, args.end,
+                            args.spike_threshold, args.max_spikes,
+                            args.gap_fill_hours, args.shift_min_days,
+                            args.shift_threshold, args.dist_k,
+                            args.max_dist_outliers, args.max_shifts,
+                            args.max_removals)
+                        if not _ts:
+                            continue
+                        try:
+                            plot_position_correlation(
+                                pos, list(pos_series) + _ts,
+                                os.path.join(chart_dir, _safe_dirname(pos)),
+                                dpi=args.dpi)
+                        except Exception as exc:  # noqa: BLE001
+                            issues.append(f"相关性图错误: {pos}: {exc}")
+                            print(f"[警告] 相关性图失败 {pos}: {exc}",
+                                  flush=True)
+                        break
+            print(f"合并图库完成: 成功 {merged_ok} 组，失败 {merged_fail} 组")
+
+    # 失败/数据不足记录（--skip-charts 时写到统计值目录，图库目录不存在）
+    issue_path = os.path.join(
+        chart_dir if not args.skip_charts else stats_dir,
+        "生成失败记录.txt")
+    with open(issue_path, "w", encoding="utf-8") as f:
+        f.write(f"图库生成记录\n生成时间: "
+                f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"问题总数: {len(issues)}\n")
+        f.write("=" * 50 + "\n")
+        f.write("\n".join(issues) if issues else "无\n")
+    print(f"问题记录已写入: {issue_path} ({len(issues)} 条)")
+
+    if args.skip_per_sensor and args.skip_stats:
+        print(f"[完成] 跳过逐传感器处理(共 {len(sensors)} 个传感器)，"
+              f"仅生成合并图，总耗时 {time.time()-t0:.0f}s")
+    else:
+        print(f"[完成] 共处理 {len(sensors)} 个传感器，"
+              f"总耗时 {time.time()-t0:.0f}s")
+    if not args.skip_per_sensor and not args.skip_charts:
+        _copy_per_sensor_dirs(args.lib_root, chart_dir, bridge)
+    _write_status_dirs(args.lib_root, chart_dir, stats_dir,
+                       update_charts=not args.skip_charts)
+    print(f"  图库目录: {chart_dir}")
+    print(f"  统计值目录: {stats_dir}")
+
+
+if __name__ == "__main__":
+    main()

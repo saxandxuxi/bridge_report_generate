@@ -1,0 +1,51 @@
+{
+  "说明": "桥梁部署注册表示例。复制为 registry.json 后填写各桥服务器地址与令牌环境变量；真实地址与令牌不入库。",
+  "更新日期": "2026-08-19",
+  "bridges": [
+    {
+      "id": "chishi",
+      "name": "赤石大桥",
+      "config": "config/config_chishi.json",
+      "host": "10.0.0.1",
+      "port": 8456,
+      "token_env": "BRIDGE_CHISHI_TOKEN",
+      "description": "赤石大桥健康监测数据分析（真实数据已接入桥数据预处理产物）"
+    },
+    {
+      "id": "dongtinghu",
+      "name": "洞庭湖大桥",
+      "config": "config/config_dongtinghu.json",
+      "host": "10.0.0.2",
+      "port": 8456,
+      "token_env": "BRIDGE_DONGTINGHU_TOKEN",
+      "description": "洞庭湖大桥（当前为虚拟样例数据，待接真实预处理产物）"
+    },
+    {
+      "id": "mishuihe",
+      "name": "洣水河特大桥",
+      "config": "config/config_mishuihe.json",
+      "host": "10.0.0.3",
+      "port": 8456,
+      "token_env": "BRIDGE_MISHUIHE_TOKEN",
+      "description": "洣水河特大桥——需在各桥服务器创建 config_mishuihe.json"
+    },
+    {
+      "id": "xiangjiang",
+      "name": "湘江特大桥",
+      "config": "config/config_xiangjiang.json",
+      "host": "10.0.0.4",
+      "port": 8456,
+      "token_env": "BRIDGE_XIANGJIANG_TOKEN",
+      "description": "湘江特大桥——需在各桥服务器创建 config_xiangjiang.json"
+    },
+    {
+      "id": "aizhai",
+      "name": "矮寨大桥",
+      "config": "config/config_aizhai.json",
+      "host": "10.0.0.5",
+      "port": 8456,
+      "token_env": "BRIDGE_AIZHAI_TOKEN",
+      "description": "矮寨大桥——需在各桥服务器创建 config_aizhai.json"
+    }
+  ]
+}

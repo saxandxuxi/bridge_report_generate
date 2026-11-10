@@ -1,0 +1,88 @@
+# ---------- Python / IDE / 系统 ----------
+.venv/
+.venv_web/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+~$*
+*.bak
+*.tmp
+*.swp
+
+# ---------- 本地工具/环境 ----------
+.workbuddy/
+.agents/
+skills-lock.json
+.env
+.env.*
+!.env.example
+
+# ---------- 根目录临时脚本（_sim*.py / _corr*.py / _xjr*.py 等） ----------
+/_*.py
+
+# ---------- 日志 ----------
+*.log
+
+# ---------- 输入/输出/运行时目录：只保留空目录骨架 ----------
+inputs/*
+!inputs/.gitkeep
+outputs/*
+!outputs/.gitkeep
+data/*
+!data/.gitkeep
+debug/*
+!debug/.gitkeep
+tests/*
+!tests/.gitkeep
+docs/*
+!docs/.gitkeep
+sync_daily/*
+!sync_daily/.gitkeep
+
+# ---------- 报告模板：含甲方与工程信息，本地保存不入库 ----------
+templates/*
+!templates/.gitkeep
+
+# ---------- 真实部署注册表：含服务器地址，只提交脱敏样例 ----------
+bridges/registry.json
+
+# ---------- 运行时状态与凭据 ----------
+web/current_bridge.json
+monitor_credentials.json
+sync_daily/sync_daily_receiver.json
+skills-lock.json
+
+# ---------- 压缩包/备份（体积大且可重建，不提交） ----------
+*.tar
+*.gz
+*.tar.gz
+*.zip
+*.rar
+*.7z
+*.bak.*
+bridge.tar.gz
+
+# ---------- 桥数据预处理产物（可在服务器重新生成） ----------
+preprocess/图库*/
+preprocess/统计值*/
+inputs/矮寨大桥_车道统计_*
+inputs/赤石大桥_车道统计_*
+preprocess/*.csv
+preprocess/*.log
+preprocess/status.json
+preprocess/sensor_ids.txt
+.venv_web/
+*.bak
+bridge.tar.gz

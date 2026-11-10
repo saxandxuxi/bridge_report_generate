@@ -1,0 +1,261 @@
+# -*- coding: utf-8 -*-
+"""模板识别：扫描 .docx 模板，找出需要替换的数据位置。
+
+支持的占位符：
+  {{stats.<指标>}}      统计值，例如 {{stats.temperature.max}}
+  {{date.<字段>}}       报告期日期，例如 {{date.period_start}}
+  {{chart.<图表ID>}}    图表位置（独占一行）
+  {{rows.<数据集>}}     表格中可重复行的模板标记
+  {{col.<字段>}}        可重复行内的列字段
+  {{key|default:值}}    带默认值的占位符
+  {{expr:表达式}}        算术表达式计算
+  {{?condition}}...{{?}} 条件渲染块
+"""
+
+import re
+from typing import Dict, List
+
+from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+
+# 与 report_builder.MARKER_RE 保持一致
+# key 用 [^:|}]+ 匹配除分隔符外的任意字符（含中文、#、（）等），避免特殊字符占位符"隐形"
+MARKER_RE = re.compile(r"\{\{([^:|}]+)(?::([^}|]+))?(?:\|default:([^}]*))?\}\}")
+COND_RE = re.compile(r"\{\{\?(.+?)\}\}(.*?)\{\{\?\}\}", re.DOTALL)
+NUMBER_RE = re.compile(r"(?<![\w℃%])([+-]?\d+(?:\.\d+)?)(?![\w%])")
+
+
+def _unique_cells(row) -> List:
+    """合并单元格去重（row.cells 会重复返回同一 _tc）。"""
+    seen, out = set(), []
+    for c in row.cells:
+        k = id(getattr(c, "_tc", None))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out
+
+
+def iter_block_items(parent):
+    """按文档顺序遍历正文中的段落和表格。"""
+    from docx.oxml.ns import qn
+
+    if hasattr(parent, "element") and hasattr(parent.element, "body"):
+        body = parent.element.body
+    else:
+        body = parent._tc
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, parent)
+        elif child.tag == qn("w:tbl"):
+            yield Table(child, parent)
+
+
+def iter_paragraphs(doc: Document):
+    """遍历正文、页眉、页脚以及表格单元格里的所有段落。"""
+    for para in iter_block_items(doc):
+        if isinstance(para, Paragraph):
+            yield para
+        elif isinstance(para, Table):
+            for row in para.rows:
+                for cell in _unique_cells(row):
+                    for p in cell.paragraphs:
+                        yield p
+    for section in doc.sections:
+        for p in section.header.paragraphs:
+            yield p
+        for p in section.footer.paragraphs:
+            yield p
+
+
+_CAPTION_END = ("频率分布直方图", "时程曲线图", "时间序列图", "曲线图",
+                "直方图", "时程曲线", "频率分布图", "分布图", "曲线")
+_KEEP_END = ("布置图", "示意图", "平面图", "立面图", "断面图", "结构图",
+             "流程图", "系统图", "测点布置图")
+_LEADIN_END = ("如下图所示。", "如下图所示：", "如下表。", "如下表：",
+               "如下图所示", "如下表")
+
+# 时效性语句：原报告针对当季事件的“请及时…/请尽快…/立即…”类建议，
+# 换季度后不适用，生成模版时删除（异常现象描述保留，只去掉时效性措辞）
+TIMELINESS_RE = re.compile(
+    r"[，,]\s*(?:请|望|应)?\s*(?:及时|尽快|立即|尽快安排)[^。；]*?"
+    r"(?:查明|处理|排查|检修|复核|整改|调查|安排)[^。；]*")
+
+
+def cleanup_redundant_captions(doc: Document) -> int:
+    """生成模版后清洗：删除未被替换成占位符的冗余图注文字。
+
+    规则：无编号、以 曲线图/直方图/时程曲线 等结尾，且不是
+    “…如下图所示。/如下表。”引导句、也不是原报告图纸标题（布置图/示意图等）
+    的段落，视为冗余图注删除（图表位置已由 {{chart.*}} 占位符接管）。
+    编号正规图注（图N.N-N …）不动。返回删除的段落数。
+    """
+    removed = 0
+    for para in iter_paragraphs(doc):
+        runs = [r for r in para.runs]
+        t = "".join(r.text or "" for r in runs).strip()
+        if not t:
+            continue
+        if t.startswith("{{") or re.match(r"^图\s*\d+[-.]\d+", t):
+            continue  # 占位符 / 编号正规图注
+        # “(结果图1) / （结果图3）”等多余图注：清空段落
+        if re.match(r"^[（(]?\s*结果图\s*\d*\s*[）)]?$", t):
+            for r in runs:
+                r.text = ""
+            removed += 1
+            continue
+        if any(t.endswith(x) for x in _LEADIN_END):
+            continue  # “…如下图所示。”引导句保留
+        if any(t.endswith(x) for x in _KEEP_END):
+            continue  # 原报告图纸标题保留
+        # 时效性语句删除（如“，请及时查明情况”），保留异常现象本身
+        t2 = TIMELINESS_RE.sub("", t)
+        if t2 != t:
+            if runs:
+                runs[0].text = t2
+                for r in runs[1:]:
+                    r.text = ""
+                removed += 1
+            continue
+        if any(t.endswith(x) for x in _CAPTION_END):
+            for r in runs:
+                r.text = ""
+            removed += 1
+    return removed
+
+
+def _classify(key: str) -> str:
+    if key.startswith("stats."):
+        return "stats"
+    if key.startswith("date."):
+        return "date"
+    if key.startswith("chart."):
+        return "chart"
+    if key.startswith("rows."):
+        return "rows"
+    if key.startswith("col."):
+        return "col"
+    if key.startswith("expr:"):
+        return "expr"
+    return "unknown"
+
+
+def analyze_template(template_path: str) -> Dict:
+    """识别模板中所有动态内容，返回结构化结果。"""
+    doc = Document(template_path)
+    result = {
+        "template": template_path,
+        "placeholders": [],
+        "charts": [],
+        "rows": [],
+        "candidate_numbers": [],
+        "tables": [],
+        "conditional_blocks": [],
+    }
+
+    for idx, para in enumerate(iter_paragraphs(doc)):
+        text = para.text
+        # 检测条件渲染块
+        for cm in COND_RE.finditer(text):
+            result["conditional_blocks"].append(
+                {
+                    "condition": cm.group(1).strip(),
+                    "content_snippet": cm.group(2).strip()[:60],
+                    "index": idx,
+                }
+            )
+
+        for m in MARKER_RE.finditer(text):
+            key = m.group(1)
+            spec = m.group(2)
+            default = m.group(3)
+            entry = {
+                "marker": m.group(0),
+                "key": key,
+                "type": _classify(key),
+                "format": spec.strip() if spec else None,
+                "default": default,
+                "snippet": text.strip()[:80],
+                "index": idx,
+            }
+            result["placeholders"].append(entry)
+            if key.startswith("chart."):
+                result["charts"].append(key.split(".", 1)[1])
+            elif key.startswith("rows."):
+                result["rows"].append(key.split(".", 1)[1])
+
+        # 占位符与正文混排时，把占位符/条件块先“挖空”再扫数字，
+        # 避免“同段含 {{...}} 就漏掉其它动态数字”。
+        _num_text = MARKER_RE.sub(" ", text)
+        _num_text = COND_RE.sub(" ", _num_text)
+        for m in NUMBER_RE.finditer(_num_text):
+            result["candidate_numbers"].append(
+                {"number": m.group(0), "snippet": text.strip()[:80],
+                 "index": idx})
+
+    for t_idx, table in enumerate(doc.tables):
+        info = {
+            "table_index": t_idx,
+            "rows": len(table.rows),
+            "cols": len(table.columns),
+            "markers": [],
+        }
+        for row_idx, row in enumerate(table.rows):
+            for col_idx, cell in enumerate(_unique_cells(row)):
+                for m in MARKER_RE.finditer(cell.text):
+                    info["markers"].append(
+                        {
+                            "row": row_idx,
+                            "col": col_idx,
+                            "marker": m.group(0),
+                            "key": m.group(1),
+                        }
+                    )
+        result["tables"].append(info)
+
+    # 去重图表/行数据集
+    result["charts"] = list(dict.fromkeys(result["charts"]))
+    result["rows"] = list(dict.fromkeys(result["rows"]))
+    return result
+
+
+def print_analysis(result: Dict) -> None:
+    """以中文友好格式打印识别结果。"""
+    print("=" * 60)
+    print("模板动态内容识别结果")
+    print("=" * 60)
+    print(f"模板文件: {result['template']}")
+    print(f"\n[占位符] 共 {len(result['placeholders'])} 处")
+    for e in result["placeholders"]:
+        fmt = f" (格式 {e['format']})" if e.get("format") else ""
+        default = f" (默认: {e['default']})" if e.get("default") else ""
+        print(f"  {e['marker']}  [{e['type']}]{fmt}{default}  段落#{e['index']}")
+
+    # 条件渲染块
+    cond_blocks = result.get("conditional_blocks", [])
+    if cond_blocks:
+        print(f"\n[条件渲染块] 共 {len(cond_blocks)} 处")
+        for cb in cond_blocks:
+            print(f"  {{?{cb['condition']}}}  <- \"{cb['content_snippet']}\"  段落#{cb['index']}")
+
+    print(f"\n[图表] 共 {len(result['charts'])} 张")
+    for cid in result["charts"]:
+        print(f"  {{{{chart.{cid}}}}}")
+
+    print(f"\n[可重复行] 共 {len(result['rows'])} 个数据集")
+    for rid in result["rows"]:
+        print(f"  {{{{rows.{rid}}}}}")
+
+    print(f"\n[表格] 共 {len(result['tables'])} 张")
+    for t in result["tables"]:
+        marker_keys = ", ".join(m["key"] for m in t["markers"][:8])
+        print(f"  表#{t['table_index']}: {t['rows']}行 x {t['cols']}列 -> {marker_keys}")
+
+    cand = result.get("candidate_numbers", [])
+    print(f"\n[候选数值]（正文中的普通数字，可能是需要动态替换的数据，共 {len(cand)} 处）")
+    for c in cand[:20]:
+        print(f"  {c['number']:>10}  <- \"{c['snippet']}\"")
+    if len(cand) > 20:
+        print(f"  ... 其余 {len(cand) - 20} 处略")
